@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 
@@ -277,6 +277,7 @@ pub enum ExecutionState {
     Failed,
 }
 
+#[derive(Debug, Clone)]
 struct Binding {
     value: Value,
     is_const: bool,
@@ -308,6 +309,7 @@ enum ExportBinding {
     Live(HeapRefHandle, String),
 }
 
+#[derive(Debug, Clone)]
 struct Frame {
     function_index: usize,
     scopes: Vec<HashMap<String, Binding>>,
@@ -315,12 +317,8 @@ struct Frame {
     captured_env: Option<HeapRefHandle>,
     scope_env: Option<HeapRefHandle>,
     return_instructions: Option<Vec<Opcode>>,
-    /// Set when this frame is the body of an async task (§101).
+    /// Set when this frame belongs to an async task's own context (§101).
     task_id: Option<usize>,
-    /// True when the frame was started by the `Await` opcode (a waiter exists
-    /// that expects the result on its value stack). False for scheduler-started
-    /// tasks that nobody awaits (§108: failed un-awaited tasks must not throw).
-    awaited: bool,
 }
 
 /// Task lifecycle states (§106). Terminal states: Completed, Failed, Cancelled.
@@ -352,25 +350,66 @@ impl TaskState {
     }
 }
 
+/// What kind of task this is. `Normal` tasks execute an async function body;
+/// the others are synthetic tasks created by `task.*` builtins and driven by
+/// the scheduler from events and timers (§103-§105, §109-§111).
+#[derive(Debug, Clone)]
+enum TaskKind {
+    Normal {
+        func_idx: usize,
+        args: Vec<Value>,
+        callee: Value,
+        env: Option<HeapRefHandle>,
+    },
+    /// `task.all` inputs — completes with results in input order (§103).
+    All(Vec<usize>),
+    /// `task.race` inputs — first input to reach terminal wins (§104).
+    Race(Vec<usize>),
+    /// `task.wait` target — completes with Null, propagates failure (§109).
+    Wait(usize),
+    /// `task.sleep` deadline (§111).
+    Sleep { deadline_ms: u128 },
+    /// `task.timeout` target + deadline (§110).
+    Timeout {
+        target: usize,
+        deadline_ms: u128,
+    },
+}
+
+/// A suspended task's execution context: everything the linear instruction
+/// loop operates on, swapped in/out of `ZeroVM`'s active fields by the
+/// cooperative scheduler (§112).
+#[derive(Debug, Clone)]
+struct TaskContext {
+    pc: usize,
+    instructions: Vec<Opcode>,
+    stack: Vec<Value>,
+    call_stack: Vec<Frame>,
+    handlers: Vec<TryHandler>,
+    pending_error: Option<String>,
+    pending_return: Option<Value>,
+}
+
 /// A single asynchronous task (§101). Stored in `ZeroVM.tasks` (outside the
-/// heap); heap-backed args/results are rooted via `live_refs` so GC keeps
-/// them alive while the task exists.
+/// heap); heap-backed values are rooted via `live_refs` so GC keeps them
+/// alive while the task exists.
 #[derive(Debug, Clone)]
 struct Task {
     state: TaskState,
-    func_idx: usize,
-    /// Arguments captured at call time; bound when the body starts.
-    args: Vec<Value>,
-    /// Callee value (function/closure) for the body's self-reference binding.
-    callee: Value,
-    /// Closure environment, if the async function captured variables.
-    env: Option<HeapRefHandle>,
+    kind: TaskKind,
     /// Stored result of a completed task (§107).
     result: Option<Value>,
     /// Stored error of a failed task (§108).
     error: Option<String>,
-    /// Value-stack length to restore if this task's frame must be unwound.
-    resume_stack_depth: usize,
+    /// Saved execution context while the task is suspended; None for tasks
+    /// that have not started yet or have reached a terminal state.
+    context: Option<TaskContext>,
+    /// Id of the task this task is suspended on (`await ...`). Combinators
+    /// are themselves tasks, so every suspension is a wait on one task id.
+    wait: Option<usize>,
+    /// Order in which this task reached a terminal state — `task.race`
+    /// compares it to find the genuine first finisher (§104).
+    terminal_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -407,6 +446,22 @@ pub struct ZeroVM {
     program_args: Vec<String>,
     /// All created tasks (§101). Index is the `Value::Task` handle.
     tasks: Vec<Task>,
+    /// FIFO ready queue of normal task ids — round-robin scheduler order
+    /// (§112 lets the scheduler choose; FIFO keeps it deterministic).
+    ready_queue: VecDeque<usize>,
+    /// Id of the task whose context is currently loaded into the instruction
+    /// loop fields (pc/instructions/stack/call_stack/handlers).
+    active_task: Option<usize>,
+    /// Virtual monotonic clock (milliseconds) for sleep/timeout (§110, §111).
+    /// Advanced to the earliest deadline only when nothing is runnable; the
+    /// spec exposes no wall-clock API, so observable order is unaffected.
+    now_ms: u128,
+    /// Monotonic counter stamped onto tasks when they reach a terminal state.
+    next_terminal_seq: u64,
+    /// Top-level/global bindings (builtins + `let`/`const` at program scope).
+    /// Lives outside every execution context so task contexts (§112), which
+    /// do not contain the root frame, still resolve globals identically.
+    global_scope: HashMap<String, Binding>,
 }
 
 impl ZeroVM {
@@ -427,6 +482,11 @@ impl ZeroVM {
             pending_return: None,
             program_args: Vec::new(),
             tasks: Vec::new(),
+            ready_queue: VecDeque::new(),
+            active_task: None,
+            now_ms: 0,
+            next_terminal_seq: 0,
+            global_scope: HashMap::new(),
         }
     }
 
@@ -559,12 +619,8 @@ impl ZeroVM {
         Ok(())
     }
 
-    pub fn run(&mut self) -> Result<(), VmError> {
-        self.validate()?;
-        self.state = ExecutionState::Running;
-
-        // Create initial frame for top-level execution with built-ins
-        let mut root_scope = HashMap::new();
+    /// Install built-in bindings into the shared global scope (§42-§53).
+    fn install_builtins(&mut self) {
         for name in [
             "print",
             "type",
@@ -579,7 +635,7 @@ impl ZeroVM {
             "json",
             "task",
         ] {
-            root_scope.insert(
+            self.global_scope.insert(
                 name.to_string(),
                 Binding {
                     value: Value::BuiltIn(name.to_string()),
@@ -589,15 +645,24 @@ impl ZeroVM {
                 },
             );
         }
+    }
+
+    pub fn run(&mut self) -> Result<(), VmError> {
+        self.validate()?;
+        self.state = ExecutionState::Running;
+
+        // Globals live in `global_scope` (shared across task contexts); the
+        // root frame only hosts the top-level lexical scope stack.
+        self.global_scope.clear();
+        self.install_builtins();
         self.call_stack.push(Frame {
             function_index: 0,
-            scopes: vec![root_scope],
+            scopes: vec![HashMap::new()],
             return_pc: 0,
             captured_env: None,
             scope_env: None,
             return_instructions: None,
             task_id: None,
-            awaited: false,
         });
 
         while self.state == ExecutionState::Running {
@@ -619,41 +684,10 @@ impl ZeroVM {
             }
         }
 
-        // Cooperative scheduler (§112): when the top level goes idle, run any
-        // tasks that were created but never awaited (§101: tasks run as the
-        // runtime allows; §108: an un-awaited task can still fail on its own).
-        self.drain_pending_tasks()?;
+        // Cooperative scheduler (§112): once the top level is done, run every
+        // task round-robin until all reach a terminal state (§106).
+        self.run_scheduler()?;
 
-        Ok(())
-    }
-
-    /// Start and run every pending task, one at a time, until it reaches a
-    /// terminal state. Tasks awaited from within other tasks are started by
-    /// `execute_await` itself; this drain covers tasks nobody awaits.
-    fn drain_pending_tasks(&mut self) -> Result<(), VmError> {
-        while let Some(tid) = self
-            .tasks
-            .iter()
-            .position(|t| t.state == TaskState::Pending)
-        {
-            self.start_task(tid, false)?;
-            while self.call_stack.len() > 1 {
-                if self.pc >= self.program.instructions.len() {
-                    return Err(VmError::InvalidExecutionState(
-                        "Task execution ran past bytecode end".to_string(),
-                    ));
-                }
-                let instruction = self.program.instructions[self.pc].clone();
-                self.pc += 1;
-                if let Err(err) = self.execute_instruction(&instruction) {
-                    if let VmError::RuntimeError(msg) = err {
-                        self.raise_runtime_error(msg)?;
-                    } else {
-                        return Err(err);
-                    }
-                }
-            }
-        }
         Ok(())
     }
 
@@ -672,40 +706,16 @@ impl ZeroVM {
         self.validate()?;
         self.state = ExecutionState::Running;
 
-        let mut root_scope = HashMap::new();
-        for name in [
-            "print",
-            "type",
-            "number",
-            "string",
-            "boolean",
-            "list",
-            "object",
-            "color",
-            "file",
-            "system",
-            "json",
-            "task",
-        ] {
-            root_scope.insert(
-                name.to_string(),
-                Binding {
-                    value: Value::BuiltIn(name.to_string()),
-                    is_const: true,
-                    initialized: true,
-                    live: None,
-                },
-            );
-        }
+        self.global_scope.clear();
+        self.install_builtins();
         self.call_stack.push(Frame {
             function_index: 0,
-            scopes: vec![root_scope],
+            scopes: vec![HashMap::new()],
             return_pc: 0,
             captured_env: None,
             scope_env: None,
             return_instructions: None,
             task_id: None,
-            awaited: false,
         });
 
         let mut cache: HashMap<String, HashMap<String, ExportBinding>> = HashMap::new();
@@ -831,7 +841,7 @@ impl ZeroVM {
         }
 
         // Run tasks created during module initialization (§112 scheduler).
-        self.drain_pending_tasks()?;
+        self.run_scheduler()?;
 
         self.state = ExecutionState::Completed;
         Ok(())
@@ -1080,12 +1090,7 @@ impl ZeroVM {
     }
 
     fn execute_declare_global(&mut self, name: &str, is_const: bool) -> Result<(), VmError> {
-        let frame = self.call_stack.first_mut().ok_or_else(|| {
-            VmError::InvalidExecutionState("No global frame".to_string())
-        })?;
-        let scope = frame.scopes.first_mut().ok_or_else(|| {
-            VmError::InvalidExecutionState("No global scope".to_string())
-        })?;
+        let scope = &mut self.global_scope;
         const BUILTINS: &[&str] = &[
             "print",
             "type",
@@ -1125,15 +1130,11 @@ impl ZeroVM {
     }
 
     fn execute_load_global(&mut self, name: &str) -> Result<(), VmError> {
-        if let Some(frame) = self.call_stack.first() {
-            if let Some(scope) = frame.scopes.first() {
-                if let Some(binding) = scope.get(name) {
-                    let value = binding.value.clone();
-                    self.stack.push(value);
-                    self.track_stack_top();
-                    return Ok(());
-                }
-            }
+        if let Some(binding) = self.global_scope.get(name) {
+            let value = binding.value.clone();
+            self.stack.push(value);
+            self.track_stack_top();
+            return Ok(());
         }
         Err(VmError::RuntimeError(format!(
             "Undefined variable '{}'",
@@ -1146,8 +1147,9 @@ impl ZeroVM {
 
         let mut was_const = false;
         let mut found = false;
-        if let Some(frame) = self.call_stack.first_mut() {
-            if let Some(scope) = frame.scopes.first_mut() {
+        {
+            let scope = &mut self.global_scope;
+            {
                 if let Some(binding) = scope.get_mut(name) {
                     if binding.is_const && binding.initialized {
                         return Err(VmError::RuntimeError(format!(
@@ -1569,7 +1571,6 @@ impl ZeroVM {
                     scope_env: None,
                     return_instructions: Some(return_instructions),
                     task_id: None,
-                    awaited: false,
                 });
 
                 self.pc = 0;
@@ -1625,7 +1626,6 @@ impl ZeroVM {
                     scope_env: None,
                     return_instructions: Some(return_instructions),
                     task_id: None,
-                    awaited: false,
                 });
 
                 self.pc = 0;
@@ -1685,7 +1685,7 @@ impl ZeroVM {
     }
 
     /// Create a pending task for an async function call (§101). The body runs
-    /// when the task is awaited, or when the scheduler drains pending tasks.
+    /// when the scheduler gives the task control (round-robin ready queue, §112).
     fn create_task(
         &mut self,
         func_idx: usize,
@@ -1704,37 +1704,80 @@ impl ZeroVM {
         }
         self.tasks.push(Task {
             state: TaskState::Pending,
-            func_idx,
-            args,
-            callee,
-            env,
+            kind: TaskKind::Normal {
+                func_idx,
+                args,
+                callee,
+                env,
+            },
             result: None,
             error: None,
-            resume_stack_depth: 0,
+            context: None,
+            wait: None,
+            terminal_seq: None,
         });
+        self.ready_queue.push_back(id);
         self.stack.push(Value::Task(id));
         self.track_stack_top();
         Ok(())
     }
 
-    /// Start a pending task: mark it Running and push its body frame.
-    /// `awaited = true` when started by the Await opcode (result pushed to the
-    /// awaiter's stack on return); `false` for scheduler-started tasks.
-    fn start_task(&mut self, task_id: usize, awaited: bool) -> Result<(), VmError> {
-        if task_id >= self.tasks.len() {
-            return Err(VmError::RuntimeError(format!(
-                "Invalid task handle {}",
-                task_id
-            )));
+    /// Create a synthetic task driven by the scheduler instead of a function
+    /// body (§103, §104, §109-§111). Combinator inputs may already be
+    /// terminal, so they are evaluated immediately; sleeps only complete when
+    /// a timer fires (so `task.sleep(0)` still yields, §111).
+    fn create_synthetic_task(&mut self, kind: TaskKind) -> Result<usize, VmError> {
+        let id = self.tasks.len();
+        let is_sleep = matches!(kind, TaskKind::Sleep { .. });
+        self.tasks.push(Task {
+            state: TaskState::Pending,
+            kind,
+            result: None,
+            error: None,
+            context: None,
+            wait: None,
+            terminal_seq: None,
+        });
+        if !is_sleep {
+            self.reevaluate_synthetic(id)?;
         }
+        Ok(id)
+    }
+
+    /// Stamp the next terminal sequence number on a task reaching a terminal
+    /// state. `task.race` uses it to pick the genuinely first-finished input
+    /// even when several were already terminal (§104 determinism).
+    fn stamp_terminal(&mut self, id: usize) {
+        if self.tasks[id].terminal_seq.is_none() {
+            let seq = self.next_terminal_seq;
+            self.next_terminal_seq += 1;
+            self.tasks[id].terminal_seq = Some(seq);
+        }
+    }
+
+    /// Build the initial context for a pending normal task and mark it
+    /// running (§106). The scheduler loads the returned context to execute it.
+    fn prepare_task_start(&mut self, task_id: usize) -> Result<TaskContext, VmError> {
         if self.tasks[task_id].state != TaskState::Pending {
             return Err(VmError::InvalidExecutionState(format!(
                 "Cannot start task in state {}",
                 self.tasks[task_id].state.as_str()
             )));
         }
-
-        let func_idx = self.tasks[task_id].func_idx;
+        let (func_idx, args, callee, env) = match self.tasks[task_id].kind.clone() {
+            TaskKind::Normal {
+                func_idx,
+                args,
+                callee,
+                env,
+            } => (func_idx, args, callee, env),
+            _ => {
+                return Err(VmError::InvalidExecutionState(format!(
+                    "Task {} has no body to start",
+                    task_id
+                )))
+            }
+        };
         if func_idx >= self.program.functions.len() {
             return Err(VmError::RuntimeError(format!(
                 "Invalid function index {}",
@@ -1742,120 +1785,472 @@ impl ZeroVM {
             )));
         }
         let func_info = self.program.functions[func_idx].clone();
-        let args = self.tasks[task_id].args.clone();
-        let callee = self.tasks[task_id].callee.clone();
-        let env = self.tasks[task_id].env.clone();
-
         let root_scope = self.build_function_scope(&func_info, &args, &callee);
-
+        let instructions = if func_idx < self.program.function_bodies.len() {
+            self.program.function_bodies[func_idx].clone()
+        } else {
+            Vec::new()
+        };
         self.tasks[task_id].state = TaskState::Running;
-        self.tasks[task_id].resume_stack_depth = self.stack.len();
-
-        let return_pc = self.pc;
-        let return_instructions = self.program.instructions.clone();
-
-        if func_idx < self.program.function_bodies.len() {
-            self.program.instructions = self.program.function_bodies[func_idx].clone();
-        }
-
-        self.call_stack.push(Frame {
-            function_index: func_idx,
-            scopes: vec![root_scope],
-            return_pc,
-            captured_env: env,
-            scope_env: None,
-            return_instructions: Some(return_instructions),
-            task_id: Some(task_id),
-            awaited,
-        });
-
-        self.pc = 0;
-        Ok(())
+        Ok(TaskContext {
+            pc: 0,
+            instructions,
+            stack: Vec::new(),
+            call_stack: vec![Frame {
+                function_index: func_idx,
+                scopes: vec![root_scope],
+                return_pc: 0,
+                captured_env: env,
+                scope_env: None,
+                return_instructions: None,
+                task_id: Some(task_id),
+            }],
+            handlers: Vec::new(),
+            pending_error: None,
+            pending_return: None,
+        })
     }
 
-    /// Record a task reaching `completed` with its result (§106, §107).
-    fn finish_task(&mut self, task_id: usize, result: &Value) {
+    /// Save the active instruction-loop state into `task_id`'s context.
+    /// Called when a task suspends on `await` (§112).
+    fn save_active_context(&mut self, task_id: usize) {
+        let ctx = TaskContext {
+            pc: self.pc,
+            instructions: std::mem::take(&mut self.program.instructions),
+            stack: std::mem::take(&mut self.stack),
+            call_stack: std::mem::take(&mut self.call_stack),
+            handlers: std::mem::take(&mut self.handlers),
+            pending_error: self.pending_error.take(),
+            pending_return: self.pending_return.take(),
+        };
+        self.tasks[task_id].context = Some(ctx);
+    }
+
+    /// Load a saved context into the instruction-loop fields.
+    fn load_context(&mut self, ctx: TaskContext) {
+        self.pc = ctx.pc;
+        self.program.instructions = ctx.instructions;
+        self.stack = ctx.stack;
+        self.call_stack = ctx.call_stack;
+        self.handlers = ctx.handlers;
+        self.pending_error = ctx.pending_error;
+        self.pending_return = ctx.pending_return;
+    }
+
+    /// Record a task reaching `completed` with its result (§106, §107) and
+    /// wake everything waiting on it (§103, §104, §109, §110).
+    fn finish_task(&mut self, task_id: usize, result: &Value) -> Result<(), VmError> {
         if !self.tasks[task_id].state.is_terminal() {
             self.tasks[task_id].state = TaskState::Completed;
             self.tasks[task_id].result = Some(result.clone());
+            self.tasks[task_id].context = None;
             self.track_value_heap_refs(result);
+            self.stamp_terminal(task_id);
+            self.notify_dependents(task_id)?;
         }
+        Ok(())
     }
 
-    /// Mark a task `failed` and unwind its frame (§106, §108).
-    ///
-    /// If the task was awaited, re-raise the error at the await point (so the
-    /// awaiter's try/catch can handle it, §108). If nobody awaits it, the
-    /// error stays stored on the task and execution continues (§108: a failed
-    /// un-awaited task must not throw into another scope).
+    /// Mark a task `failed`, discard its context, and wake dependents (§106,
+    /// §108). The error stays stored; it is thrown only where the task is
+    /// awaited — an un-awaited failure must not stop the program (§108).
     fn fail_task(&mut self, task_id: usize, msg: String) -> Result<(), VmError> {
         if task_id >= self.tasks.len() {
             return Err(VmError::RuntimeError(msg));
         }
-
-        let awaited = match self
-            .call_stack
-            .iter()
-            .rposition(|f| f.task_id == Some(task_id))
-        {
-            Some(frame_idx) => {
-                self.tasks[task_id].state = TaskState::Failed;
-                self.tasks[task_id].error = Some(msg.clone());
-
-                // Unwind the task's frame and anything above it.
-                let mut task_return_pc = None;
-                let mut awaited_flag = false;
-                while self.call_stack.len() > frame_idx {
-                    let frame = self.call_stack.pop().unwrap();
-                    if frame.task_id == Some(task_id) {
-                        task_return_pc = Some(frame.return_pc);
-                        awaited_flag = frame.awaited;
-                    }
-                    if let Some(instrs) = frame.return_instructions {
-                        self.program.instructions = instrs;
-                    }
-                }
-                if let Some(pc) = task_return_pc {
-                    self.pc = pc;
-                }
-
-                // Drop handlers installed inside the task body.
-                self.handlers.retain(|h| h.frame_depth <= frame_idx);
-                // Restore the value stack to the await/drain entry point.
-                let resume = self.tasks[task_id].resume_stack_depth;
-                if self.stack.len() > resume {
-                    self.stack.truncate(resume);
-                }
-                awaited_flag
+        if !self.tasks[task_id].state.is_terminal() {
+            self.tasks[task_id].state = TaskState::Failed;
+            self.tasks[task_id].error = Some(msg);
+            self.tasks[task_id].context = None;
+            self.tasks[task_id].wait = None;
+            self.stamp_terminal(task_id);
+            if self.active_task == Some(task_id) {
+                // The failing task owns the active loop fields: clear them so
+                // the step loop exits.
+                self.stack.clear();
+                self.call_stack.clear();
+                self.handlers.clear();
+                self.pending_error = None;
+                self.pending_return = None;
+                self.active_task = None;
             }
-            // Task frame already gone (e.g. unwound by an outer failure):
-            // only record the state.
-            None => {
-                self.tasks[task_id].state = TaskState::Failed;
-                self.tasks[task_id].error = Some(msg.clone());
-                false
-            }
-        };
-
-        if awaited {
-            // Re-raise in the awaiting context (catchable via try/catch).
-            self.raise_runtime_error(msg)
-        } else {
-            Ok(())
+            self.notify_dependents(task_id)?;
         }
+        Ok(())
+    }
+
+    /// Cancel a non-terminal task (§105). Already-terminal tasks are a no-op.
+    /// Cancellation is cooperative: under the single-threaded scheduler other
+    /// code can only reach a task while it is pending or suspended, so its
+    /// saved context is simply discarded (ISSUES.md §64 for limits).
+    fn cancel_task(&mut self, task_id: usize) -> Result<(), VmError> {
+        if task_id >= self.tasks.len() {
+            return Err(VmError::RuntimeError(format!(
+                "Invalid task handle {}",
+                task_id
+            )));
+        }
+        if self.tasks[task_id].state.is_terminal() {
+            return Ok(()); // §105: cancelling a finished task is a no-op.
+        }
+        if self.active_task == Some(task_id) {
+            // Spec is silent on self-cancellation; refusing avoids inventing
+            // an unwind rule (ISSUES.md §64).
+            return Err(VmError::RuntimeError(
+                "Cannot cancel the currently running task".to_string(),
+            ));
+        }
+        self.tasks[task_id].state = TaskState::Cancelled;
+        self.tasks[task_id].context = None;
+        self.tasks[task_id].wait = None;
+        self.stamp_terminal(task_id);
+        self.notify_dependents(task_id)
+    }
+
+    /// Wake everything that depends on `tid` reaching a terminal state:
+    /// synthetic combinators are re-evaluated; suspended awaiters are queued
+    /// so the scheduler can resume them (§112).
+    fn notify_dependents(&mut self, tid: usize) -> Result<(), VmError> {
+        if tid >= self.tasks.len() {
+            return Ok(());
+        }
+        let mut waiters = Vec::new();
+        for i in 0..self.tasks.len() {
+            if i == tid {
+                continue;
+            }
+            let depends = match &self.tasks[i].kind {
+                TaskKind::All(ids) | TaskKind::Race(ids) => ids.contains(&tid),
+                TaskKind::Wait(target) | TaskKind::Timeout { target, .. } => *target == tid,
+                _ => false,
+            };
+            if depends && !self.tasks[i].state.is_terminal() {
+                self.reevaluate_synthetic(i)?;
+            }
+            if self.tasks[i].wait == Some(tid)
+                && matches!(self.tasks[i].state, TaskState::Running)
+            {
+                waiters.push(i);
+            }
+        }
+        for w in waiters {
+            self.ready_queue.push_back(w);
+        }
+        Ok(())
+    }
+
+    /// Re-evaluate a synthetic task after an input changes state or right
+    /// after creation (§103, §104, §109-§111).
+    fn reevaluate_synthetic(&mut self, id: usize) -> Result<(), VmError> {
+        if id >= self.tasks.len() || self.tasks[id].state.is_terminal() {
+            return Ok(());
+        }
+        match self.tasks[id].kind.clone() {
+            TaskKind::Normal { .. } => Ok(()),
+            TaskKind::All(ids) => {
+                // Fail fast: propagate the first failure without waiting for
+                // the remaining tasks to finish (Scope B; §103).
+                for &x in &ids {
+                    match self.tasks[x].state {
+                        TaskState::Failed => {
+                            let msg = self.tasks[x]
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "Task failed".to_string());
+                            return self.fail_task(id, msg);
+                        }
+                        TaskState::Cancelled => {
+                            return self.fail_task(id, "Task was cancelled".to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                if ids
+                    .iter()
+                    .all(|&x| self.tasks[x].state == TaskState::Completed)
+                {
+                    let mut results = Vec::with_capacity(ids.len());
+                    for &x in &ids {
+                        results.push(self.tasks[x].result.clone().unwrap_or(Value::Null));
+                    }
+                    let list = self.values_to_list(results)?;
+                    return self.finish_task(id, &list);
+                }
+                Ok(())
+            }
+            TaskKind::Race(ids) => {
+                // First input to have finished (by terminal order) decides —
+                // deterministic under the single-threaded scheduler (§104).
+                let mut winner: Option<usize> = None;
+                let mut best_seq = u64::MAX;
+                for &x in &ids {
+                    if let Some(seq) = self.tasks[x].terminal_seq {
+                        if seq < best_seq {
+                            best_seq = seq;
+                            winner = Some(x);
+                        }
+                    }
+                }
+                let Some(w) = winner else { return Ok(()) };
+                match self.tasks[w].state {
+                    TaskState::Completed => {
+                        let r = self.tasks[w].result.clone().unwrap_or(Value::Null);
+                        self.finish_task(id, &r)
+                    }
+                    TaskState::Failed => {
+                        let m = self.tasks[w]
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "Task failed".to_string());
+                        self.fail_task(id, m)
+                    }
+                    TaskState::Cancelled => self.fail_task(id, "Task was cancelled".to_string()),
+                    _ => Ok(()),
+                }
+            }
+            TaskKind::Wait(target) => match self.tasks[target].state {
+                TaskState::Completed => self.finish_task(id, &Value::Null),
+                TaskState::Failed => {
+                    let m = self.tasks[target]
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Task failed".to_string());
+                    self.fail_task(id, m)
+                }
+                TaskState::Cancelled => self.fail_task(id, "Task was cancelled".to_string()),
+                _ => Ok(()),
+            },
+            TaskKind::Sleep { deadline_ms } => {
+                if self.now_ms >= deadline_ms {
+                    self.finish_task(id, &Value::Null)
+                } else {
+                    Ok(())
+                }
+            }
+            TaskKind::Timeout { target, deadline_ms } => match self.tasks[target].state {
+                TaskState::Completed => {
+                    let r = self.tasks[target].result.clone().unwrap_or(Value::Null);
+                    self.finish_task(id, &r)
+                }
+                TaskState::Failed => {
+                    let m = self.tasks[target]
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Task failed".to_string());
+                    self.fail_task(id, m)
+                }
+                TaskState::Cancelled => self.fail_task(id, "Task was cancelled".to_string()),
+                _ if self.now_ms >= deadline_ms => {
+                    // §110: timeout errors the wait; the task is not cancelled.
+                    self.fail_task(
+                        id,
+                        "task.timeout(): task did not complete before the timeout".to_string(),
+                    )
+                }
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// Fire every sleep/timeout whose deadline has been reached (§110, §111).
+    /// Returns true if any timer task was re-evaluated.
+    fn wake_due_timers(&mut self) -> Result<bool, VmError> {
+        let mut woken = false;
+        for id in 0..self.tasks.len() {
+            let due = match self.tasks[id].kind {
+                TaskKind::Sleep { deadline_ms } | TaskKind::Timeout { deadline_ms, .. } => {
+                    self.now_ms >= deadline_ms
+                }
+                _ => false,
+            };
+            if due && !self.tasks[id].state.is_terminal() {
+                self.reevaluate_synthetic(id)?;
+                woken = true;
+            }
+        }
+        Ok(woken)
+    }
+
+    /// Earliest outstanding timer deadline, if any.
+    fn earliest_deadline(&self) -> Option<u128> {
+        self.tasks
+            .iter()
+            .filter(|t| !t.state.is_terminal())
+            .filter_map(|t| match t.kind {
+                TaskKind::Sleep { deadline_ms } => Some(deadline_ms),
+                TaskKind::Timeout { deadline_ms, .. } => Some(deadline_ms),
+                _ => None,
+            })
+            .min()
+    }
+
+    fn count_terminal(&self) -> usize {
+        self.tasks.iter().filter(|t| t.state.is_terminal()).count()
+    }
+
+    /// Pop the next runnable normal task from the FIFO ready queue (§112).
+    /// Stale entries (terminal or re-suspended tasks) are skipped.
+    fn pop_runnable(&mut self) -> Option<usize> {
+        while let Some(tid) = self.ready_queue.pop_front() {
+            if tid >= self.tasks.len() {
+                continue;
+            }
+            if !matches!(self.tasks[tid].kind, TaskKind::Normal { .. }) {
+                continue; // synthetics are event-driven, never queued
+            }
+            match self.tasks[tid].state {
+                TaskState::Pending => return Some(tid),
+                TaskState::Running if self.tasks[tid].context.is_some() => return Some(tid),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Cooperative scheduler (§112): run ready tasks round-robin until every
+    /// task reaches a terminal state. Awaiting/sleeping tasks never block
+    /// other ready tasks; when nothing is runnable the virtual clock jumps
+    /// straight to the next timer deadline (§110, §111).
+    fn run_scheduler(&mut self) -> Result<(), VmError> {
+        loop {
+            // Ready queue must hold every pending normal task (heal in case
+            // an entry was consumed by a stale pop).
+            for id in 0..self.tasks.len() {
+                if matches!(self.tasks[id].kind, TaskKind::Normal { .. })
+                    && self.tasks[id].state == TaskState::Pending
+                    && !self.ready_queue.contains(&id)
+                {
+                    self.ready_queue.push_back(id);
+                }
+            }
+
+            self.wake_due_timers()?;
+
+            if let Some(tid) = self.pop_runnable() {
+                self.run_task_step(tid)?;
+                continue;
+            }
+
+            // Nothing runnable: jump the virtual clock to the next deadline.
+            if let Some(d) = self.earliest_deadline() {
+                let before = self.count_terminal();
+                if d > self.now_ms {
+                    self.now_ms = d;
+                }
+                self.wake_due_timers()?;
+                if self.count_terminal() == before && self.ready_queue.is_empty() {
+                    return Err(VmError::InvalidExecutionState(
+                        "Scheduler made no progress waking timers".to_string(),
+                    ));
+                }
+                continue;
+            }
+
+            // No timers left. Either every task is terminal, or the remaining
+            // tasks wait on each other forever (spec has no cycle rule).
+            if self.tasks.iter().any(|t| !t.state.is_terminal()) {
+                return Err(VmError::RuntimeError(
+                    "Task deadlock: remaining tasks are waiting on each other".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+    }
+
+    /// Run one task until it suspends on `await` or reaches a terminal state.
+    /// Its context is saved back to the task table on suspension (§112).
+    fn run_task_step(&mut self, tid: usize) -> Result<(), VmError> {
+        match self.tasks[tid].state {
+            TaskState::Pending => {
+                let ctx = self.prepare_task_start(tid)?;
+                self.active_task = Some(tid);
+                self.load_context(ctx);
+            }
+            TaskState::Running => {
+                let ctx = self.tasks[tid].context.take().ok_or_else(|| {
+                    VmError::InvalidExecutionState(format!(
+                        "Task {} has no saved context",
+                        tid
+                    ))
+                })?;
+                self.active_task = Some(tid);
+                self.load_context(ctx);
+                // Resolve an outstanding await whose target is terminal now
+                // (§107: completed → result, failed/cancelled → error).
+                if let Some(target) = self.tasks[tid].wait {
+                    match self.tasks[target].state {
+                        TaskState::Completed => {
+                            let result =
+                                self.tasks[target].result.clone().unwrap_or(Value::Null);
+                            self.tasks[tid].wait = None;
+                            self.stack.push(result);
+                            self.track_stack_top();
+                        }
+                        TaskState::Failed => {
+                            let msg = self.tasks[target]
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "Task failed".to_string());
+                            self.tasks[tid].wait = None;
+                            // May dispatch to this task's try/catch or fail it.
+                            self.raise_runtime_error(msg)?;
+                        }
+                        TaskState::Cancelled => {
+                            self.tasks[tid].wait = None;
+                            self.raise_runtime_error("Task was cancelled".to_string())?;
+                        }
+                        _ => {
+                            // Stale queue entry — target not terminal yet:
+                            // re-suspend without executing.
+                            self.save_active_context(tid);
+                            self.active_task = None;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            _ => return Ok(()), // stale entry for a terminal task
+        }
+
+        while !self.call_stack.is_empty() {
+            if self.tasks[tid].wait.is_some() {
+                // Suspended on await: save the context, hand control back.
+                self.save_active_context(tid);
+                self.active_task = None;
+                return Ok(());
+            }
+            if self.pc >= self.program.instructions.len() {
+                return Err(VmError::InvalidExecutionState(
+                    "Task execution ran past bytecode end".to_string(),
+                ));
+            }
+            let instruction = self.program.instructions[self.pc].clone();
+            self.pc += 1;
+            if let Err(err) = self.execute_instruction(&instruction) {
+                if let VmError::RuntimeError(msg) = err {
+                    self.raise_runtime_error(msg)?;
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+        // The task finished or failed; its context is gone.
+        self.active_task = None;
+        Ok(())
     }
 
     /// `await expr` (§49, §101, §107, §113): resolve a task to its result.
     ///
     /// - completed → stored result, without re-running the body
-    /// - failed → re-raise the stored error at the await point (catchable)
-    /// - cancelled → cancellation error
-    /// - pending → start the task body now and suspend this frame until it
-    ///   returns (single-task cooperative driver; see Required Final Report)
-    /// - non-task → runtime ERROR (spec silent; see ISSUES.md)
+    /// - failed → stored error thrown here (catchable, §108)
+    /// - cancelled → cancellation error (§105, §113)
+    /// - pending/running → suspend the current task; the scheduler runs other
+    ///   ready tasks until the target is terminal (§107: await waits for a
+    ///   running task instead of blocking others, §112)
+    /// - non-task → runtime ERROR (spec silent; ISSUES.md §63b)
     fn execute_await(&mut self) -> Result<(), VmError> {
         let value = self.pop_stack("await")?;
-        let task_id = match value {
+        let target = match value {
             Value::Task(id) => id,
             other => {
                 return Err(VmError::RuntimeError(format!(
@@ -1865,37 +2260,46 @@ impl ZeroVM {
             }
         };
 
-        if task_id >= self.tasks.len() {
+        if target >= self.tasks.len() {
             return Err(VmError::RuntimeError(format!(
                 "Invalid task handle {}",
-                task_id
+                target
             )));
         }
 
-        match self.tasks[task_id].state {
+        match self.tasks[target].state {
             TaskState::Completed => {
-                let result = self.tasks[task_id].result.clone().unwrap_or(Value::Null);
+                let result = self.tasks[target].result.clone().unwrap_or(Value::Null);
                 self.stack.push(result);
                 self.track_stack_top();
                 Ok(())
             }
-            TaskState::Failed => {
-                let msg = self.tasks[task_id]
+            TaskState::Failed => Err(VmError::RuntimeError(
+                self.tasks[target]
                     .error
                     .clone()
-                    .unwrap_or_else(|| "Task failed".to_string());
-                Err(VmError::RuntimeError(msg))
+                    .unwrap_or_else(|| "Task failed".to_string()),
+            )),
+            TaskState::Cancelled => Err(VmError::RuntimeError(
+                "Task was cancelled".to_string(),
+            )),
+            TaskState::Pending | TaskState::Running => {
+                // Only task contexts may suspend; top-level await is rejected
+                // at compile time (§49, §101; ISSUES.md §63a).
+                let Some(tid) = self.active_task else {
+                    return Err(VmError::RuntimeError(
+                        "await cannot suspend the top-level program".to_string(),
+                    ));
+                };
+                if target == tid {
+                    return Err(VmError::RuntimeError(
+                        "Cannot await a task from within itself".to_string(),
+                    ));
+                }
+                self.tasks[tid].wait = Some(target);
+                // The step loop sees `wait` set and saves the context.
+                Ok(())
             }
-            TaskState::Cancelled => Err(VmError::RuntimeError("Task was cancelled".to_string())),
-            TaskState::Running => {
-                // Re-entrant await (e.g. a task awaiting itself). The spec
-                // does not define this; treat it as an error rather than
-                // deadlocking the single-threaded driver.
-                Err(VmError::RuntimeError(
-                    "Task is already running".to_string(),
-                ))
-            }
-            TaskState::Pending => self.start_task(task_id, true),
         }
     }
 
@@ -2375,10 +2779,115 @@ impl ZeroVM {
                     )),
                 }
             }
+            // ---- task.* group/race/cancel/wait/timeout/sleep (§103-§105, §109-§111) ----
+            "task.all" => {
+                if args.len() != 1 {
+                    return Err(VmError::RuntimeError(
+                        "task.all() expects exactly 1 argument".to_string(),
+                    ));
+                }
+                let ids = self.task_ids_from_list(&args[0], "task.all()")?;
+                let id = self.create_synthetic_task(TaskKind::All(ids))?;
+                Ok(Value::Task(id))
+            }
+            "task.race" => {
+                if args.len() != 1 {
+                    return Err(VmError::RuntimeError(
+                        "task.race() expects exactly 1 argument".to_string(),
+                    ));
+                }
+                let ids = self.task_ids_from_list(&args[0], "task.race()")?;
+                if ids.is_empty() {
+                    // §104: no task to wait for → ERROR.
+                    return Err(VmError::RuntimeError(
+                        "task.race() requires at least one task".to_string(),
+                    ));
+                }
+                let id = self.create_synthetic_task(TaskKind::Race(ids))?;
+                Ok(Value::Task(id))
+            }
+            "task.cancel" => {
+                if args.len() != 1 {
+                    return Err(VmError::RuntimeError(
+                        "task.cancel() expects exactly 1 argument".to_string(),
+                    ));
+                }
+                let tid = expect_task_arg(&args, 0, "task.cancel()")?;
+                self.cancel_task(tid)?;
+                Ok(Value::Null)
+            }
+            "task.wait" => {
+                if args.len() != 1 {
+                    return Err(VmError::RuntimeError(
+                        "task.wait() expects exactly 1 argument".to_string(),
+                    ));
+                }
+                let tid = expect_task_arg(&args, 0, "task.wait()")?;
+                let id = self.create_synthetic_task(TaskKind::Wait(tid))?;
+                Ok(Value::Task(id))
+            }
+            "task.timeout" => {
+                if args.len() != 2 {
+                    return Err(VmError::RuntimeError(
+                        "task.timeout() expects exactly 2 arguments".to_string(),
+                    ));
+                }
+                let target = expect_task_arg(&args, 0, "task.timeout()")?;
+                let ms = duration_ms(&args[1], "task.timeout()")?;
+                let id = self.create_synthetic_task(TaskKind::Timeout {
+                    target,
+                    deadline_ms: self.now_ms + ms,
+                })?;
+                Ok(Value::Task(id))
+            }
+            "task.sleep" => {
+                if args.len() != 1 {
+                    return Err(VmError::RuntimeError(
+                        "task.sleep() expects exactly 1 argument".to_string(),
+                    ));
+                }
+                let ms = duration_ms(&args[0], "task.sleep()")?;
+                let id = self.create_synthetic_task(TaskKind::Sleep {
+                    deadline_ms: self.now_ms + ms,
+                })?;
+                Ok(Value::Task(id))
+            }
             _ => Err(VmError::RuntimeError(format!(
                 "Unknown built-in '{}'",
                 name
             ))),
+        }
+    }
+
+    /// Read a list argument as task ids (§103, §104). Every element must be
+    /// an asynchronous task.
+    fn task_ids_from_list(&self, value: &Value, fname: &str) -> Result<Vec<usize>, VmError> {
+        let r = match value {
+            Value::List(r) => r.clone(),
+            _ => {
+                return Err(VmError::RuntimeError(format!(
+                    "{} expects a list",
+                    fname
+                )))
+            }
+        };
+        match self.heap.get(&r) {
+            Ok(HeapObject::List { items, .. }) => {
+                let mut ids = Vec::with_capacity(items.len());
+                for item_ref in items {
+                    match self.heap.get(item_ref) {
+                        Ok(HeapObject::Task(id)) => ids.push(*id),
+                        _ => {
+                            return Err(VmError::RuntimeError(format!(
+                                "{} list elements must be tasks",
+                                fname
+                            )))
+                        }
+                    }
+                }
+                Ok(ids)
+            }
+            _ => Err(VmError::RuntimeError(format!("{} expects a list", fname))),
         }
     }
 
@@ -2631,13 +3140,10 @@ impl ZeroVM {
         self.handlers.retain(|h| h.frame_depth <= new_depth);
 
         if let Some(tid) = frame.task_id {
-            // Task body finished: store the result (§106, §107).
-            self.finish_task(tid, &return_value);
-            if frame.awaited {
-                // The awaiting frame resumes with the task's result.
-                self.stack.push(return_value);
-                self.track_stack_top();
-            }
+            // Base frame of a task context: the body finished (§106, §107).
+            // The context is discarded, dependents are woken, and any awaiter
+            // resolves its await when the scheduler resumes it (§107).
+            self.finish_task(tid, &return_value)?;
         } else {
             self.stack.push(return_value);
             self.track_stack_top();
@@ -2693,13 +3199,10 @@ impl ZeroVM {
         }
 
         if let Some(tid) = frame.task_id {
-            // Task body finished: store the result (§106, §107).
-            self.finish_task(tid, &return_value);
-            if frame.awaited {
-                // The awaiting frame resumes with the task's result.
-                self.stack.push(return_value);
-                self.track_stack_top();
-            }
+            // Base frame of a task context: the body finished (§106, §107).
+            // The context is discarded, dependents are woken, and any awaiter
+            // resolves its await when the scheduler resumes it (§107).
+            self.finish_task(tid, &return_value)?;
         } else {
             self.stack.push(return_value);
             self.track_stack_top();
@@ -2801,6 +3304,11 @@ impl ZeroVM {
             }
         }
 
+        // Fall back to the shared global scope (builtins + top-level vars).
+        if let Some(binding) = self.global_scope.get(name) {
+            return Ok(binding.value.clone());
+        }
+
         Err(VmError::RuntimeError(format!(
             "Undefined variable '{}'",
             name
@@ -2823,6 +3331,11 @@ impl ZeroVM {
                     return Ok(value);
                 }
             }
+        }
+
+        // Fall back to the shared global scope (builtins + top-level vars).
+        if let Some(binding) = self.global_scope.get(name) {
+            return Ok(binding.value.clone());
         }
 
         Err(VmError::RuntimeError(format!(
@@ -3221,7 +3734,7 @@ impl ZeroVM {
                     "file" => &["read", "write", "exists", "remove", "mkdir"],
                     "system" => &["args", "env", "os", "arch"],
                     "json" => &["parse", "stringify"],
-                    "task" => &["state"],
+                    "task" => &["state", "all", "race", "cancel", "wait", "timeout", "sleep"],
                     _ => &[],
                 };
                 if known.contains(&name) {
@@ -3365,6 +3878,37 @@ fn expect_list_arg(args: &[Value], idx: usize, fname: &str) -> Result<HeapRefHan
             fname,
             idx + 1,
             other
+        ))),
+    }
+}
+
+/// Require `args[idx]` to be a task handle (§105, §109, §110).
+fn expect_task_arg(args: &[Value], idx: usize, fname: &str) -> Result<usize, VmError> {
+    if idx >= args.len() {
+        return Err(VmError::RuntimeError(format!(
+            "{} expects at least {} argument(s)",
+            fname,
+            idx + 1
+        )));
+    }
+    match &args[idx] {
+        Value::Task(id) => Ok(*id),
+        other => Err(VmError::RuntimeError(format!(
+            "{} argument {} must be a task, got {:?}",
+            fname,
+            idx + 1,
+            other
+        ))),
+    }
+}
+
+/// Parse a non-negative integer millisecond duration (§110, §111).
+fn duration_ms(value: &Value, fname: &str) -> Result<u128, VmError> {
+    match value {
+        Value::Number(n) if n.is_finite() && *n >= 0.0 && n.fract() == 0.0 => Ok(*n as u128),
+        _ => Err(VmError::RuntimeError(format!(
+            "{} time must be a non-negative integer number of milliseconds",
+            fname
         ))),
     }
 }
@@ -7353,5 +7897,439 @@ outer()"#,
         )
         .unwrap();
         assert_eq!(output, vec!["15"]);
+    }
+
+    // ==================== Job 015: Async Concurrency ====================
+
+    /// Req 1 (§102): several tasks are created before any await; both
+    /// progress concurrently — the short task reaches a terminal state while
+    /// the long task is still being awaited, and each result stays separate.
+    #[test]
+    fn test_job015_concurrent_creation_before_await() {
+        let output = run_source(
+            r#"async function ambilUser() { await task.sleep(60)
+    return "user" }
+async function ambilData() { await task.sleep(10)
+    return "data" }
+async function main() {
+    let userTask = ambilUser()
+    let dataTask = ambilData()
+    let user = await userTask
+    print(user)
+    print(task.state(dataTask))
+    let data = await dataTask
+    print(data)
+}
+main()"#,
+        )
+        .unwrap();
+        // dataTask (10 ms) completed while main was still awaiting
+        // userTask (60 ms): creating task A first does not gate task B.
+        assert_eq!(output, vec!["user", "completed", "data"]);
+    }
+
+    /// Req 2 (§103): task.all() waits for every task and returns results in
+    /// input order, not completion order.
+    #[test]
+    fn test_job015_all_results_input_order() {
+        let output = run_source(
+            r#"async function slow() { await task.sleep(60)
+    return "slow" }
+async function fast() { await task.sleep(10)
+    return "fast" }
+async function main() {
+    let results = await task.all([slow(), fast()])
+    print(results[0])
+    print(results[1])
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["slow", "fast"]);
+    }
+
+    /// Req 3 (§103): task.all([]) → empty list.
+    #[test]
+    fn test_job015_all_empty_list() {
+        let output = run_source(
+            r#"async function main() {
+    let results = await task.all([])
+    print(type(results))
+    print(list.length(results))
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["list", "0"]);
+    }
+
+    /// Req 4 (§103): one failing task fails task.all() (fail-fast, error
+    /// forwarded) and does not cancel or corrupt the other tasks.
+    #[test]
+    fn test_job015_all_fail_fast() {
+        let output = run_source(
+            r#"async function bad() { return nosuchvar }
+async function slow() { await task.sleep(200)
+    return "ok" }
+async function main() {
+    let s = slow()
+    try {
+        await task.all([bad(), s])
+        print("no error")
+    } catch e {
+        print("caught")
+        print(task.state(s))
+    }
+}
+main()"#,
+        )
+        .unwrap();
+        // The slow task is untouched by the sibling failure: still running.
+        assert_eq!(output, vec!["caught", "running"]);
+    }
+
+    /// Req 5 (§103): a non-task element in the list → ERROR.
+    #[test]
+    fn test_job015_all_non_task_error() {
+        let output = run_source(
+            r#"async function main() {
+    try {
+        await task.all([1, 2])
+        print("no error")
+    } catch e {
+        print("caught")
+    }
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["caught"]);
+    }
+
+    /// Req 6 (§104): task.race() yields the first finisher's result; losing
+    /// tasks are not cancelled (they keep running).
+    #[test]
+    fn test_job015_race_first_finisher_wins() {
+        let output = run_source(
+            r#"async function slow() { await task.sleep(60)
+    return "slow" }
+async function fast() { await task.sleep(10)
+    return "fast" }
+async function main() {
+    let s = slow()
+    let f = fast()
+    let winner = await task.race([s, f])
+    print(winner)
+    print(task.state(s))
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["fast", "running"]);
+    }
+
+    /// Req 7 (§104): if the first finisher fails, task.race() forwards the
+    /// error to the awaiter.
+    #[test]
+    fn test_job015_race_first_finisher_error() {
+        let output = run_source(
+            r#"async function bad() { return nosuchvar }
+async function slow() { await task.sleep(200)
+    return "slow" }
+async function main() {
+    try {
+        await task.race([bad(), slow()])
+        print("no error")
+    } catch e {
+        print("caught")
+    }
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["caught"]);
+    }
+
+    /// Req 8 (§104): task.race([]) → ERROR (nothing to wait for).
+    #[test]
+    fn test_job015_race_empty_error() {
+        let output = run_source(
+            r#"async function main() {
+    try {
+        await task.race([])
+        print("no error")
+    } catch e {
+        print("caught")
+    }
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["caught"]);
+    }
+
+    /// Req 9 (§105): task.cancel() on a running task → state becomes
+    /// "cancelled".
+    #[test]
+    fn test_job015_cancel_running_task() {
+        let output = run_source(
+            r#"async function sleepy() { await task.sleep(1000)
+    print("never") }
+async function main() {
+    let t = sleepy()
+    await task.sleep(0)
+    print(task.state(t))
+    task.cancel(t)
+    print(task.state(t))
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["running", "cancelled"]);
+    }
+
+    /// Req 10 (§105): task.cancel() on a completed task is a no-op — no
+    /// error, state unchanged.
+    #[test]
+    fn test_job015_cancel_completed_noop() {
+        let output = run_source(
+            r#"async function quick() { return 1 }
+async function main() {
+    let t = quick()
+    let r = await t
+    task.cancel(t)
+    print(task.state(t))
+    print(r)
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["completed", "1"]);
+    }
+
+    /// Req 11 (§105): awaiting a cancelled task raises a cancellation error
+    /// that try/catch handles.
+    #[test]
+    fn test_job015_await_cancelled_is_error() {
+        let output = run_source(
+            r#"async function sleepy() { await task.sleep(1000)
+    return "never" }
+async function main() {
+    let t = sleepy()
+    await task.sleep(0)
+    task.cancel(t)
+    try {
+        await t
+        print("no error")
+    } catch e {
+        print("caught")
+    }
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["caught"]);
+    }
+
+    /// Req 12 (§109): task.wait() on completed → Null (result not taken);
+    /// on failed → the task error; on cancelled → the cancellation error.
+    #[test]
+    fn test_job015_wait_terminal_states() {
+        let output = run_source(
+            r#"async function ok() { return 1 }
+async function bad() { return nosuchvar }
+async function sleepy() { await task.sleep(1000)
+    return "never" }
+async function main() {
+    let a = ok()
+    let b = bad()
+    let c = sleepy()
+    let w = await task.wait(a)
+    print(type(w))
+    try {
+        await task.wait(b)
+        print("no error")
+    } catch e {
+        print("wait failed caught")
+    }
+    task.cancel(c)
+    try {
+        await task.wait(c)
+        print("no error")
+    } catch e {
+        print("wait cancelled caught")
+    }
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            vec!["null", "wait failed caught", "wait cancelled caught"]
+        );
+    }
+
+    /// Req 13 (§110): task finishes before the limit → normal result.
+    #[test]
+    fn test_job015_timeout_success() {
+        let output = run_source(
+            r#"async function quick() { await task.sleep(10)
+    return "ok" }
+async function main() {
+    let t = quick()
+    let r = await task.timeout(t, 5000)
+    print(r)
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["ok"]);
+    }
+
+    /// Req 14 (§110): timeout → ERROR, and the timed-out task is NOT
+    /// cancelled — it keeps running and can still finish normally.
+    #[test]
+    fn test_job015_timeout_error_task_keeps_running() {
+        let output = run_source(
+            r#"async function slow() { await task.sleep(500)
+    print("slow done")
+    return "slow" }
+async function main() {
+    let t = slow()
+    try {
+        await task.timeout(t, 10)
+        print("no timeout")
+    } catch e {
+        print("timeout caught")
+    }
+    print(task.state(t))
+    await task.wait(t)
+    print("finished")
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            vec!["timeout caught", "running", "slow done", "finished"]
+        );
+    }
+
+    /// Req 15 (§111, §112): completion order follows sleep duration, not
+    /// creation order — mirrors the §112 example (1000 ms vs 500 ms).
+    #[test]
+    fn test_job015_sleep_ordering_not_creation_order() {
+        let output = run_source(
+            r#"async function A() { await task.sleep(1000)
+    print("A") }
+async function B() { await task.sleep(500)
+    print("B") }
+async function main() {
+    let taskA = A()
+    let taskB = B()
+    await task.all([taskA, taskB])
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["B", "A"]);
+    }
+
+    /// Req 16 (§111): task.sleep(0) does not crash or hang; it yields to
+    /// other runnable tasks before resuming.
+    #[test]
+    fn test_job015_sleep_zero_yields() {
+        let output = run_source(
+            r#"async function other() { print("other") }
+async function main() {
+    let o = other()
+    await task.sleep(0)
+    print("main")
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["other", "main"]);
+    }
+
+    /// Extra: task.cancel() on a non-task argument → ERROR (§105 requires
+    /// an asynchronous task).
+    #[test]
+    fn test_job015_cancel_non_task_error() {
+        let output = run_source(
+            r#"async function main() {
+    try {
+        task.cancel(42)
+        print("no error")
+    } catch e {
+        print("caught")
+    }
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["caught"]);
+    }
+
+    /// Extra (ISSUES §64b): cancelling the currently running task from
+    /// inside its own body → runtime ERROR (spec silent; a single-threaded
+    /// scheduler cannot unwind itself).
+    #[test]
+    fn test_job015_self_cancel_is_error() {
+        let output = run_source(
+            r#"async function selfy() { task.cancel(t)
+    print("after") }
+let t = selfy()
+async function main() {
+    try {
+        await t
+        print("no error")
+    } catch e {
+        print("caught")
+    }
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["caught"]);
+    }
+
+    /// Extra (ISSUES §64c): a cycle of tasks awaiting each other makes no
+    /// progress and has no timers → runtime ERROR instead of a hang
+    /// (spec silent on await cycles).
+    #[test]
+    fn test_job015_await_cycle_deadlock_error() {
+        let err = run_source(
+            r#"async function a() { await tb }
+async function b() { await ta }
+let ta = a()
+let tb = b()
+async function main() { await ta }
+main()"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("deadlock"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    /// Extra: negative sleep duration → ERROR (§111: non-negative integer).
+    #[test]
+    fn test_job015_sleep_negative_error() {
+        let output = run_source(
+            r#"async function main() {
+    try {
+        await task.sleep(-1)
+        print("no error")
+    } catch e {
+        print("caught")
+    }
+}
+main()"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["caught"]);
     }
 }

@@ -194,14 +194,16 @@ Spec files audited: Language.md, Bytecode.md, ZeroVM.md, Runtime.md, Modules.md,
 | Feature | Spec | Status | Evidence |
 |---|---|---|---|
 | `async function` / `await` | §49 | Implemented | lexer keywords Async/Await (test_async_keywords); ast Stmt::FunctionDecl.is_async + Expr::Await; parser async decl + await expr (test_async_function_declaration incl. export async, test_await_expression); compiler `in_async` gate → compile ERROR `'await' is only allowed inside an async function` (test_job014_await_outside_async_is_compile_error: top level, sync fn, nested sync fn); Opcode::Await + vm execute_await (test_job014_await_returns_result §107 example → 30) |
-| Task states (pending, running, completed, failed, cancelled) | §106 | Partially Implemented | vm.rs TaskState{Pending,Running,Completed,Failed,Cancelled} + Value::Task(id) + HeapObject::Task; pending/running/completed/failed all observed (test_job014_task_state_transitions → pending,running,completed,failed); `cancelled` unreachable until task.cancel (Job 015) — ISSUES.md §63f |
-| `task.all()`, `task.race()` | §103, §104 | **Not Implemented** | Job 015 |
-| `task.cancel()`, `task.state()` | §105, §106 | Partially Implemented | task.state: builtin `task.state(A)` + `t.state` property, non-task → ERROR (test_job014_task_state_*, test_job014_task_state_non_task_error); task.cancel Job 015 |
-| `task.wait()`, `task.timeout()`, `task.sleep()` | §109, §110, §111 | **Not Implemented** | Job 015 |
-| Task scheduler | §112 | Partially Implemented | lazy start (async call → task pending) + await-start + FIFO `drain_pending_tasks()` at end of run()/run_modules(); §108 un-awaited failure does not stop program (test_job014_unawaited_failure_does_not_stop_program); no interleaving — Job 015; §112 top-level-await example tension ISSUES.md §63a |
-| Concurrent execution | §102 | **Not Implemented** | Job 015 |
+| Task states (pending, running, completed, failed, cancelled) | §106 | Implemented | vm.rs TaskState{Pending,Running,Completed,Failed,Cancelled} (vm.rs:326) + Value::Task(id) + HeapObject::Task; all five states observed: pending/running/completed/failed (test_job014_task_state_transitions), cancelled reachable since Job 015 cancel_task (vm.rs:1900; test_job015_cancel_running_task → running→cancelled, test_job015_cancel_completed_noop) — ISSUES.md §63f closed by Job 015 |
+| `task.all()`, `task.race()` | §103, §104 | Implemented | builtins vm.rs:2783 (all) / vm.rs:2793 (race) + TaskKind::All/Race + notify_dependents/reevaluate_synthetic; input-order results (test_job015_all_results_input_order), empty list (test_job015_all_empty_list), fail-fast + sibling untouched (test_job015_all_fail_fast), non-task → ERROR (test_job015_all_non_task_error), first finisher wins w/ losers uncancelled (test_job015_race_first_finisher_wins), first failure forwarded (test_job015_race_first_finisher_error), race([]) → ERROR (test_job015_race_empty_error) |
+| `task.cancel()`, `task.state()` | §105, §106 | Implemented | task.state builtin (vm.rs:2774) + property, non-task → ERROR (test_job014_task_state_non_task_error); task.cancel builtin (vm.rs:2809) → cancel_task (vm.rs:1900): running → cancelled (test_job015_cancel_running_task), completed → no-op (test_job015_cancel_completed_noop), await of cancelled → cancellation error (test_job015_await_cancelled_is_error), non-task → ERROR (test_job015_cancel_non_task_error), self-cancel → ERROR (test_job015_self_cancel_is_error, ISSUES.md §64b) |
+| `task.wait()`, `task.timeout()`, `task.sleep()` | §109, §110, §111 | Implemented | builtins vm.rs:2819/2829/2843 + TaskKind::Wait/Timeout/Sleep + wake_due_timers (vm.rs:2055) on virtual clock; wait on completed/failed/cancelled (test_job015_wait_terminal_states), timeout success (test_job015_timeout_success), timeout → ERROR without cancelling (test_job015_timeout_error_task_keeps_running), §112 sleep ordering (test_job015_sleep_ordering_not_creation_order), sleep(0) yields (test_job015_sleep_zero_yields), negative duration → ERROR (test_job015_sleep_negative_error) |
+| Task scheduler | §112 | Implemented | Job 015 replaced drain_pending_tasks with full cooperative `run_scheduler`/`run_task_step` in run()/run_modules(): round-robin FIFO ready_queue, per-task swapped context (TaskContext), suspension via Task.wait, virtual monotonic clock advanced to earliest deadline only when idle; §112 example logic (test_job015_sleep_ordering_not_creation_order → B before A), non-blocking sleeps (test_job015_timeout_error_task_keeps_running), §108 un-awaited failure still holds (test_job014_unawaited_failure_does_not_stop_program), await-cycle guard → deadlock ERROR (test_job015_await_cycle_deadlock_error, ISSUES.md §64c); §112 top-level-await example executed via main() wrapper (ISSUES.md §63a/§64a) |
+| Concurrent execution | §102 | Implemented | tasks created before any await progress concurrently under the scheduler; §102 example logic (test_job015_concurrent_creation_before_await: dataTask 10 ms completes while userTask 60 ms still awaited); results stay separate, sibling failure does not cancel others (test_job015_all_fail_fast) |
 
 Job 014 behavior tests (vm.rs): test_job014_async_call_creates_pending_task, test_job014_await_outside_async_is_compile_error, test_job014_await_returns_result, test_job014_await_failed_task_catchable (§108), test_job014_task_state_transitions (§106), test_job014_await_twice_does_not_rerun (§113), test_job014_nested_async_calls, test_job014_async_recursion, test_job014_task_state_non_task_error (§106), test_job014_await_non_task_is_error (ISSUES §63b), test_job014_unawaited_failure_does_not_stop_program (§108), test_job014_try_catch_inside_task_body (§49), test_job014_second_await_of_failed_task_reraises (§107/§113), test_job014_async_closure_capture.
+
+Job 015 behavior tests (vm.rs): test_job015_concurrent_creation_before_await (§102), test_job015_all_results_input_order, test_job015_all_empty_list, test_job015_all_fail_fast, test_job015_all_non_task_error (§103), test_job015_race_first_finisher_wins, test_job015_race_first_finisher_error, test_job015_race_empty_error (§104), test_job015_cancel_running_task, test_job015_cancel_completed_noop, test_job015_await_cancelled_is_error (§105), test_job015_wait_terminal_states (§109), test_job015_timeout_success, test_job015_timeout_error_task_keeps_running (§110), test_job015_sleep_ordering_not_creation_order, test_job015_sleep_zero_yields (§111, §112), test_job015_cancel_non_task_error, test_job015_self_cancel_is_error (ISSUES §64b), test_job015_await_cycle_deadlock_error (ISSUES §64c), test_job015_sleep_negative_error.
 
 ---
 
@@ -327,15 +329,16 @@ Job 014 behavior tests (vm.rs): test_job014_async_call_creates_pending_task, tes
 | Heap | 15 | 15 | 0 | 0 |
 | GC | 6 | 5 | 1 | 0 |
 | Modules | 13 | 12 | 1 | 0 |
-| Async / Task | 7 | 2 | 3 | 2 |
+| Async / Task | 7 | 7 | 0 | 0 |
 | Standard Library | 12 | 11 | 0 | 1 |
 | Dependencies | 10 | 0 | 0 | 10 |
 | Error Handling | 14 | 14 | 0 | 0 |
 | Semantics | 36 | 33 | 3 | 0 |
-| **TOTAL** | **243** | **216** | **8** | **19** |
+| **TOTAL** | **243** | **221** | **5** | **17** |
 
 *(Job 013: Modules alias/re-export/conflict/live binding rows → Implemented (test_job013_*). Modules now 12 Implemented + 1 Partial (§73 eval failure / try-catch tension — ISSUES.md §62).*
 *(Job 014: Async rows updated — async/await Implemented; task states / task.state / scheduler Partially (cancelled, task.cancel, interleaving → Job 015; ISSUES.md §63). Async now 2 Implemented + 3 Partial + 2 Not. Totals: 243 = 216+8+19.)*
+*(Job 015: all remaining Async rows → Implemented (task states, task.all/race, task.cancel, task.wait/timeout/sleep, scheduler, concurrent execution). Async now 7 Implemented + 0 Partial + 0 Not. Totals: 243 = 221+5+17. Ambiguities/decisions → ISSUES.md §64.)*
 
 ---
 
@@ -359,12 +362,13 @@ Job 014 behavior tests (vm.rs): test_job014_async_call_creates_pending_task, tes
 - 560 tests passing with 0 failures (Job 012 added 29 module tests)
 - 573 tests passing with 0 failures (Job 013 added 13 binding tests: live binding, alias, re-export, export conflict)
 - 590 tests passing with 0 failures (Job 014 added 17 tests: 14 vm async/await + 2 parser + 1 lexer)
+- 610 tests passing with 0 failures (Job 015 added 20 vm tests: task.all/race/cancel/wait/timeout/sleep + scheduler/concurrency)
 
 ---
 
 ## 18. Not In Scope (Future Jobs)
 
-- Async concurrency: `task.all`/`task.race`/`task.cancel`/`task.wait`/`task.timeout`/`task.sleep`, interleaved scheduler, top-level await (Job 015; Job 014 implemented async/await core — see §10)
+- Top-level await as literally written in §49's invocation snippet and §112's example: still a compile error by design (rules normative; examples run via `async function main()` wrapper — ISSUES.md §63a/§64a). Async concurrency itself (§102, §103-§105, §109-§112) implemented in Job 015 — see §10
 - Standard Library http.* beyond print.err/type/conversions/string.*/list.*/object.*/print/color.*/file.*/json.*/system.* (Job 016, after Async)
 - Package management (zpm)
 - Default parameters evaluated at call time (Job 008 explicitly out of scope)
@@ -396,6 +400,12 @@ Job 014 behavior tests (vm.rs): test_job014_async_call_creates_pending_task, tes
 
 ### Candidate Gaps for Future Work (discovered during Job 014)
 
-- **Top-level await / §112 example**: §49/§101 forbid await outside async functions, but §49's invocation snippet and §112's `await task.all([...])` example are top-level. Job 015 must decide how those examples execute (ISSUES.md §63a).
-- **`await` on a running task under a real scheduler**: Job 014 errors on re-entrant await (deadlock avoidance); §107 requires waiting until terminal state — Job 015's independent task starts must restore the wait behavior (ISSUES.md §63d).
+- **Top-level await / §112 example** *(resolved by Job 015 — ISSUES.md §64a)*: compile error kept (rules normative); §112's example logic runs wrapped in `async function main()` (test_job015_sleep_ordering_not_creation_order). Literal top-level-await text remains non-runnable — spec-level documentation ambiguity left in place.
+- **`await` on a running task under a real scheduler** *(resolved by Job 015 — ISSUES.md §63d/§64c)*: awaits now wait for the target's terminal state; only genuine cycles (no runnable task, no timer) raise the deadlock ERROR (test_job015_await_cycle_deadlock_error).
 - **Task memory reclamation**: `ZeroVM.tasks` grows monotonically; task args/callee/env are rooted at creation and results stored at completion, but tasks are never freed. Long-running programs creating many tasks will retain all of them (no `task.dispose` in spec — investigate in Job 015/GC work).
+
+### Candidate Gaps for Future Work (discovered during Job 015)
+
+- **Un-awaited `task.sleep`/`task.timeout` not rejected**: §111 says `task.sleep()` "harus digunakan dengan await" but the spec defines no detection mechanism; an un-awaited sleep becomes a silent background timer task (ISSUES.md §64d). Spec-level rule without an enforceable consequence — needs spec clarification before a language rule can be invented.
+- **Virtual clock vs wall-clock pacing**: scheduler uses a virtual monotonic clock (deterministic, instant tests); sleep/timeout do not pace against real time (ISSUES.md §64d). No spec section exposes wall-clock time, so nothing observable is missing — flag if a future stdlib exposes real time.
+- **Task memory reclamation (carried from Job 014)**: `ZeroVM.tasks` grows monotonically; results/errors/contexts of terminal tasks are retained forever (no `task.dispose` in spec — GC work).

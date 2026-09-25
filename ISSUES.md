@@ -298,3 +298,30 @@ Under Job 014's lazy-start single-task model, `execute_await` only observes stat
 ### 63f. Unreachable `cancelled` state (§105 vs Job 014 scope)
 
 §105 (`task.cancel`) and §106's `cancelled` state are not in Job 014's scope; without `task.cancel` no code path can produce a cancelled task. `TaskState::Cancelled` exists in the type but is unreachable in Job 014 tests. Cancellation tests deferred to Job 015 (job file permits deferring, must be reported).
+
+## 64. Job 015 Ambiguity Analyses (2026-09-25)
+
+### 64a. §112 example still requires a wrapper (follow-up to §63a)
+
+§63a (reading 1, implemented) makes top-level `await` a compile error because §49/§101 state the rule normatively. §112's scheduler example writes `await task.all([taskA, taskB])` at top level after top-level `let taskA = A()`.
+
+Job 015 owned the resolution (per §63a) and keeps the compile error: the example executes in tests only when wrapped in `async function main() { ... }` plus a top-level `main()` call (`test_job015_sleep_ordering_not_creation_order` runs exactly §112's logic). Readings considered: (1) implicit top-level async context — rejected, it would contradict the §49/§101 rules; (2) mandatory `async` main wrapper (implemented); (3) editing the spec example — not permitted without a spec job. The literal example text remains non-runnable as written; this is left as a spec-level documentation ambiguity, not silently changed.
+
+### 64b. Self-cancellation (§105 silent)
+
+§105 defines `task.cancel(A)` for tasks that are still running but says nothing about cancelling the task whose body is executing the call (constructible when the task handle is stored in a global the body can read, e.g. `let t = selfy()` with `selfy`'s body calling `task.cancel(t)`).
+
+**Decision:** runtime ERROR `Cannot cancel the currently running task` — a single-threaded cooperative scheduler cannot unwind its own running frame, and inventing silent re-scheduling semantics is not spec-supported. The error is a normal catchable runtime error (`test_job015_self_cancel_is_error`). Note: the spec provides no way to obtain the *current* task's handle (`task.current()` does not exist), so self-cancel is only reachable via an externally stored handle.
+
+### 64c. Await cycles / deadlock (§107, §112 silent)
+
+§107 says awaiting a running task waits for the terminal state; §112 says a suspended task must not block runnable ones. Neither covers a cycle (task A awaits B while B awaits A): waiting per §107 means neither ever reaches a terminal state, and there is no timer to advance.
+
+**Decision:** when the scheduler has no runnable task and no timer, but non-terminal tasks remain, it raises runtime error `Task deadlock: remaining tasks are waiting on each other` instead of hanging (`test_job015_await_cycle_deadlock_error`). Message wording is implementation text, not spec-derived. §107's literal "wait" for a running task is honored for all non-cyclic cases; the Running branch added in Job 015 awaits the target's terminal state (`test_job014` semantics unchanged).
+
+### 64d. Mechanical details the spec does not state
+
+- **Virtual clock.** `task.sleep`/`task.timeout` are measured on a monotonic *virtual* clock advanced by the scheduler to the earliest deadline only when nothing is runnable; the spec exposes no wall-clock API, so no observable behavior derives from real time. Tests are therefore instant and deterministic; real-time pacing is not implemented (known limitation, reported).
+- **Timeout/empty-race/duration/deadlock error wording** (e.g. `task.timeout(): task did not complete before the timeout`, `task.race() requires at least one task`, `... must be a non-negative integer number of milliseconds`) is implementation wording; the spec only says ERROR.
+- **`task.sleep` without `await`.** §111 says sleep "harus digunakan dengan await", but the spec defines no mechanism for detecting an un-awaited sleep. An un-awaited `task.sleep(ms)` creates a background timer task that completes silently; it is not rejected (reported as a limitation rather than an invented compile/runtime rule).
+- **`task.all`/`task.race`/`task.wait`/`task.timeout` return values** are task values awaited by the surrounding `await` (the combinator is itself a synthetic task); this composition is an implementation choice — the spec describes only the awaited result of the combined call.
