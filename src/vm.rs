@@ -1,6 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use crate::compiler::{BytecodeProgram, Constant, FunctionInfo, Opcode};
 use crate::gc::Gc;
@@ -374,6 +377,23 @@ enum TaskKind {
         target: usize,
         deadline_ms: u128,
     },
+    /// In-flight HTTP request (§50). The actual network I/O runs on a
+    /// worker thread; the scheduler polls the shared slot and finishes the
+    /// task when the result lands (§112 non-blocking rule).
+    Http { slot: HttpSlot },
+}
+
+/// Result slot shared between an HTTP worker thread and the scheduler.
+/// Written exactly once by the worker; polled (and taken) on the VM thread
+/// so all task state transitions stay single-threaded.
+type HttpSlot = Arc<Mutex<Option<Result<HttpOutcome, String>>>>;
+
+/// A completed HTTP exchange as parsed by the client (§50 Response).
+#[derive(Debug, Clone)]
+struct HttpOutcome {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
 }
 
 /// A suspended task's execution context: everything the linear instruction
@@ -634,6 +654,7 @@ impl ZeroVM {
             "system",
             "json",
             "task",
+            "http",
         ] {
             self.global_scope.insert(
                 name.to_string(),
@@ -1104,6 +1125,7 @@ impl ZeroVM {
             "system",
             "json",
             "task",
+            "http",
         ];
         if scope.contains_key(name) {
             if BUILTINS.contains(&name) {
@@ -1947,6 +1969,9 @@ impl ZeroVM {
         }
         match self.tasks[id].kind.clone() {
             TaskKind::Normal { .. } => Ok(()),
+            // Event-driven: completes when the worker thread's result is
+            // polled by the scheduler, never by re-evaluation.
+            TaskKind::Http { .. } => Ok(()),
             TaskKind::All(ids) => {
                 // Fail fast: propagate the first failure without waiting for
                 // the remaining tasks to finish (Scope B; §103).
@@ -2131,6 +2156,11 @@ impl ZeroVM {
                 continue;
             }
 
+            // Collect finished HTTP exchanges before deciding idleness.
+            if self.poll_http_completed()? {
+                continue;
+            }
+
             // Nothing runnable: jump the virtual clock to the next deadline.
             if let Some(d) = self.earliest_deadline() {
                 let before = self.count_terminal();
@@ -2143,6 +2173,14 @@ impl ZeroVM {
                         "Scheduler made no progress waking timers".to_string(),
                     ));
                 }
+                continue;
+            }
+
+            // Virtual timers are done, but HTTP exchanges are still on the
+            // wire: wait in real time. Virtual time must not jump here —
+            // HTTP progress depends on the real clock (ISSUES §65).
+            if self.http_inflight() {
+                thread::park_timeout(Duration::from_millis(1));
                 continue;
             }
 
@@ -2852,6 +2890,15 @@ impl ZeroVM {
                 })?;
                 Ok(Value::Task(id))
             }
+            // ---- http.* (StandardLibrary §50, §50.1, §59, §60) ----
+            // Each call creates a Task (§50 + Async.md §101): the network
+            // exchange runs on a worker thread and the awaiter is resumed by
+            // the scheduler when the result lands.
+            "http.get" => self.http_request("GET", args, "http.get"),
+            "http.post" => self.http_request("POST", args, "http.post"),
+            "http.put" => self.http_request("PUT", args, "http.put"),
+            "http.patch" => self.http_request("PATCH", args, "http.patch"),
+            "http.delete" => self.http_request("DELETE", args, "http.delete"),
             _ => Err(VmError::RuntimeError(format!(
                 "Unknown built-in '{}'",
                 name
@@ -2889,6 +2936,241 @@ impl ZeroVM {
             }
             _ => Err(VmError::RuntimeError(format!("{} expects a list", fname))),
         }
+    }
+
+    /// `http.get/post/put/patch/delete` (§50, §50.1, §59, §60).
+    ///
+    /// Validates options synchronously (wrong types → ERROR per §59/§60),
+    /// spawns a worker thread for the blocking exchange, and returns a Task
+    /// the caller awaits (§101). The task is `running` from creation: the
+    /// request is already in flight (§106).
+    fn http_request(&mut self, method: &str, args: &[Value], fname: &str) -> Result<Value, VmError> {
+        if args.is_empty() || args.len() > 2 {
+            return Err(VmError::RuntimeError(format!(
+                "{} expects 1 or 2 arguments",
+                fname
+            )));
+        }
+        let url = expect_string_arg(args, 0, fname)?.to_string();
+        let mut query_pairs: Vec<String> = Vec::new();
+        let mut headers: Vec<(String, String)> = Vec::new();
+        let mut body: Option<String> = None;
+        let mut timeout_ms: Option<u64> = None;
+
+        if let Some(opt) = args.get(1) {
+            let obj_ref = match opt {
+                Value::Object(r) => r.clone(),
+                _ => {
+                    return Err(VmError::RuntimeError(format!(
+                        "{} options must be an object",
+                        fname
+                    )))
+                }
+            };
+            let props = match self.heap.get(&obj_ref) {
+                Ok(HeapObject::Object { props, .. }) => props.clone(),
+                _ => {
+                    return Err(VmError::RuntimeError(format!(
+                        "{} options must be an object",
+                        fname
+                    )))
+                }
+            };
+            for (key, vr) in props {
+                let v = Value::from_heap_ref(&vr, &self.heap)
+                    .map_err(|_| VmError::RuntimeError("Failed to read options".to_string()))?;
+                match key.as_str() {
+                    // §59: object; string keys; string/number/boolean/null
+                    // values; everything URL-encoded; null → empty value.
+                    "query" => match v {
+                        Value::Object(qr) => {
+                            let qprops = match self.heap.get(&qr) {
+                                Ok(HeapObject::Object { props, .. }) => props.clone(),
+                                _ => {
+                                    return Err(VmError::RuntimeError(format!(
+                                        "{} query must be an object",
+                                        fname
+                                    )))
+                                }
+                            };
+                            for (qk, qvr) in qprops {
+                                let qv = Value::from_heap_ref(&qvr, &self.heap).map_err(|_| {
+                                    VmError::RuntimeError("Failed to read query".to_string())
+                                })?;
+                                let encoded = match &qv {
+                                    Value::Str(s) => percent_encode_component(s),
+                                    Value::Number(n) => {
+                                        percent_encode_component(&format!("{}", n))
+                                    }
+                                    Value::Boolean(b) => {
+                                        percent_encode_component(if *b { "true" } else { "false" })
+                                    }
+                                    Value::Null => String::new(),
+                                    _ => {
+                                        return Err(VmError::RuntimeError(format!(
+                                            "{} query values must be string, number, boolean, or null",
+                                            fname
+                                        )))
+                                    }
+                                };
+                                query_pairs
+                                    .push(format!("{}={}", percent_encode_component(&qk), encoded));
+                            }
+                        }
+                        _ => {
+                            return Err(VmError::RuntimeError(format!(
+                                "{} query must be an object",
+                                fname
+                            )))
+                        }
+                    },
+                    // §60: object; string keys; values MUST be strings.
+                    "headers" => match v {
+                        Value::Object(hr) => {
+                            let hprops = match self.heap.get(&hr) {
+                                Ok(HeapObject::Object { props, .. }) => props.clone(),
+                                _ => {
+                                    return Err(VmError::RuntimeError(format!(
+                                        "{} headers must be an object",
+                                        fname
+                                    )))
+                                }
+                            };
+                            for (hk, hvr) in hprops {
+                                let hv = Value::from_heap_ref(&hvr, &self.heap).map_err(|_| {
+                                    VmError::RuntimeError("Failed to read headers".to_string())
+                                })?;
+                                match hv {
+                                    Value::Str(s) => headers.push((hk, s)),
+                                    _ => {
+                                        return Err(VmError::RuntimeError(format!(
+                                            "{} header values must be strings",
+                                            fname
+                                        )))
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(VmError::RuntimeError(format!(
+                                "{} headers must be an object",
+                                fname
+                            )))
+                        }
+                    },
+                    // §50.1 shows body as a string (json.stringify output);
+                    // the spec gives no other body form → string only.
+                    "body" => match v {
+                        Value::Str(s) => body = Some(s),
+                        _ => {
+                            return Err(VmError::RuntimeError(format!(
+                                "{} body must be a string",
+                                fname
+                            )))
+                        }
+                    },
+                    // §50.1: timeout in milliseconds, non-negative integer.
+                    "timeout" => {
+                        let ms = duration_ms(&v, fname)?;
+                        timeout_ms = Some(u64::try_from(ms).unwrap_or(u64::MAX));
+                    }
+                    // Unknown option keys are ignored (spec is silent).
+                    _ => {}
+                }
+            }
+        }
+
+        let final_url = append_query(&url, &query_pairs);
+        let slot: HttpSlot = Arc::new(Mutex::new(None));
+        let worker_slot = slot.clone();
+        let worker_method = method.to_string();
+        let worker_fname = fname.to_string();
+        thread::spawn(move || {
+            let result = http_perform(
+                &worker_method,
+                &final_url,
+                &headers,
+                body.as_deref(),
+                timeout_ms,
+            )
+            .map_err(|e| format!("{}: {}", worker_fname, e));
+            if let Ok(mut guard) = worker_slot.lock() {
+                *guard = Some(result);
+            }
+        });
+
+        let id = self.create_synthetic_task(TaskKind::Http { slot })?;
+        // The exchange started at creation (§106 "running": sedang
+        // menjalankan operasi asynchronous).
+        self.tasks[id].state = TaskState::Running;
+        Ok(Value::Task(id))
+    }
+
+    /// Convert a finished exchange into the §50 response object:
+    /// `{ status: number, headers: object, body: string }`. The headers
+    /// object is an independent copy — mutating it cannot touch the
+    /// response or any future request (§60).
+    fn build_http_response(&mut self, out: &HttpOutcome) -> Result<Value, VmError> {
+        let mut hprops = Vec::with_capacity(out.headers.len());
+        for (k, v) in &out.headers {
+            let hr = Value::Str(v.clone()).heap_object_for_element(&mut self.heap);
+            hprops.push((k.clone(), hr));
+        }
+        let headers_ref = self.heap.allocate(HeapObject::object(hprops));
+        self.add_live_ref(headers_ref.clone());
+
+        let fields = [
+            ("status", Value::Number(out.status as f64)),
+            ("headers", Value::Object(headers_ref)),
+            ("body", Value::Str(out.body.clone())),
+        ];
+        let mut props = Vec::with_capacity(fields.len());
+        for (name, val) in fields {
+            let r = val.heap_object_for_element(&mut self.heap);
+            props.push((name.to_string(), r));
+        }
+        let obj = self.heap.allocate(HeapObject::object(props));
+        self.add_live_ref(obj.clone());
+        self.gc.on_allocation();
+        Ok(Value::Object(obj))
+    }
+
+    /// Finish every HTTP task whose worker result has landed. Returns true
+    /// if any task transitioned (scheduler should loop again).
+    fn poll_http_completed(&mut self) -> Result<bool, VmError> {
+        for tid in 0..self.tasks.len() {
+            if self.tasks[tid].state.is_terminal() {
+                continue;
+            }
+            let slot = match &self.tasks[tid].kind {
+                TaskKind::Http { slot } => slot.clone(),
+                _ => continue,
+            };
+            let taken = match slot.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(_) => None,
+            };
+            if let Some(res) = taken {
+                match res {
+                    Ok(outcome) => {
+                        let value = self.build_http_response(&outcome)?;
+                        self.finish_task(tid, &value)?;
+                    }
+                    Err(msg) => self.fail_task(tid, msg)?,
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// True while at least one HTTP exchange is still on the wire. The
+    /// scheduler parks in real time for these — virtual time must not jump
+    /// past HTTP work, which progresses on the real clock (ISSUES §65).
+    fn http_inflight(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|t| !t.state.is_terminal() && matches!(t.kind, TaskKind::Http { .. }))
     }
 
     /// Recursively convert a parsed JsonValue into a VM Value (heap-backed
@@ -3735,6 +4017,7 @@ impl ZeroVM {
                     "system" => &["args", "env", "os", "arch"],
                     "json" => &["parse", "stringify"],
                     "task" => &["state", "all", "race", "cancel", "wait", "timeout", "sleep"],
+                    "http" => &["get", "post", "put", "patch", "delete"],
                     _ => &[],
                 };
                 if known.contains(&name) {
@@ -3911,6 +4194,179 @@ fn duration_ms(value: &Value, fname: &str) -> Result<u128, VmError> {
             fname
         ))),
     }
+}
+
+/// Percent-encode one query component (§59: everything URL-encoded;
+/// RFC 3986 unreserved characters are kept readable).
+fn percent_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Append encoded query pairs to a URL (§59): a URL that already has a
+/// query keeps it (appended with `&`, not replaced); fragments stay last.
+fn append_query(url: &str, pairs: &[String]) -> String {
+    if pairs.is_empty() {
+        return url.to_string();
+    }
+    let (base, frag) = match url.find('#') {
+        Some(i) => (&url[..i], &url[i..]),
+        None => (url, ""),
+    };
+    let sep = if base.contains('?') {
+        if base.ends_with('?') || base.ends_with('&') {
+            ""
+        } else {
+            "&"
+        }
+    } else {
+        "?"
+    };
+    format!("{}{}{}{}", base, sep, pairs.join("&"), frag)
+}
+
+/// Chain an error and its sources into one message (ureq's Display prints
+/// only the top-level variant).
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(cause) = src {
+        s.push_str(": ");
+        s.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    s
+}
+
+/// Perform one blocking HTTP exchange on a worker thread (§50).
+///
+/// - 4xx/5xx are ordinary responses (`http_status_as_error(false)` per §50.1)
+/// - `timeout` (§50.1) bounds the whole operation in real time
+/// - response bodies are always read as (lossy UTF-8) strings — no JSON
+///   parsing at the HTTP layer (§50, §51)
+fn http_perform(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+    timeout_ms: Option<u64>,
+) -> Result<HttpOutcome, String> {
+    let timeout = timeout_ms.map(Duration::from_millis);
+
+    // Build + run a request, applying user headers and §50.1 options.
+    // GET/DELETE builders have no body unless force_send_body() is used.
+    let resp = match method {
+        "GET" => {
+            let mut rb = ureq::get(url);
+            for (k, v) in headers {
+                rb = rb.header(k.as_str(), v.as_str());
+            }
+            let rb = rb
+                .config()
+                .http_status_as_error(false)
+                .timeout_global(timeout)
+                .build();
+            match body {
+                Some(b) => rb.force_send_body().send(b),
+                None => rb.call(),
+            }
+        }
+        "DELETE" => {
+            let mut rb = ureq::delete(url);
+            for (k, v) in headers {
+                rb = rb.header(k.as_str(), v.as_str());
+            }
+            let rb = rb
+                .config()
+                .http_status_as_error(false)
+                .timeout_global(timeout)
+                .build();
+            match body {
+                Some(b) => rb.force_send_body().send(b),
+                None => rb.call(),
+            }
+        }
+        "POST" => {
+            let mut rb = ureq::post(url);
+            for (k, v) in headers {
+                rb = rb.header(k.as_str(), v.as_str());
+            }
+            let rb = rb
+                .config()
+                .http_status_as_error(false)
+                .timeout_global(timeout)
+                .build();
+            match body {
+                Some(b) => rb.send(b),
+                None => rb.send_empty(),
+            }
+        }
+        "PUT" => {
+            let mut rb = ureq::put(url);
+            for (k, v) in headers {
+                rb = rb.header(k.as_str(), v.as_str());
+            }
+            let rb = rb
+                .config()
+                .http_status_as_error(false)
+                .timeout_global(timeout)
+                .build();
+            match body {
+                Some(b) => rb.send(b),
+                None => rb.send_empty(),
+            }
+        }
+        "PATCH" => {
+            let mut rb = ureq::patch(url);
+            for (k, v) in headers {
+                rb = rb.header(k.as_str(), v.as_str());
+            }
+            let rb = rb
+                .config()
+                .http_status_as_error(false)
+                .timeout_global(timeout)
+                .build();
+            match body {
+                Some(b) => rb.send(b),
+                None => rb.send_empty(),
+            }
+        }
+        other => return Err(format!("unsupported HTTP method '{}'", other)),
+    };
+
+    let mut resp = resp.map_err(|e| match &e {
+        ureq::Error::Timeout(_) => match timeout_ms {
+            Some(ms) => format!("request timed out after {} ms", ms),
+            None => "request timed out".to_string(),
+        },
+        _ => error_chain(&e),
+    })?;
+
+    let status = resp.status().as_u16();
+    let mut out_headers = Vec::with_capacity(resp.headers().len());
+    for (name, value) in resp.headers().iter() {
+        out_headers.push((
+            name.as_str().to_string(),
+            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+        ));
+    }
+    let resp_body = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("failed to read response body: {}", error_chain(&e)))?;
+    Ok(HttpOutcome {
+        status,
+        headers: out_headers,
+        body: resp_body,
+    })
 }
 
 /// Require `args[idx]` to be an object.
@@ -8331,5 +8787,447 @@ main()"#,
         )
         .unwrap();
         assert_eq!(output, vec!["caught"]);
+    }
+
+    // ==================== Job 016: Standard Library HTTP ====================
+
+    /// One request recorded by the deterministic local mock server.
+    struct RecordedRequest {
+        method: String,
+        target: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    struct MockReply {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: String,
+        /// Accept the request but never respond (timeout tests).
+        hang: bool,
+    }
+
+    /// Start a localhost HTTP/1.1 server that records every request and
+    /// answers with `handler`'s reply. Returns the base URL and the shared
+    /// recording log. Handlers run inline in the accept loop (tests are
+    /// sequential), `hang` sleeps bounded before dropping the connection.
+    fn spawn_mock_server<F>(handler: F) -> (String, Arc<Mutex<Vec<RecordedRequest>>>)
+    where
+        F: Fn(&RecordedRequest) -> MockReply + Send + 'static,
+    {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let records: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec2 = records.clone();
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut stream) = conn else { continue };
+                let mut buf: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 1024];
+                let header_end = loop {
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(p);
+                    }
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break None,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(_) => break None,
+                    }
+                    if buf.len() > 64 * 1024 {
+                        break None;
+                    }
+                };
+                let Some(header_end) = header_end else { continue };
+                let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let mut lines = head.split("\r\n");
+                let request_line = lines.next().unwrap_or("");
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let target = parts.next().unwrap_or("").to_string();
+                let mut headers = Vec::new();
+                for line in lines {
+                    if let Some((k, v)) = line.split_once(':') {
+                        headers.push((k.trim().to_string(), v.trim().to_string()));
+                    }
+                }
+                let content_length = headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, v)| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = buf[header_end + 4..].to_vec();
+                while body.len() < content_length {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => body.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let rec = RecordedRequest {
+                    method,
+                    target,
+                    headers,
+                    body: String::from_utf8_lossy(&body).to_string(),
+                };
+                let reply = handler(&rec);
+                rec2.lock().unwrap().push(rec);
+                if reply.hang {
+                    thread::sleep(Duration::from_secs(3));
+                    continue;
+                }
+                let reason = match reply.status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    500 => "Internal Server Error",
+                    _ => "Status",
+                };
+                let mut resp = format!("HTTP/1.1 {} {}\r\n", reply.status, reason);
+                for (k, v) in &reply.headers {
+                    resp.push_str(&format!("{}: {}\r\n", k, v));
+                }
+                resp.push_str(&format!(
+                    "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.body.len()
+                ));
+                resp.push_str(&reply.body);
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{}", port), records)
+    }
+
+    fn plain_reply(body: &str) -> MockReply {
+        MockReply {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
+            body: body.to_string(),
+            hang: false,
+        }
+    }
+
+    /// Req 1 (§50): http.get returns res.status (number), res.headers
+    /// (object), res.body (string).
+    #[test]
+    fn test_job016_http_get_basic_response() {
+        let (base, _recs) = spawn_mock_server(|_| plain_reply("hello world"));
+        let src = r#"async function main() {
+    let res = await http.get("__URL__/data")
+    print(res.status)
+    print(res.body)
+    print(type(res.status))
+    print(type(res.headers))
+    print(type(res.body))
+    print(res.headers)
+}
+main()"#
+        .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(
+            &output[..5],
+            ["200", "hello world", "number", "object", "string"]
+        );
+        // Header key casing is preserved exactly as the server sent it.
+        let h = output[5].to_lowercase();
+        assert!(h.contains("content-type"), "headers: {}", output[5]);
+        assert!(h.contains("text/plain"), "headers: {}", output[5]);
+    }
+
+    /// Req 2 (§50, §50.1): post/put/patch/delete carry body + headers.
+    #[test]
+    fn test_job016_http_methods_with_body_and_headers() {
+        let (base, recs) = spawn_mock_server(|r| MockReply {
+            status: 200,
+            headers: vec![],
+            body: format!("got {}", r.method),
+            hang: false,
+        });
+        let src = r#"async function main() {
+    let opts = {
+        headers: { "Content-Type": "application/json", "X-Token": "abc" },
+        body: "{\"a\":1}"
+    }
+    print((await http.post("__URL__/a", opts)).body)
+    print((await http.put("__URL__/b", opts)).body)
+    print((await http.patch("__URL__/c", opts)).body)
+    print((await http.delete("__URL__/d", opts)).body)
+}
+main()"#
+        .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["got POST", "got PUT", "got PATCH", "got DELETE"]);
+        let recs = recs.lock().unwrap();
+        assert_eq!(recs.len(), 4);
+        let methods: Vec<&str> = recs.iter().map(|r| r.method.as_str()).collect();
+        assert_eq!(methods, ["POST", "PUT", "PATCH", "DELETE"]);
+        let targets: Vec<&str> = recs.iter().map(|r| r.target.as_str()).collect();
+        assert_eq!(targets, ["/a", "/b", "/c", "/d"]);
+        for r in recs.iter() {
+            assert_eq!(r.body, r#"{"a":1}"#);
+            assert!(r
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "application/json"));
+            assert!(r
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("x-token") && v == "abc"));
+        }
+    }
+
+    /// Req 3 (§50, §51): res.body is always a string — a JSON payload is
+    /// never auto-parsed into an object.
+    #[test]
+    fn test_job016_http_body_never_auto_parsed() {
+        let (base, _recs) = spawn_mock_server(|_| MockReply {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: r#"{"n":1}"#.to_string(),
+            hang: false,
+        });
+        let src = r#"async function main() {
+    let res = await http.get("__URL__/j")
+    print(type(res.body))
+    print(res.body)
+    let data = json.parse(res.body)
+    print(data.n)
+}
+main()"#
+        .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["string", r#"{"n":1}"#, "1"]);
+    }
+
+    /// Req 4 (§50.1): 4xx/5xx are NOT runtime errors — res.status reads
+    /// normally.
+    #[test]
+    fn test_job016_http_4xx_5xx_are_normal_responses() {
+        let (base, _recs) = spawn_mock_server(|r| MockReply {
+            status: if r.target.contains("missing") { 404 } else { 500 },
+            headers: vec![],
+            body: "e".to_string(),
+            hang: false,
+        });
+        let src = r#"async function main() {
+    let a = await http.get("__URL__/missing")
+    print(a.status)
+    let b = await http.get("__URL__/boom")
+    print(b.status)
+}
+main()"#
+        .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["404", "500"]);
+    }
+
+    /// Req 5 (§59): query values are URL-encoded (incl. null → empty),
+    /// existing query in the URL is preserved (appended, not replaced).
+    #[test]
+    fn test_job016_http_query_encoding() {
+        let (base, recs) = spawn_mock_server(|_| plain_reply("ok"));
+        let src = r#"async function main() {
+    let res = await http.get("__URL__/s?sort=name", {
+        query: { page: 2, active: true, q: "a b&c", empty: null }
+    })
+    print(res.status)
+}
+main()"#
+        .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["200"]);
+        let recs = recs.lock().unwrap();
+        assert_eq!(
+            recs[0].target,
+            "/s?sort=name&page=2&active=true&q=a%20b%26c&empty="
+        );
+    }
+
+    /// Req 6 (§59): query that is not an object → ERROR (request never
+    /// leaves the process).
+    #[test]
+    fn test_job016_http_query_non_object_error() {
+        let (base, recs) = spawn_mock_server(|_| plain_reply("ok"));
+        let src = r#"async function main() {
+    try {
+        let r = await http.get("__URL__/q", { query: 5 })
+        print("no error")
+    } catch e {
+        print("caught")
+    }
+}
+main()"#
+        .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["caught"]);
+        assert!(recs.lock().unwrap().is_empty());
+    }
+
+    /// Req 7 (§60): request headers are sent exactly as given.
+    #[test]
+    fn test_job016_http_request_headers_sent_as_given() {
+        let (base, recs) = spawn_mock_server(|_| plain_reply("ok"));
+        let src = r#"async function main() {
+    let res = await http.get("__URL__/h", {
+        headers: { "Authorization": "Bearer token", "Accept": "application/json" }
+    })
+    print(res.status)
+}
+main()"#
+        .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["200"]);
+        let recs = recs.lock().unwrap();
+        assert!(recs[0].headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("authorization") && v == "Bearer token"
+        }));
+        assert!(recs[0]
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("accept") && v == "application/json"));
+    }
+
+    /// Req 8 (§60): headers that is not an object → ERROR.
+    #[test]
+    fn test_job016_http_headers_non_object_error() {
+        let (base, recs) = spawn_mock_server(|_| plain_reply("ok"));
+        let src = r#"async function main() {
+    try {
+        let r = await http.get("__URL__/h", { headers: 5 })
+        print("no error")
+    } catch e {
+        print("caught")
+    }
+}
+main()"#
+        .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["caught"]);
+        assert!(recs.lock().unwrap().is_empty());
+    }
+
+    /// Req 9 (§60): a non-string header value → ERROR.
+    #[test]
+    fn test_job016_http_header_value_non_string_error() {
+        let (base, recs) = spawn_mock_server(|_| plain_reply("ok"));
+        let src = r#"async function main() {
+    try {
+        let r = await http.get("__URL__/h", { headers: { "X-Bad": 5 } })
+        print("no error")
+    } catch e {
+        print("caught")
+    }
+}
+main()"#
+        .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["caught"]);
+        assert!(recs.lock().unwrap().is_empty());
+    }
+
+    /// Req 10 (§50.1): timeout → runtime error, catchable with try/catch
+    /// (server accepts but never responds).
+    #[test]
+    fn test_job016_http_timeout_is_catchable_error() {
+        let (base, _recs) = spawn_mock_server(|_| MockReply {
+            status: 200,
+            headers: vec![],
+            body: String::new(),
+            hang: true,
+        });
+        let src = r#"async function main() {
+    try {
+        let r = await http.get("__URL__/slow", { timeout: 150 })
+        print("no error")
+    } catch e {
+        print("caught")
+    }
+}
+main()"#
+        .replace("__URL__", &base);
+        let started = std::time::Instant::now();
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["caught"]);
+        // The failure came from the 150 ms timeout, not a hang.
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Req 11: network failure (connection refused) → runtime error,
+    /// catchable.
+    #[test]
+    fn test_job016_http_network_failure_catchable() {
+        use std::net::TcpListener;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l); // port closed → connection refused
+        let src = r#"async function main() {
+    try {
+        let r = await http.get("http://127.0.0.1:9nope/")
+        print("no error")
+    } catch e {
+        print("bad url caught")
+    }
+    try {
+        let r = await http.get("http://127.0.0.1:__PORT__/")
+        print("no error")
+    } catch e {
+        print("refused caught")
+    }
+}
+main()"#
+        .replace("__PORT__", &port.to_string());
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["bad url caught", "refused caught"]);
+    }
+
+    /// Req 12 (§50.1 example): json.stringify as request body, json.parse
+    /// on the response — no automatic conversion at the HTTP layer.
+    #[test]
+    fn test_job016_http_json_stringify_body_roundtrip() {
+        let (base, recs) = spawn_mock_server(|r| MockReply {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: r.body.clone(),
+            hang: false,
+        });
+        let src = r#"async function main() {
+    let payload = json.stringify({ nama: "Kael" })
+    let res = await http.post("__URL__/users", {
+        headers: { "Content-Type": "application/json" },
+        body: payload
+    })
+    if res.status == 200 {
+        let data = json.parse(res.body)
+        print(data.nama)
+    }
+}
+main()"#
+        .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["Kael"]);
+        let recs = recs.lock().unwrap();
+        assert_eq!(recs[0].body, r#"{"nama":"Kael"}"#);
+    }
+
+    /// Extra: options itself must be an object (mechanical rule; §59/§60
+    /// only define field-level errors).
+    #[test]
+    fn test_job016_http_options_non_object_error() {
+        let (base, recs) = spawn_mock_server(|_| plain_reply("ok"));
+        let src = r#"async function main() {
+    try {
+        let r = await http.get("__URL__/o", 5)
+        print("no error")
+    } catch e {
+        print("caught")
+    }
+}
+main()"#
+        .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["caught"]);
+        assert!(recs.lock().unwrap().is_empty());
     }
 }

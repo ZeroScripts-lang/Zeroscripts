@@ -1,8 +1,8 @@
 # ZeroScript Implementation Audit
 
-Generated: 2026-09-22 (Job 008 update: 2026-09-23; Job 009 update: 2026-09-23; Job 010 update: 2026-09-24; Job 011 update: 2026-09-24; Job 012 update: 2026-09-24; Job 013 update: 2026-09-24)
-Tests: 573 passed, 0 failed (Job 011 baseline 531; +29 Job 012 module tests = 560; +13 Job 013 binding tests = 573)
-Source files audited: src/*.rs (16 files — module.rs added Job 012)
+Generated: 2026-09-22 (Job 008 update: 2026-09-23; Job 009 update: 2026-09-23; Job 010 update: 2026-09-24; Job 011 update: 2026-09-24; Job 012 update: 2026-09-24; Job 013 update: 2026-09-24; Job 014-016 updates: 2026-09-25; Job 017 update: 2026-09-26)
+Tests: 727 passed, 0 failed (Job 017 baseline 623; +93 unit tests = 716 lib tests; +11 CLI integration tests in tests/zero017_zpm_cli.rs = 727)
+Source files audited: src/*.rs (16 files — lib.rs, package.rs, version.rs added Job 017) + src/bin/zpm.rs + tests/zero017_zpm_cli.rs
 Spec files audited: Language.md, Bytecode.md, ZeroVM.md, Runtime.md, Modules.md, Async.md, StandardLibrary.md, Dependencies.md, INDEX.md
 
 ---
@@ -174,7 +174,7 @@ Spec files audited: Language.md, Bytecode.md, ZeroVM.md, Runtime.md, Modules.md,
 | Feature | Spec | Status | Evidence |
 |---|---|---|---|
 | `import` / `export` syntax | §46-§47 | Implemented | token Import/Export; ast Import/ExportList + `exported` flag; parser parse_import/parse_export; compiler Import/ExportList arms; test_job012_basic_import_export, test_job012_export_list_form |
-| Module path resolution | §64 | Implemented | module.rs resolve_path (relative to importer, auto `.zs`, dir/missing → ERROR); test_job012_path_resolution_*, test_job012_directory_import_error, test_job012_module_not_found |
+| Module path resolution | §64 | Implemented | module.rs `Loader::resolve_path` (relative to importer, auto `.zs`, dir/missing → ERROR); bare paths (`pkg`, `pkg/sub`) route to package resolution instead of NotFound (§81, Job 017 — see §12); test_job012_path_resolution_*, test_job012_directory_import_error, test_job012_module_not_found, test_job017_bare_path_is_package_not_local_module |
 | Module scope / encapsulation | §65, §75-§76 | Implemented | compile_module scopes [placeholder, module], function_base=1 → DeclareLocal; runtime per-module scope push/pop + export cache; test_job012_private_not_accessible, test_job012_isolation_distinct_exports, test_job012_same_name_no_conflict |
 | Module initialization order | §71-§72, §78 | Implemented | DFS post-order topo in module.rs load; EndModule ranges; test_job012_init_order, test_job012_init_order_nested, test_job012_import_mid_file_static, test_job012_init_once_two_imports_diff_names |
 | Circular dependency detection | §62, §77 | Implemented | gray-stack DFS; ModuleError::Circular; test_job012_circular_direct, test_job012_circular_indirect, test_job012_self_import |
@@ -218,7 +218,7 @@ Job 015 behavior tests (vm.rs): test_job015_concurrent_creation_before_await (§
 | `object.*` (remove) | §39 | Implemented | call_builtin object.remove; const + missing-key ERROR; test_job010_object_remove_* |
 | `color.*` (red, green, yellow, blue, bold) | §45 | Implemented | call_builtin color.* arms (vm.rs); GetProperty known color methods; test_job011_color_* (8 tests incl. bold nesting + catchable) |
 | `file.*` (read, write, exists, remove, mkdir) | §48 | Implemented | call_builtin file.* arms → std::fs, IOError → RuntimeError catchable; test_job011_file_* (7 tests incl. try/catch) |
-| `http.*` (get, post, put, patch, delete) | §50 | **Not Implemented** | Job 016 (after Async Job 014-015) |
+| `http.*` (get, post, put, patch, delete) + query/headers/timeout (§50, §50.1, §59, §60) | §50, §50.1, §59, §60 | Implemented | Cargo.toml: ureq 3.4.2; call_builtin http.* arms → http_request (options validation §59/§60, percent-encode query, worker thread, TaskKind::Http slot) + scheduler poll/park (poll_http_completed, http_inflight); response object {status, headers, body} via build_http_response; tests: test_job016_http_get_basic_response, _methods_with_body_and_headers, _body_never_auto_parsed, _4xx_5xx_are_normal_responses, _query_encoding, _query_non_object_error, _request_headers_sent_as_given, _headers_non_object_error, _header_value_non_string_error, _timeout_is_catchable_error, _network_failure_catchable, _json_stringify_body_roundtrip, _options_non_object_error (local mock server; ISSUES.md §65) |
 | `json.*` (parse, stringify) | §51 | Implemented | src/json.rs (parser+stringifier, 0 deps); call_builtin json.parse/stringify; json_value_to_value / value_to_json_value (vm.rs); test_job011_json_* (10 tests) + json::tests (7) |
 | `system.*` (args, env, os, arch) | §52 | Implemented | call_builtin system.* arms; ZeroVM.program_args + set_program_args; test_job011_system_* (7 tests incl. args exclude program name, env null) |
 | `type()` (Type Introspection, §53) | §53 | Implemented | type_name() builtin; test_job009_type_* |
@@ -230,16 +230,23 @@ Job 015 behavior tests (vm.rs): test_job015_concurrent_creation_before_await (§
 
 | Feature | Spec | Status | Evidence |
 |---|---|---|---|
-| `project.zson` manifest | §82 | **Not Implemented** | |
-| `project.lock.zson` lockfile | §83 | **Not Implemented** | |
-| `package.zson` metadata | §85 | **Not Implemented** | |
-| `zpm` package manager | §81 | **Not Implemented** | |
-| `.zsc_m/` dependency directory | §87 | **Not Implemented** | |
-| `.zsc_cache/` package cache | §88 | **Not Implemented** | |
-| Git package source | §90 | **Not Implemented** | |
-| Package registry | §91 | **Not Implemented** | |
-| Version resolution (SemVer) | §92 | **Not Implemented** | |
-| Package integrity verification | §93 | **Not Implemented** | |
+| `project.zson` manifest | §82 | Implemented | src/package.rs `parse_manifest` (name/version required strings, dependencies object, ZSON via `json::parse_zson`); test_job017_manifest_* (9: minimal, §82 example, missing field, wrong type, root not object, invalid selector, unsafe dep name, scripts validation, unknown fields ignored); not executable / not importable (test_job017_project_zson_not_importable) |
+| `project.lock.zson` lockfile | §84 | Implemented | `parse_lockfile`/`render_lockfile` (§84 shape `{ packages: { "n": "v" } }`, bare `packages` key, 4-space indent); used when valid (test_job017_install_honours_lockfile, cli_install_honours_existing_lockfile), deleted → resolver picks newest (test_job017_lockfile_removed_resolves_newest), invalid → ignored and rewritten (test_job017_invalid_lockfile_is_ignored_not_fatal), stale selector entry → re-resolved (test_job017_stale_lockfile_entry_is_re_resolved), not importable (test_job017_lockfile_not_importable) |
+| `package.zson` metadata | §96, §94 | Implemented | `parse_package_meta` (name + SemVer version required, dependencies optional, §96 "metadata tidak valid → ERROR"); validated on the installed copy at import time (module.rs `check_locked` — test_job017_lockfile_version_mismatch_is_error, test_job017_broken_installed_metadata_is_error, test_job017_missing_installed_metadata_with_lock_is_error); registry-side metadata mismatch rejected (test_job017_metadata_mismatch_is_error, test_job017_missing_package_zson_in_registry_is_error); not importable (test_job017_package_zson_not_importable). Consumption by registry/publishing = Job 018 |
+| `zpm` package manager | §85, §86 | Implemented | src/bin/zpm.rs: `install`, `run <script> [args]`, `--registry`, `--help` (exit 0) / unknown command (exit 1); tests/zero017_zpm_cli.rs (11 end-to-end tests against the real binaries). `zpm install <name>`, `remove`, `update` = Job 018 (§91-§93) |
+| `.zsc_m/` dependency directory | §82, §85, §87 | Implemented | Flat one-copy-per-package layout written by `install()`; read by module.rs `Loader::resolve_package`; test_job017_install_full_flow, cli_install_writes_zsc_m_and_lockfile, test_job017_package_import_resolves_in_zsc_m |
+| Git package source | §93 | Not Implemented | Job 018 |
+| Package registry | §95 | Partially Implemented | Local filesystem registry only, layout mirrors §95 (`<root>/<name>/<version>/` + `package.zson`): `Registry::versions`/`package_dir` (src/package.rs); resolution order `--registry` > `$ZPM_REGISTRY` > `<project>/registry` (src/bin/zpm.rs:43); test_job017_install_* use it. Remote/Git registry + index (§95) → Job 018 |
+| Version resolution (SemVer) | §83 | Implemented | src/version.rs `Version` (MAJOR.MINOR.PATCH, Ord) + `Selector` {Exact, `N.M.x`, `N.x`, `x`} + `highest_matching`; range operators `^ ~ >=` rejected (test_job017_manifest_invalid_selector_rejected_at_parse); selector matrix (test_job017_install_selector_matrix); no match → ERROR (test_job017_install_no_version_matches_selector_error) |
+| Package integrity verification | §97 | Not Implemented | Job 018 |
+| `.zsc_cache/` package cache | §98 | Not Implemented | Job 018 |
+| Package import resolution (bare path → `.zsc_m/`) | §81, §87 | Implemented | module.rs `Loader::resolve_package`: path without `./`/`../` → package; `pkg/sub` → `.zsc_m/pkg/sub.zs`, bare `pkg` → `.zsc_m/pkg/index.zs`; NOT installed → ERROR (test_job017_package_not_installed_is_error), not declared → ERROR (test_job017_package_not_declared_is_error), missing module / directory import → ERROR; reuses the single Job 012 loader (`visit`/`Loader`), no second loader |
+| Package boundary | §81 | Implemented | canonicalized target must stay under `.zsc_m/<pkg>/` (module.rs resolve_package + resolve_module); test_job017_package_cannot_escape_its_boundary; internal relative import still works (test_job017_package_internal_relative_import_works) |
+| `zpm run` project scripts | §86 | Implemented | package.rs `run_script`: `sh -c '<command>'` from project root, extra args appended shell-quoted, child exit code propagated; unknown script → ERROR (test_job017_run_script_unknown_name_is_error, cli_run_unknown_script_is_error); §86 example `start: "zsc index.zs"` runs end-to-end (test_job017_run_script_example_shape_with_zsc, cli_run_script_then_package_import_works) |
+| Dependency tree / nested dependencies | §88 | Implemented | `install()` requirement accumulation + breadth-first expansion, shared package installed once (test_job017_nested_dependency_tree, test_job017_shared_dependency_installed_once, test_job017_shared_version_intersects_selectors), no satisfying version → ERROR (test_job017_unresolvable_version_conflict_is_error), circular → ERROR (test_job017_circular_package_dependency_is_error, test_job017_self_dependency_is_circular), init order depth-first (test_job017_nested_package_init_order). Multi-version conflict from §88's last example → §90, Job 018 |
+| Dependency scope | §89 | Implemented | Visible set = project's own `dependencies` for project modules, the owning package's `package.zson` dependencies for package modules (module.rs `resolve_package` + `package_dependencies`); project cannot import transitive dep (test_job017_project_cannot_import_transitive_dependency), package can import its own (test_job017_package_imports_its_own_dependency), cannot import another package's dep (test_job017_package_cannot_import_undeclared_package), installed-but-transitive is not global (test_job017_installed_transitive_package_is_not_global); no dev/runtime categories invented (§89 defines none) |
+
+*(Job 017: rows above updated in place — spec citations corrected where they were off (lockfile §83→§84, package.zson §85→§96, zpm §81→§85/§86, registry §91→§95, SemVer §92→§83, integrity §93→§97, cache §88→§98, git §90→§93) — and 5 rows added (package import, boundary, scripts, dependency tree, scope). Ambiguities → ISSUES.md §66.)*
 
 ---
 
@@ -330,15 +337,18 @@ Job 015 behavior tests (vm.rs): test_job015_concurrent_creation_before_await (§
 | GC | 6 | 5 | 1 | 0 |
 | Modules | 13 | 12 | 1 | 0 |
 | Async / Task | 7 | 7 | 0 | 0 |
-| Standard Library | 12 | 11 | 0 | 1 |
-| Dependencies | 10 | 0 | 0 | 10 |
+| Standard Library | 12 | 12 | 0 | 0 |
+| Dependencies | 15 | 11 | 1 | 3 |
 | Error Handling | 14 | 14 | 0 | 0 |
 | Semantics | 36 | 33 | 3 | 0 |
-| **TOTAL** | **243** | **221** | **5** | **17** |
+| **TOTAL** | **248** | **233** | **6** | **9** |
 
-*(Job 013: Modules alias/re-export/conflict/live binding rows → Implemented (test_job013_*). Modules now 12 Implemented + 1 Partial (§73 eval failure / try-catch tension — ISSUES.md §62).*
+*(Job 013: Modules alias/re-export/conflict/live binding rows → Implemented (test_job013_*). Modules now 12 Implemented + 1 Partial (§73 eval failure / try/catch tension — ISSUES.md §62).*
 *(Job 014: Async rows updated — async/await Implemented; task states / task.state / scheduler Partially (cancelled, task.cancel, interleaving → Job 015; ISSUES.md §63). Async now 2 Implemented + 3 Partial + 2 Not. Totals: 243 = 216+8+19.)*
 *(Job 015: all remaining Async rows → Implemented (task states, task.all/race, task.cancel, task.wait/timeout/sleep, scheduler, concurrent execution). Async now 7 Implemented + 0 Partial + 0 Not. Totals: 243 = 221+5+17. Ambiguities/decisions → ISSUES.md §64.)*
+*(Job 016: `http.*` row (§50/§50.1/§59/§60, incl. query encoding + header rules + timeout) → Implemented with mock-server tests. Standard Library now 12 Implemented + 0 Partial + 0 Not. Totals: 243 = 222+5+16. Decisions → ISSUES.md §65.)*
+*(Job 017: Dependencies domain 10 Not-Implemented rows → 11 Implemented + 1 Partial + 3 Not (5 rows added: package import, boundary, scripts, dependency tree, scope; registry Partial = local filesystem source only). Totals: 248 = 233+6+9. Decisions → ISSUES.md §66.)*
+
 
 ---
 
@@ -363,14 +373,16 @@ Job 015 behavior tests (vm.rs): test_job015_concurrent_creation_before_await (§
 - 573 tests passing with 0 failures (Job 013 added 13 binding tests: live binding, alias, re-export, export conflict)
 - 590 tests passing with 0 failures (Job 014 added 17 tests: 14 vm async/await + 2 parser + 1 lexer)
 - 610 tests passing with 0 failures (Job 015 added 20 vm tests: task.all/race/cancel/wait/timeout/sleep + scheduler/concurrency)
+- 623 tests passing with 0 failures (Job 016 added 13 tests: 12 required http.* tests + 1 options-type test, against a deterministic local mock server)
+- 727 tests passing with 0 failures (Job 017 added 93 unit tests + 11 CLI integration tests: ZSON/manifest/lockfile parsing, version selectors, install flow, nested/shared/circular dependency resolution, package import + boundary + scope, `zpm run`, and end-to-end `zpm install` → `zpm run start` → `zsc` package import)
 
 ---
 
 ## 18. Not In Scope (Future Jobs)
 
 - Top-level await as literally written in §49's invocation snippet and §112's example: still a compile error by design (rules normative; examples run via `async function main()` wrapper — ISSUES.md §63a/§64a). Async concurrency itself (§102, §103-§105, §109-§112) implemented in Job 015 — see §10
-- Standard Library http.* beyond print.err/type/conversions/string.*/list.*/object.*/print/color.*/file.*/json.*/system.* (Job 016, after Async)
-- Package management (zpm)
+- http.* (§50/§50.1/§59/§60): implemented in Job 016 — see §11 (nothing of the listed stdlib set remains deferred; only package/zpm completion, bytecode hardening, and the §18 gap list below remain)
+- Package management remainder (Job 018): Job 017 shipped manifest/lockfile/`.zsc_m`/version selectors/`zpm install`+`zpm run` (§81-§89). Still open: remote & Git registry source + index (§93, §95), `zpm install <name>` / `remove` / `update` (§91, §92), `.zsc_cache/` (§98), integrity (§97), source priority (§99), multi-version conflict resolution (§90) — see §12
 - Default parameters evaluated at call time (Job 008 explicitly out of scope)
 - Closure-in-data-structure shared env fix (heap_object_for_element)
 - GC root coverage for local vars/params
@@ -379,7 +391,7 @@ Job 015 behavior tests (vm.rs): test_job015_concurrent_creation_before_await (§
 - One-way const marking: `let A=[1]; const C=A` freezes A's object too (documented limitation, ISSUES.md)
 - break/continue crossing try-with-finally (documented gap; return-through-finally IS implemented)
 - Multi-arg print / full print.* API (still single-arg; Job 010 confirmed types work, arity not expanded)
-- CLI runner wiring for system.args() — ZeroVM.set_program_args exists; main.rs does not yet parse argv when launching .zs files (host must strip interpreter+script names per §52)
+- CLI runner wiring for system.args(): resolved by Job 017 — `zsc <file.zs> [args...]` (src/main.rs) strips interpreter+script names and calls `ZeroVM::set_program_args` before `run_modules` (§52); verified by test cli_zsc_passes_program_arguments (`zsc index.zs hello world` → 2 / hello / world)
 
 ### Candidate Gaps for Future Work (discovered during Job 008/009)
 

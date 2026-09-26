@@ -1,5 +1,11 @@
 // Minimal JSON support for ZeroScript stdlib json.* (StandardLibrary.md §51).
 // No external dependencies: hand-rolled recursive-descent parser + stringifier.
+//
+// The same parser backs ZSON (ZeroScript Object Notation), the configuration
+// format used by project.zson / project.lock.zson / package.zson (§82, §84,
+// §96). ZSON shares the JSON value grammar and additionally accepts bare
+// (unquoted) identifier keys, which is the only difference between the two
+// forms as far as the specification shows.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue {
@@ -11,10 +17,43 @@ pub enum JsonValue {
     Object(Vec<(String, JsonValue)>),
 }
 
+impl JsonValue {
+    pub fn as_object(&self) -> Option<&Vec<(String, JsonValue)>> {
+        match self {
+            JsonValue::Object(entries) => Some(entries),
+            _ => None,
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&JsonValue> {
+        self.as_object()?
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            JsonValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
 pub fn parse(input: &str) -> Result<JsonValue, String> {
+    parse_with(input, false)
+}
+
+/// Parse ZSON: the JSON value grammar plus bare identifier keys (§82, §84).
+pub fn parse_zson(input: &str) -> Result<JsonValue, String> {
+    parse_with(input, true)
+}
+
+fn parse_with(input: &str, zson: bool) -> Result<JsonValue, String> {
     let mut p = Parser {
         bytes: input.as_bytes(),
         pos: 0,
+        zson,
     };
     p.skip_ws();
     let v = p.parse_value()?;
@@ -101,6 +140,8 @@ fn write_string(s: &str, out: &mut String) {
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// ZSON mode: bare identifier keys are accepted (§82/§84/§96).
+    zson: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -322,6 +363,43 @@ impl<'a> Parser<'a> {
         Ok(cp)
     }
 
+    /// Object key: always accepts a quoted string; in ZSON mode a bare
+    /// identifier key is also accepted (`name: "my-app"`, §82).
+    fn parse_key(&mut self) -> Result<String, String> {
+        if self.peek() == Some(b'"') {
+            return self.parse_string();
+        }
+        if self.zson {
+            if let Some(key) = self.try_bare_key() {
+                return Ok(key);
+            }
+        }
+        Err(format!(
+            "Expected string key at position {}",
+            self.pos
+        ))
+    }
+
+    /// `[A-Za-z_][A-Za-z0-9_]*` — hyphenated keys are only shown quoted in
+    /// the specification (e.g. `"http-utils"`), so `-` is not part of the
+    /// bare-key form.
+    fn try_bare_key(&mut self) -> Option<String> {
+        let start = self.pos;
+        let first = self.peek()?;
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return None;
+        }
+        self.pos += 1;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        String::from_utf8(self.bytes[start..self.pos].to_vec()).ok()
+    }
+
     fn parse_array(&mut self) -> Result<JsonValue, String> {
         self.expect(b'[')?;
         self.skip_ws();
@@ -364,13 +442,7 @@ impl<'a> Parser<'a> {
         }
         loop {
             self.skip_ws();
-            if self.peek() != Some(b'"') {
-                return Err(format!(
-                    "Expected string key at position {}",
-                    self.pos
-                ));
-            }
-            let key = self.parse_string()?;
+            let key = self.parse_key()?;
             self.skip_ws();
             self.expect(b':')?;
             self.skip_ws();
@@ -479,5 +551,90 @@ mod tests {
             stringify(&JsonValue::String("a\"b\\c\nd".to_string())).unwrap(),
             "\"a\\\"b\\\\c\\nd\""
         );
+    }
+
+    // Job 017 — ZSON (§82, §84, §96)
+
+    #[test]
+    fn zson_bare_keys_manifest_example() {
+        // §82 example, verbatim.
+        let src = r#"{
+    name: "my-app",
+    version: "1.0.0",
+
+    dependencies: {
+        "http-utils": "1.2.0",
+        "database": "2.0.1"
+    }
+}"#;
+        let v = parse_zson(src).unwrap();
+        assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("my-app"));
+        assert_eq!(v.get("version").and_then(|x| x.as_str()), Some("1.0.0"));
+        let deps = v.get("dependencies").unwrap().as_object().unwrap();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].0, "http-utils");
+        assert_eq!(deps[0].1.as_str(), Some("1.2.0"));
+    }
+
+    #[test]
+    fn zson_mixed_bare_and_quoted_keys() {
+        // §84 lockfile example: bare `packages`, quoted package names.
+        let src = r#"{ packages: { "http-utils": "1.2.10", "database": "2.0.0" } }"#;
+        let v = parse_zson(src).unwrap();
+        assert_eq!(
+            v.get("packages")
+                .and_then(|p| p.get("http-utils"))
+                .and_then(|x| x.as_str()),
+            Some("1.2.10")
+        );
+    }
+
+    #[test]
+    fn zson_bare_key_with_hyphen_is_rejected() {
+        // `http-utils:` is never shown bare in the spec → only quoted keys
+        // may contain `-`.
+        assert!(parse_zson(r#"{ http-utils: "1.0.0" }"#).is_err());
+    }
+
+    #[test]
+    fn zson_rejects_non_identifier_bare_key() {
+        assert!(parse_zson("{ 1abc: 2 }").is_err());
+        assert!(parse_zson("{ : 2 }").is_err());
+    }
+
+    #[test]
+    fn zson_value_grammar_matches_json() {
+        let v = parse_zson(r#"{ a: [1, 2.5, true, false, null], b: { c: "d" } }"#).unwrap();
+        let a = v.get("a").unwrap();
+        assert!(matches!(a, JsonValue::Array(items) if items.len() == 5));
+        assert_eq!(
+            v.get("b").and_then(|b| b.get("c")).and_then(|x| x.as_str()),
+            Some("d")
+        );
+    }
+
+    #[test]
+    fn zson_no_comments_or_trailing_commas() {
+        // Not shown anywhere in the spec → not accepted.
+        assert!(parse_zson("{ // c\n name: \"x\" }").is_err());
+        assert!(parse_zson("{ name: \"x\", }").is_err());
+    }
+
+    #[test]
+    fn strict_json_parse_still_rejects_bare_keys() {
+        assert!(parse(r#"{ name: "x" }"#).is_err());
+        assert!(parse(r#"{"name": "x"}"#).is_ok());
+    }
+
+    #[test]
+    fn json_get_helpers() {
+        let v = parse(r#"{"a":{"b":"c"},"n":1}"#).unwrap();
+        assert_eq!(
+            v.get("a").and_then(|a| a.get("b")).and_then(|x| x.as_str()),
+            Some("c")
+        );
+        assert!(v.get("n").unwrap().as_str().is_none());
+        assert!(v.get("missing").is_none());
+        assert!(v.as_object().unwrap().len() == 2);
     }
 }

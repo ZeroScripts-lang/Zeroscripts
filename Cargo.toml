@@ -2,5 +2,19 @@
 name = "ZeroScript"
 version = "0.1.0"
 edition = "2024"
+autobins = false
+
+[lib]
+name = "zeroscript"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zsc"
+path = "src/main.rs"
+
+[[bin]]
+name = "zpm"
+path = "src/bin/zpm.rs"
 
 [dependencies]
+ureq = "3.4.2"

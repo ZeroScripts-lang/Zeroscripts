@@ -325,3 +325,113 @@ Job 015 owned the resolution (per §63a) and keeps the compile error: the exampl
 - **Timeout/empty-race/duration/deadlock error wording** (e.g. `task.timeout(): task did not complete before the timeout`, `task.race() requires at least one task`, `... must be a non-negative integer number of milliseconds`) is implementation wording; the spec only says ERROR.
 - **`task.sleep` without `await`.** §111 says sleep "harus digunakan dengan await", but the spec defines no mechanism for detecting an un-awaited sleep. An un-awaited `task.sleep(ms)` creates a background timer task that completes silently; it is not rejected (reported as a limitation rather than an invented compile/runtime rule).
 - **`task.all`/`task.race`/`task.wait`/`task.timeout` return values** are task values awaited by the surrounding `await` (the combinator is itself a synthetic task); this composition is an implementation choice — the spec describes only the awaited result of the combined call.
+
+## 65. Job 016 Ambiguity Analyses (2026-09-25)
+
+### 65a. http.* as Task: worker thread + scheduler poll (§50 + §101 + §112)
+
+§50 says every `http.*` call yields a Task used with `await`, while §112 requires that a task waiting on an async operation must not block other runnable tasks. A blocking HTTP call executed inside `run_task_step` would freeze the whole scheduler for the duration of the request.
+
+**Decision:** each call spawns a `std::thread` performing the blocking exchange (ureq); the task is created `running` (the request is already in flight — §106 wording) with a shared `Arc<Mutex<Option<Result<...>>>>` slot. The worker writes the slot exactly once; the scheduler polls slots on the VM thread and finishes/fails the task there, so every task-state transition stays single-threaded. The awaiter resumes through the normal `notify_dependents` path. Not spec-derived: no section states *how* the network work is scheduled (§112 explicitly leaves the mechanism to the runtime).
+
+### 65b. Virtual clock vs real network time (§110-§112 vs HTTP)
+
+Job 015 measures `task.sleep`/`task.timeout` on a virtual monotonic clock that jumps to the next deadline when idle (deterministic tests). HTTP exchanges complete on the *real* clock.
+
+**Decision (hybrid):** when only virtual timers remain, the clock jumps as before; when no virtual timer remains but HTTP work is on the wire, the scheduler parks in real time (`park_timeout(1ms)` polls) **without** advancing `now_ms`. HTTP `options.timeout` is enforced inside the worker thread in real time (ureq `timeout_global`) — it never participates in virtual jumps, so a `timeout: 5000` request against a fast server cannot be "virtually" preempted. Mixing a virtual `task.sleep` with an in-flight HTTP deadline in the same program can interleave the two clocks in an order that has no real-time meaning; no spec section coordinates them (reported, untested combination).
+
+### 65c. `res.headers` read-only enforcement (§60)
+
+§60 guarantees that changing `res.headers` does not alter the response or any request. Job 016's scope note offers "independent copy" vs "heap object that is simply never written back".
+
+**Decision:** `res.headers` is a freshly allocated independent heap object built from the parsed response at completion time. Mutation is *allowed* in the language (the object is not const/frozen) but trivially cannot affect anything network-related: nothing ever reads it back. This matches the explanatory sentence of §60 ("Mengubah res.headers tidak mengubah response atau request yang sudah terjadi") over a freeze reading. Whether the object should be const was not stated by the spec and was not guessed.
+
+### 65d. Mechanical details the spec does not state
+
+- **HTTP client dependency:** `ureq` 3.4.2 (blocking, pure-Rust TLS via rustls) — chosen because §50's own examples use `https://` URLs (a hand-rolled client would need TLS) and because it has no async runtime, matching the single-threaded VM. Report item 2.
+- **Error wording**: `http.get(): ...` prefixes, `query must be an object`, `header values must be strings`, `body must be a string`, `options must be an object`, `request timed out after N ms` — the spec only says ERROR.
+- **`options` itself non-object** → ERROR (only field-level rules exist in §59/§60); **`body` non-string** → ERROR (§50.1 only ever shows a string body from `json.stringify`); **unknown option keys** → ignored (no rule); **url non-string** → ERROR; **`timeout: 0`** → accepted (0 ms, fails unless instantaneous).
+- **Client-added headers**: ureq adds `user-agent` (and friends per its defaults); §60 only governs *user-provided* headers ("Header dikirim sesuai key/value yang diberikan" — asserted for given headers; client defaults are not spec-controlled either way).
+- **Redirects**: followed (ureq default, max 10, error beyond) — spec silent on redirects.
+- **Body limits**: response bodies read as lossy UTF-8 up to ureq's 10 MB default (`read_to_string`); larger bodies → runtime error. Lossy decoding means invalid UTF-8 bytes become U+FFFD — `res.body` is always a string per §50.
+- **Un-awaited `http.get(...)`**: creates a background request task (same shape as un-awaited sleep, ISSUES §64d); not rejected.
+- **Query order**: `options.query` key order follows the object literal order (props are a `Vec`), so `?page=2&active=true` from §59's example is reproduced exactly; §59 does not mandate ordering for programmatically built objects.
+- **Query keys/values**: encoded with RFC 3986 unreserved set kept (`A-Za-z0-9-._~`); `null` → `key=` (empty value with `=`); `#fragment` URLs keep the fragment last.
+
+## 66. Job 017 Ambiguity Analyses (2026-09-26)
+
+### 66a. ZSON grammar is never defined (§82, §84, §96)
+
+§82 calls `project.zson` "format ZSON (ZeroScript Object Notation)" and shows only one object; §84 and §96 show two more. No section defines ZSON's grammar, whether it allows comments, trailing commas, unquoted keys, or how it differs from JSON. Job 011's `json.*` parser (Job 010/011) implements strict JSON only, and AGENTS.md forbids inventing syntax beyond what the spec illustrates.
+
+**Decision:** ZSON = the JSON value grammar **plus bare identifier keys**, reusing `json.rs` (`parse_zson` sets a `zson` flag that makes `parse_key` try an identifier before a quoted string). Bare keys match the spec's three examples (`name`, `version`, `dependencies`, `packages`, `scripts`); a hyphen cannot be a bare key (all spec examples that contain `-` — `"http-utils"`, `"2.0.1"` — are quoted), so keys stay `[A-Za-z_][A-Za-z0-9_]*` and `http-utils:` is rejected (`test_job017_manifest_unsafe_dependency_name_rejected`, `zson_bare_key_with_hyphen_is_rejected`). No comments, no trailing commas (`zson_no_comments_or_trailing_commas`) — neither appears in any spec example, and adding them would be invented syntax. Values are exactly JSON's. Readings rejected: (2) ZSON as a full superset of ZeroScript expression syntax, (3) ZSON as strict JSON with quoted keys only (would make all three spec examples invalid).
+
+### 66b. Version selector notation (§83)
+
+§83 documents exactly four forms — `1.2.0`, `1.2.x`, `1.x`, `x` — states that `^`, `~`, `>=` are *not* used, and says `x` is only a selector, never part of a version.
+
+**Decision:** `Selector::parse` accepts only those four forms; anything else (bare `1`, `1.2`, `1.x.x`, uppercase `X`, `*`, `1.2.3-beta`) is rejected at manifest-parse time (`test_job017_manifest_invalid_selector_rejected_at_parse`). Leading zeros (`01.x`) are rejected as invalid numeric components. A selector is always combined with every other requirement seen for the same package, and the highest version satisfying **all** of them is chosen (`highest_matching`) — §83 "Selector selalu memilih versi terbaru yang memenuhi pola selector". Pre-release/build metadata is not in §83 and is not supported (SemVer parsing accepts `MAJOR.MINOR.PATCH` only).
+
+### 66c. Package layout: §81's example tree contradicts §82/§85/§87/§94/§96
+
+§81 shows `my-app/ deps/http-utils/{package.zs, src/client.zs}` with `zeroproject.zs`, and its import `from "http-utils/client"` would then mean `src/client.zs`. Every later section instead shows `my-app/{project.zson, .zsc_m/http-utils/}` (§82, §85, §87) and a package tree of `package.zson` + `client.zs` + `parser.zs` at the package root (§94, §96), with no `src/` and no `deps/`.
+
+**Decision:** §81's tree is a superseded draft (its `zeroproject.zs`, `deps/`, `package.zs` names are contradicted by §82/§94/§96). Installed layout is `.zsc_m/<name>/` containing `package.zson` plus flat `.zs` files, and a subpath maps **literally** from the package root: `http-utils/client` → `.zsc_m/http-utils/client.zs`, `pkg/util/text` → `.zsc_m/pkg/util/text.zs`. A `src/` fallback was considered and rejected — it would contradict §94/§96's example trees and would make resolution depend on which of two files exists.
+
+### 66d. Bare package import (`from "pkg"`) has no specified target
+
+§81 defines "path tanpa `./` atau `../` → package import" but every package import example uses a subpath (`"http-utils/client"`); no section states what `from "pkg"` resolves to. §81's only root-level file names are the superseded `package.zs`.
+
+**Decision:** `pkg` → `.zsc_m/pkg/index.zs`. Spec-silent, therefore implementation convention, not a spec-derived rule. The alternative (`package.zs`) follows a section whose file naming §94/§96 replace. Both forms are tested (`test_job017_package_bare_name_uses_index`).
+
+### 66e. Flat `.zsc_m/` vs §88's tree drawing (and multi-version conflict)
+
+§88 draws `my-app → http-utils → url-parser` as a tree and ends by saying that when `package-a → shared-utils@1.2.x` and `package-b → shared-utils@2.x` cannot share a version, "resolver harus mempertahankan versi yang diperlukan oleh masing-masing dependency" — i.e. two versions of one package must be reachable at the same time, which a single flat copy cannot express. §82/§85/§87's directory examples are flat (`.zsc_m/http-utils/`, `.zsc_m/database/`), and §90 defines conflict resolution as a separate section (Job 018).
+
+**Decision:** the §88 tree is the *dependency graph*, not directory nesting; storage is flat, one copy per package name, shared by everyone whose selectors accept it (§88 "menghindari instalasi duplikat ketika versi yang sama dapat digunakan bersama"). Every requirement for a package is intersected; if the intersection is empty → ERROR (`test_job017_unresolvable_version_conflict_is_error`), which satisfies §88's "jika tidak terdapat versi yang memenuhi seluruh kebutuhan → ERROR". Carrying two conflicting versions at once (the last §88 example) requires per-requirement isolation/nested `.zsc_m` and is deferred to Job 018 (§90) — reported as a known limitation, not silently simplified.
+
+### 66f. §89 defines no dev/runtime categories
+
+§89's rules are only: the project sees its own `dependencies`; a package sees its own `package.zson` dependencies; a transitive package is not importable by the project unless declared directly; scope does not affect module scope inside the package. There is no `devDependencies`, no `optional`, no peer concept anywhere in §81-§89.
+
+**Decision:** implemented exactly those two visible sets — `Loader::resolve_package` resolves the *owner* of the importing file (project if outside `.zsc_m/`, otherwise the package name from the path) and checks membership of the requested package in that owner's declared dependencies (`test_job017_project_cannot_import_transitive_dependency`, `test_job017_package_imports_its_own_dependency`, `test_job017_package_cannot_import_undeclared_package`, `test_job017_installed_transitive_package_is_not_global`). No scope category was invented.
+
+### 66g. What the lockfile must contain (§84 vs §88)
+
+§84's example lockfile lists only the project's two direct dependencies; §88 requires "dependency tree harus dapat direproduksi menggunakan project.lock.zson"; §87 says the resolver uses the locked versions.
+
+**Decision:** the lockfile records **every** resolved package (direct and transitive) in resolution order, still in §84's exact shape `{ packages: { "n": "v" } }`. That satisfies §88 reproducibility and is backward-compatible with §84's example (which is exactly what a project with no transitive deps produces). Keys are emitted in breadth-first resolution order (manifest declaration order, then each package's own declaration order) — §87 requires deterministic resolution but never states a traversal; breadth-first was chosen for stability (`test_job017_nested_dependency_tree` pins the order).
+
+### 66h. Invalid lockfile handling (§84 silent)
+
+§84 only says "Jika lockfile tersedia **dan masih valid**, package manager menggunakan versi yang tercatat" and "Jika lockfile dihapus, resolver dapat memilih versi terbaru".
+
+**Decision:** a lockfile that fails to parse (or whose `packages` member is missing/malformed) is treated as **absent**: `install` re-resolves and rewrites it (`test_job017_invalid_lockfile_is_ignored_not_fatal`); `Project::open` stores `lock: None`. A *structurally valid* lockfile is consulted entry-by-entry: an entry whose selector no longer matches the project's selector is re-resolved and the file rewritten (`test_job017_stale_lockfile_entry_is_re_resolved`), while a matching entry pins the version (`test_job017_install_honours_lockfile`). Reading a corrupt lock as a hard error was rejected — §84 frames the lockfile as an optimization over `project.zson`, which remains authoritative.
+
+### 66i. §87 verification when installed metadata is missing or corrupt
+
+§87 requires the installed package to match `project.lock.zson`; §96 requires `package.zson` to be valid ZSON. If the file is absent or unparseable, §87's check cannot be performed at all.
+
+**Decision:** while loading, if `.zsc_m/<pkg>/package.zson` exists it is always parsed (corrupt → ERROR, `test_job017_broken_installed_metadata_is_error`); if a lock entry exists but the file is missing → ERROR `Installed version of 'pkg' is unknown (package.zson missing) but project.lock.zson locks X` (`test_job017_missing_installed_metadata_with_lock_is_error`) — silently skipping would let a wrong version run unnoticed. With **no** lock entry there is nothing to compare against, so a package without metadata still loads (`test_job017_package_without_metadata_runs_when_not_locked`); §96's "package.zson harus ada" is a publishing/registry rule (§94), enforced there by Job 018. The package's *name* field is not compared against the directory name — no rule states that it must match, and the lock is keyed by directory name.
+
+### 66j. Package source for `zpm install` (§85 "download package")
+
+§85's flow says "download package"; §95's registry is a Git-backed index of Git URLs; §93's package source is Git. Job 017 explicitly allows a local, deterministic source.
+
+**Decision:** local filesystem registry laid out exactly like §95's example tree, `<registry>/<package>/<version>/` each holding a valid package (`Registry::versions` / `package_dir`); "download" is a directory copy into `.zsc_m/<name>/`. Source lookup order — `--registry <dir>` flag, then `$ZPM_REGISTRY`, then `<project>/registry` — is **mechanical**: no section states where a local source lives. A package absent from the registry → ERROR (`Package 'x' not found in registry ...`), no matching version → ERROR (`No version of 'x' matches selector '...'`), per §85. Not-installed-and-same-version is not re-copied (`test_job017_installed_package_not_downloaded_again`).
+
+### 66k. `zpm run` argument forwarding mechanism (§86)
+
+§86 says "`zpm` tidak mengubah isi command yang ditulis programmer", that the command runs from the project root, and that "Command tambahan diteruskan kepada command script" for `zpm run start -- --debug`.
+
+**Decision:** the command text is executed verbatim (`sh -c '<command>'`, `current_dir` = project root) and extra arguments are appended as **shell-quoted words** after it — the only reading under which they reach the script's argv (`printf '%s\n' > out.txt --debug 'x y'`, since redirections are position-independent, `test_job017_run_script_args_after_redirection_still_reach_command`). Positional parameters are *not* provided, so `$@` inside a script command expands to nothing (a command written to consume `$@` would double its arguments otherwise — that combination was tried and failed). Consequences: a command ending in `;` or `&&` would receive the arguments as a separate command; a command already ending in a pipe gets them as the last command's argv. Neither case appears in §86 and neither is rejected. Exit code of the child is `zpm`'s exit code (`test_job017_run_script_nonzero_exit_code_propagates`).
+
+### 66l. Mechanical details the spec does not state
+
+- **ZSON parse errors / file names in messages.** `project.zson: Expected ',' or '}' at position N, found 'x'` — §82 only says the file must be ZSON.
+- **Error wording throughout**: `Package 'x' is not a dependency of the project|package 'y'`, `Package 'x' is not installed — run \`zpm install\``, `Script not found: name`, `Installed version of ... but project.lock.zson locks ... — run \`zpm install\``, `Package cannot import files outside its boundary: ...`, `No version of 'x' matches selector '...'`, `Circular package dependency detected: a -> b`. The spec only requires ERROR; all messages are prefixed `ERROR: `.
+- **Exit codes.** `zpm` exits 1 on any error, 0 on success, and passes the script child's code through for `zpm run`; `zsc` exits 1 on any load/run error. No section defines exit codes.
+- **`zsc` / `zpm` binary names.** §86's examples invoke `zsc` and `zerovm`, so the crate's default binary was split into `zsc` (src/main.rs) and `zpm` (src/bin/zpm.rs) with `autobins = false` (Cargo.toml). `zerovm` is not a separate binary — running a `.zs` file *is* the VM (`zsc`); no section defines binary names beyond §86's usage examples.
+- **Project discovery.** §87 says "Package resolution tidak bergantung pada current working directory". `zsc` discovers `project.zson` by walking up from the *entry file*; `zpm` walks up from its *cwd* (it has no entry file). Both are implementation choices; §87 constrains resolution, not the CLI's starting point.
+- **`project.zson` `version` is not SemVer-validated** (§82 requires only "string"), while `package.zson` `version` must be valid SemVer (§96 states it explicitly).
+- **`scripts` keys/values validation** (§86: object, string keys, string command) is done at manifest parse time; unknown manifest fields are ignored (§96 allows future fields for packages; §82 is silent for projects).
