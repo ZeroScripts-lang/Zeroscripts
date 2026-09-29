@@ -1,10 +1,48 @@
 use crate::ast::*;
 use crate::error::CompilerError;
+use crate::native;
+
+/// Magic marker of a ZeroScript bytecode image (§125 conceptual header).
+pub const BYTECODE_MAGIC: &str = "ZERO";
+
+/// Bytecode format version emitted by this compiler (§125). Distinct from the
+/// ZeroScript language version and from any package/module version.
+pub const BYTECODE_VERSION: u32 = 1;
+
+/// Bytecode versions this ZeroVM accepts (§125: compatibility is stated
+/// explicitly; an old bytecode is never assumed compatible).
+pub const SUPPORTED_BYTECODE_VERSIONS: &[u32] = &[1];
+
+/// Bytecode header (§124, §125): `ZERO` + `BYTECODE_VERSION`. Checked by the
+/// validator before any instruction runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BytecodeHeader {
+    pub magic: String,
+    pub version: u32,
+}
+
+impl BytecodeHeader {
+    /// Header the current compiler writes.
+    pub fn current() -> Self {
+        Self {
+            magic: BYTECODE_MAGIC.to_string(),
+            version: BYTECODE_VERSION,
+        }
+    }
+
+    /// Header format is well-formed and the version is supported (§125).
+    pub fn is_supported(&self) -> bool {
+        self.magic == BYTECODE_MAGIC && SUPPORTED_BYTECODE_VERSIONS.contains(&self.version)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Opcode {
     // Literals
     LoadConst(usize),
+
+    // Function value (§141 `LOAD_FUNCTION`)
+    LoadFunction(usize),
 
     // Variables
     DeclareLocal(String, bool), // name, is_const
@@ -64,6 +102,9 @@ pub enum Opcode {
 
     // Functions
     Call(usize),
+    /// `CALL_NATIVE <operation>` (§145, §146): native operation call.
+    /// `usize` is the argument count; no callee is pushed on the value stack.
+    CallNative(String, usize),
     Return,
     MakeClosure(usize, Vec<(String, bool)>), // captured: (name, is_const)
     LoadCaptured(String),
@@ -75,6 +116,12 @@ pub enum Opcode {
     // Collections
     MakeList(usize),
     MakeObject(Vec<String>),
+    /// `LIST_ADD` (§144): append a value to a mutable list. Operand = argc.
+    ListAdd(usize),
+    /// `LIST_REMOVE` (§144): remove a list element by index. Operand = argc.
+    ListRemove(usize),
+    /// `OBJECT_REMOVE` (§144): remove an object property by key. Operand = argc.
+    ObjectRemove(usize),
     GetIndex,
     SetIndex,
     GetProperty(String),
@@ -88,6 +135,11 @@ pub enum Opcode {
 
     // Module boundary (§71-§72): end of one module's instruction range
     EndModule,
+
+    /// Tag of an opcode this VM does not recognize. Never emitted by the
+    /// compiler; it exists so hand-built or foreign bytecode fails validation
+    /// with a VM Error instead of being executed (§124).
+    Unknown(u64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +153,10 @@ pub enum Constant {
 
 #[derive(Debug, Clone)]
 pub struct BytecodeProgram {
+    /// Header (§124, §125): magic + bytecode version, checked before run.
+    pub header: BytecodeHeader,
+    /// Program entry point (§124). Index of the first instruction to execute.
+    pub entry_point: usize,
     pub constants: Vec<Constant>,
     pub instructions: Vec<Opcode>,
     pub functions: Vec<FunctionInfo>,
@@ -147,6 +203,20 @@ struct LoopContext {
     break_jumps: Vec<usize>,
     continue_jumps: Vec<usize>,
     scope_depth: usize, // compiler scopes.len() before the loop body scope was pushed
+}
+
+/// A call the compiler can resolve statically to the native-call boundary
+/// (§145, §146) or to a core collection instruction (§144).
+#[derive(Debug, Clone, PartialEq)]
+enum StaticCallTarget {
+    /// `CALL_NATIVE <operation>`
+    Native(String),
+    /// `LIST_ADD` (§144)
+    ListAdd,
+    /// `LIST_REMOVE` (§144)
+    ListRemove,
+    /// `OBJECT_REMOVE` (§144)
+    ObjectRemove,
 }
 
 #[derive(Debug, Clone)]
@@ -444,6 +514,55 @@ impl Compiler {
         self.emit(Opcode::PopScope);
     }
 
+    /// Is `name` bound by user code anywhere in the current scope chain?
+    /// Undeclared names resolve as globals, and for a builtin root that means
+    /// the native binding installed by the VM (§145).
+    fn is_declared(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .any(|scope| scope.iter().any(|v| v.name == name))
+    }
+
+    /// Resolve a callee statically to the native-call boundary (§145, §146) or
+    /// to a core collection instruction (§144).
+    ///
+    /// Returns `None` for everything the compiler cannot prove is a builtin:
+    /// user bindings, shadowing parameters, unknown methods, and namespace
+    /// roots used as plain values all keep the dynamic `CALL` path, so the
+    /// observable behaviour and error messages never change.
+    fn static_call_target(&self, callee: &Expr) -> Option<StaticCallTarget> {
+        match callee {
+            Expr::Identifier(root, _) => {
+                if self.is_declared(root) || !native::is_native_operation(root) {
+                    return None;
+                }
+                Some(StaticCallTarget::Native(root.clone()))
+            }
+            Expr::Member {
+                object, property, ..
+            } => {
+                let root = match object.as_ref() {
+                    Expr::Identifier(root, _) => root,
+                    _ => return None,
+                };
+                if self.is_declared(root) || !native::is_builtin_root(root) {
+                    return None;
+                }
+                let operation = format!("{}.{}", root, property);
+                match operation.as_str() {
+                    "list.add" => Some(StaticCallTarget::ListAdd),
+                    "list.remove" => Some(StaticCallTarget::ListRemove),
+                    "object.remove" => Some(StaticCallTarget::ObjectRemove),
+                    _ if native::is_native_operation(&operation) => {
+                        Some(StaticCallTarget::Native(operation))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn push_loop_context(&mut self) {
         let scope_depth = self.scopes.len();
         self.loop_contexts.push(LoopContext {
@@ -701,8 +820,11 @@ impl Compiler {
                 self.functions[func_idx].captured_vars = captured.iter().map(|(n, _)| n.clone()).collect();
 
                 // Store function reference
-                let func_const_idx = self.add_constant(Constant::Function(func_idx));
-                self.emit(Opcode::LoadConst(func_const_idx));
+                // Function metadata stays in the constant pool (§126) — index
+                // based consumers such as param defaults keep their indices —
+                // but the value itself is pushed by LOAD_FUNCTION (§141).
+                self.add_constant(Constant::Function(func_idx));
+                self.emit(Opcode::LoadFunction(func_idx));
 
                 if !captured.is_empty() {
                     self.emit(Opcode::MakeClosure(func_idx, captured));
@@ -1324,6 +1446,25 @@ impl Compiler {
                 Ok(())
             }
             Expr::Call { callee, args, .. } => {
+                // Statically resolvable builtin call: no callee is pushed, the
+                // operation name travels in the operand (§145, §146).
+                if let Some(target) = self.static_call_target(callee) {
+                    for arg in args {
+                        self.compile_expression(arg)?;
+                    }
+                    match target {
+                        StaticCallTarget::Native(operation) => {
+                            self.emit(Opcode::CallNative(operation, args.len()))
+                        }
+                        StaticCallTarget::ListAdd => self.emit(Opcode::ListAdd(args.len())),
+                        StaticCallTarget::ListRemove => self.emit(Opcode::ListRemove(args.len())),
+                        StaticCallTarget::ObjectRemove => {
+                            self.emit(Opcode::ObjectRemove(args.len()))
+                        }
+                    };
+                    return Ok(());
+                }
+
                 // Load callee
                 self.compile_expression(callee)?;
 
@@ -1463,8 +1604,11 @@ impl Compiler {
                 self.functions[func_idx].captured_vars = captured.iter().map(|(n, _)| n.clone()).collect();
 
                 // Store function reference
-                let func_const_idx = self.add_constant(Constant::Function(func_idx));
-                self.emit(Opcode::LoadConst(func_const_idx));
+                // Function metadata stays in the constant pool (§126) — index
+                // based consumers such as param defaults keep their indices —
+                // but the value itself is pushed by LOAD_FUNCTION (§141).
+                self.add_constant(Constant::Function(func_idx));
+                self.emit(Opcode::LoadFunction(func_idx));
 
                 if !captured.is_empty() {
                     self.emit(Opcode::MakeClosure(func_idx, captured));
@@ -1580,8 +1724,11 @@ impl Compiler {
                 self.functions[func_idx].local_count = local_count;
                 self.functions[func_idx].captured_vars = captured.iter().map(|(n, _)| n.clone()).collect();
 
-                let func_const_idx = self.add_constant(Constant::Function(func_idx));
-                self.emit(Opcode::LoadConst(func_const_idx));
+                // Function metadata stays in the constant pool (§126) — index
+                // based consumers such as param defaults keep their indices —
+                // but the value itself is pushed by LOAD_FUNCTION (§141).
+                self.add_constant(Constant::Function(func_idx));
+                self.emit(Opcode::LoadFunction(func_idx));
 
                 if !captured.is_empty() {
                     self.emit(Opcode::MakeClosure(func_idx, captured));
@@ -1631,7 +1778,7 @@ pub fn compile(program: &Program) -> Result<BytecodeProgram, CompilerError> {
     let mut compiler = Compiler::new();
     compiler.compile_program(program)?;
 
-    Ok(BytecodeProgram {
+    Ok(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
         constants: compiler.constants,
         instructions: compiler.instructions,
         functions: compiler.functions,
@@ -1663,7 +1810,7 @@ pub fn compile_module(path: &str, program: &Program) -> Result<ModuleUnit, Compi
 /// Merge module units into one program: instruction ranges concatenated,
 /// constants/functions/bodies offset so cross-module indices resolve.
 pub fn merge_modules(units: &[ModuleUnit]) -> BytecodeProgram {
-    let mut combined = BytecodeProgram {
+    let mut combined = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
         constants: Vec::new(),
         instructions: Vec::new(),
         functions: Vec::new(),
@@ -1724,6 +1871,7 @@ pub fn merge_modules(units: &[ModuleUnit]) -> BytecodeProgram {
 fn remap_instr(instr: &Opcode, const_offset: usize, instr_offset: usize, func_offset: usize) -> Opcode {
     match instr {
         Opcode::LoadConst(idx) => Opcode::LoadConst(idx + const_offset),
+        Opcode::LoadFunction(idx) => Opcode::LoadFunction(idx + func_offset),
         Opcode::Jump(t) => Opcode::Jump(t + instr_offset),
         Opcode::JumpIfTrue(t) => Opcode::JumpIfTrue(t + instr_offset),
         Opcode::JumpIfFalse(t) => Opcode::JumpIfFalse(t + instr_offset),
@@ -1740,6 +1888,7 @@ fn remap_instr(instr: &Opcode, const_offset: usize, instr_offset: usize, func_of
 fn remap_body_instr(instr: &Opcode, const_offset: usize, func_offset: usize) -> Opcode {
     match instr {
         Opcode::LoadConst(idx) => Opcode::LoadConst(idx + const_offset),
+        Opcode::LoadFunction(idx) => Opcode::LoadFunction(idx + func_offset),
         Opcode::MakeClosure(idx, captured) => Opcode::MakeClosure(idx + func_offset, captured.clone()),
         other => other.clone(),
     }
@@ -2132,5 +2281,187 @@ mod tests {
     fn test_unary_positive() {
         let bc = compile_source("+10");
         assert!(bc.instructions.contains(&Opcode::Pos));
+    }
+
+    // ---- Job 019: bytecode header, CALL_NATIVE, collection opcodes, LOAD_FUNCTION ----
+
+    fn parse_source(source: &str) -> Program {
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        parser.parse().unwrap()
+    }
+
+    #[test]
+    fn test_job019_header_and_version_written_by_compiler() {
+        let bc = compile_source("print(\"x\")");
+        assert_eq!(bc.header.magic, BYTECODE_MAGIC);
+        assert_eq!(bc.header.version, BYTECODE_VERSION);
+        assert!(bc.header.is_supported());
+        assert!(SUPPORTED_BYTECODE_VERSIONS.contains(&bc.header.version));
+        assert_eq!(bc.entry_point, 0);
+    }
+
+    #[test]
+    fn test_job019_call_native_for_root_builtin() {
+        let bc = compile_source("print(\"x\")");
+        assert!(bc
+            .instructions
+            .contains(&Opcode::CallNative("print".to_string(), 1)));
+        assert!(!bc.instructions.iter().any(|op| matches!(op, Opcode::Call(_))));
+    }
+
+    #[test]
+    fn test_job019_call_native_for_conversions_and_type() {
+        let bc = compile_source("type(1)\nnumber(\"2\")\nstring(1)\nboolean(1)\nprint.err(\"e\")");
+        for operation in ["type", "number", "string", "boolean", "print.err"] {
+            assert!(
+                bc.instructions
+                    .iter()
+                    .any(|op| matches!(op, Opcode::CallNative(name, _) if name.as_str() == operation)),
+                "missing CALL_NATIVE {}",
+                operation
+            );
+        }
+        assert!(!bc.instructions.iter().any(|op| matches!(op, Opcode::Call(_))));
+    }
+
+    #[test]
+    fn test_job019_call_native_for_namespace_methods() {
+        let bc = compile_source(
+            "string.length(\"ab\")\nlist.length([1])\ncolor.red(\"r\")\nfile.exists(\"x\")\njson.stringify(1)\nsystem.os()\ntask.state(1)\nhttp.get(\"u\")",
+        );
+        for operation in [
+            "string.length",
+            "list.length",
+            "color.red",
+            "file.exists",
+            "json.stringify",
+            "system.os",
+            "task.state",
+            "http.get",
+        ] {
+            assert!(
+                bc.instructions
+                    .iter()
+                    .any(|op| matches!(op, Opcode::CallNative(name, _) if name.as_str() == operation)),
+                "missing CALL_NATIVE {}",
+                operation
+            );
+        }
+        assert!(!bc.instructions.iter().any(|op| matches!(op, Opcode::Call(_))));
+    }
+
+    #[test]
+    fn test_job019_collection_instructions_emitted() {
+        let bc = compile_source(
+            "let A = [1]\nlist.add(A, 2)\nlist.remove(A, 0)\nlet O = { k: 1 }\nobject.remove(O, \"k\")",
+        );
+        assert!(bc.instructions.contains(&Opcode::ListAdd(2)));
+        assert!(bc.instructions.contains(&Opcode::ListRemove(2)));
+        assert!(bc.instructions.contains(&Opcode::ObjectRemove(2)));
+        assert!(!bc.instructions.iter().any(
+            |op| matches!(op, Opcode::CallNative(name, _)
+                if matches!(name.as_str(), "list.add" | "list.remove" | "object.remove"))
+        ));
+    }
+
+    #[test]
+    fn test_job019_make_list_and_make_object_stay_core_opcodes() {
+        // §144: MAKE_LIST / MAKE_OBJECT are core instructions, not natives.
+        let bc = compile_source("[1]\n{ a: 2 }");
+        assert!(bc.instructions.contains(&Opcode::MakeList(1)));
+        assert!(bc.instructions.iter().any(|op| matches!(op, Opcode::MakeObject(_))));
+        assert!(!bc.instructions.iter().any(|op| matches!(op, Opcode::CallNative(..))));
+    }
+
+    #[test]
+    fn test_job019_unknown_method_keeps_dynamic_call() {
+        let bc = compile_source("string.bogus(\"x\")");
+        assert!(bc.instructions.contains(&Opcode::GetProperty("bogus".to_string())));
+        assert!(bc.instructions.contains(&Opcode::Call(1)));
+        assert!(!bc.instructions.iter().any(|op| matches!(op, Opcode::CallNative(..))));
+    }
+
+    #[test]
+    fn test_job019_shadowed_builtin_parameter_keeps_dynamic_call() {
+        let bc = compile_source("function f(print) { print(7) }");
+        let body = &bc.function_bodies[0];
+        assert!(body
+            .iter()
+            .any(|op| matches!(op, Opcode::LoadLocal(name) if name.as_str() == "print")));
+        assert!(!body.iter().any(|op| matches!(op, Opcode::CallNative(..))));
+    }
+
+    #[test]
+    fn test_job019_declared_namespace_root_keeps_dynamic_call() {
+        let bc = compile_source("let string = 1\nstring(\"2\")");
+        assert!(!bc.instructions.iter().any(|op| matches!(op, Opcode::CallNative(..))));
+        assert!(bc.instructions.contains(&Opcode::Call(1)));
+    }
+
+    #[test]
+    fn test_job019_builtin_as_value_keeps_dynamic_call() {
+        let bc = compile_source("let f = string.length");
+        assert!(bc.instructions.contains(&Opcode::GetProperty("length".to_string())));
+        assert!(!bc.instructions.iter().any(|op| matches!(op, Opcode::CallNative(..))));
+    }
+
+    #[test]
+    fn test_job019_load_function_for_function_reference() {
+        let bc = compile_source("function f() { return 1 }\nlet g = f");
+        assert!(bc.instructions.iter().any(|op| matches!(op, Opcode::LoadFunction(0))));
+        // Function references are pushed by LOAD_FUNCTION, not LOAD_CONST.
+        assert!(!bc.instructions.iter().any(
+            |op| matches!(op, Opcode::LoadConst(idx) if matches!(bc.constants[*idx], Constant::Function(_)))
+        ));
+        // The metadata itself stays in the pool (§126) for index consumers.
+        assert!(bc
+            .constants
+            .iter()
+            .any(|c| matches!(c, Constant::Function(0))));
+    }
+
+    #[test]
+    fn test_job019_load_function_inside_function_body() {
+        let bc = compile_source("function outer() { let h = () => 5 return h() }");
+        let body = &bc.function_bodies[0];
+        assert!(body.iter().any(|op| matches!(op, Opcode::LoadFunction(_))));
+    }
+
+    #[test]
+    fn test_job019_merge_modules_remaps_load_function_and_sets_header() {
+        let a = compile_module("./a.zs", &parse_source("export function f() { return 1 }")).unwrap();
+        let b = compile_module("./b.zs", &parse_source("export function g() { return 2 }")).unwrap();
+        let merged = merge_modules(&[a, b]);
+
+        let mut indices: Vec<usize> = merged
+            .instructions
+            .iter()
+            .filter_map(|op| match op {
+                Opcode::LoadFunction(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        indices.sort();
+        assert_eq!(indices, vec![0, 1]);
+
+        assert_eq!(merged.header.magic, BYTECODE_MAGIC);
+        assert_eq!(merged.header.version, BYTECODE_VERSION);
+        assert_eq!(merged.entry_point, 0);
+        assert_eq!(merged.functions.len(), merged.function_bodies.len());
+    }
+
+    #[test]
+    fn test_job019_every_function_has_a_body_after_compile() {
+        let bc = compile_source(
+            "function a() { return 1 }\nfunction b() { function c() { return 2 } return c() }\nlet f = () => 3",
+        );
+        assert_eq!(bc.functions.len(), bc.function_bodies.len());
+        for (index, function) in bc.functions.iter().enumerate() {
+            let body = &bc.function_bodies[index];
+            assert!(function.entry_point + body.len() <= bc.instructions.len());
+            assert!(bc.instructions[function.entry_point..function.entry_point + body.len()] == *body);
+        }
     }
 }

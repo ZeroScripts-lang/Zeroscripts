@@ -84,11 +84,11 @@ Spec files audited: Language.md, Bytecode.md, ZeroVM.md, Runtime.md, Modules.md,
 | Default parameter compilation | §30 | Implemented | compiler.rs:331-342 |
 | Arrow function expression body | §32 | Implemented | compiler.rs:1099-1134 |
 | `LOAD_GLOBAL` / `STORE_GLOBAL` | §127 | Implemented | Opcode::LoadGlobal/StoreGlobal (compiler.rs:14-15); DeclareGlobal(String, is_const) |
-| `LIST_ADD` / `LIST_REMOVE` / `OBJECT_REMOVE` | §144 | **Not Implemented** | Delegated to stdlib only |
-| `CALL_NATIVE` | §145-§146 | **Not Implemented** | No native call mechanism |
-| `LOAD_FUNCTION` (standalone) | §141 | **Not Implemented** | Uses `LoadConst(Function(idx))` instead |
-| Bytecode header / versioning | §124-§125 | **Not Implemented** | No version field |
-| Bytecode validation pass | §124 | **Not Implemented** | No validator |
+| `LIST_ADD` / `LIST_REMOVE` / `OBJECT_REMOVE` | §144 | Implemented | Opcode::ListAdd/ListRemove/ObjectRemove (compiler.rs:120-124); emitted for statically resolved `list.add`/`list.remove`/`object.remove` (compiler.rs:533, 1459-1462); VM arms execute_list_add/remove/object_remove → native_list_add/native_list_remove/native_object_remove (vm.rs:1060-1063, 1803-1827); dynamic path (namespace kept as value, shadowed root, unknown method) falls through BuiltIn+GetProperty+Call → same helper (vm.rs:2686-2688). Tests: test_job019_collection_instructions_emitted, test_job019_collection_instructions_execute, test_job019_make_list_and_make_object_stay_core_opcodes |
+| `CALL_NATIVE` | §145-§146 | Implemented | Opcode::CallNative(String, usize) (compiler.rs:107); static emission via Compiler::static_call_target + Expr::Call arm (compiler.rs:533, 1457) whenever the callee is an unshadowed built-in root/namespace method/conversion; single registry src/native.rs (BUILTIN_ROOTS, ROOT_FUNCTIONS, NATIVE_METHODS, is_native_operation/is_builtin_root/native_methods); VM: execute_call_native → call_native dispatch (vm.rs:1066, 1794, 2527). Unknown/dynamic callees keep the pre-Job-019 path (LoadGlobal/GetProperty/Call), so error text is byte-identical. Tests: test_job019_call_native_for_root_builtin, test_job019_call_native_for_conversions_and_type, test_job019_call_native_for_namespace_methods, test_job019_call_native_executes_builtin, test_job019_unknown_native_operation_is_runtime_error, test_job019_native_call_arity_error_is_runtime_error, test_job019_representative_builtins_after_native_refactor |
+| `LOAD_FUNCTION` (standalone) | §141 | Implemented | Opcode::LoadFunction(usize) (compiler.rs:45) is now the value push for declarations (compiler.rs:827), named references (compiler.rs:1731) and function expressions (compiler.rs:1611); Constant::Function metadata is retained in the pool per §126 (index consumers, param defaults); remapped on module merge (compiler.rs:1874, 1891); VM execute_load_function (vm.rs:1048, 1780). Tests: test_job019_load_function_for_function_reference, test_job019_load_function_inside_function_body, test_job019_load_function_executes, test_job019_load_function_recursive_still_works, test_job019_merge_modules_remaps_load_function_and_sets_header, test_job019_every_function_has_a_body_after_compile |
+| Bytecode header / versioning | §124-§125 | Implemented | BytecodeHeader{magic,version} + BYTECODE_MAGIC "ZERO"/BYTECODE_VERSION 1/SUPPORTED_BYTECODE_VERSIONS (compiler.rs:6-35); written by compile() and merge_modules() (compiler.rs:1781, 1814); checked first by validate_header (vm.rs:663) — bad magic → VmError::InvalidHeader, unknown version → VmError::UnsupportedBytecodeVersion, both before the execution loop; bytecode version is independent of the language version. Tests: test_job019_header_and_version_written_by_compiler, test_job019_header_written_by_compiler, test_job019_bad_magic_rejected_before_execution, test_job019_unsupported_version_rejected_before_execution, test_job019_unsupported_version_constant_is_not_a_supported_version, test_job019_module_programs_get_header_and_validate |
+| Bytecode validation pass | §124 | Implemented | ZeroVM::validate (vm.rs:603) runs validate_header → entry-point bounds → validate_stream(main) → function metadata (functions/function_bodies count, param/default arity, default constant indices, body entry bounds) → validate_stream(every body); validate_stream (vm.rs:681) checks every opcode tag (unknown → InvalidOpcode via Opcode::Unknown), operand format (empty variable name / empty native op / empty object key / function index), constant indices (InvalidConstantIndex) and jump targets (InvalidJumpTarget). Called as the first statement of run() (vm.rs:772) and run_modules() (vm.rs:824-825) — a program that fails validation never executes (output stays empty). Tests: test_job019_unknown_opcode_rejected_before_execution, test_job019_invalid_jump_in_function_body_rejected_before_execution, test_job019_invalid_constant_in_function_body_rejected_before_execution, test_job019_entry_point_out_of_range_rejected, test_job019_function_body_count_mismatch_rejected, test_job019_param_default_out_of_range_rejected, test_job019_param_default_count_mismatch_rejected, test_job019_empty_variable_operand_rejected, test_job019_empty_native_operation_rejected, test_job019_empty_object_key_rejected, test_job019_make_closure_target_out_of_range_rejected |
 | `const` enforcement | §3 | Implemented | check_assign_const (compiler.rs:291); DeclareLocal/Global(name, is_const); store checks is_const; runtime Binding.is_const + mark_const_if_collection. Tests: test_job008_const_* |
 | `else if` chains beyond depth 2 | §17 | Implemented | recursive compile_else_branch (compiler.rs:388,418,637); test_job008_else_if_chain_depth_gt_2 |
 | `break`/`continue` outside loop validation | §21-§22 | Implemented | compiler.rs:710,720 — compile errors; saved_loop_contexts=take at function boundaries (505,1187,1295); tests break/continue_outside_loop + function_boundary |
@@ -338,8 +338,8 @@ Job 015 behavior tests (vm.rs): test_job015_concurrent_creation_before_await (§
 | Lexer | 22 | 22 | 0 | 0 |
 | Parser | 21 | 21 | 0 | 0 |
 | AST | 17 | 17 | 0 | 0 |
-| Compiler / Opcodes | 37 | 34 | 0 | 3 |
-| ZeroVM Execution | 30 | 27 | 0 | 3 |
+| Compiler / Opcodes | 37 | 37 | 0 | 0 |
+| ZeroVM Execution | 32 | 29 | 0 | 3 |
 | Runtime Values | 3 | 3 | 0 | 0 |
 | Heap | 15 | 15 | 0 | 0 |
 | GC | 6 | 5 | 1 | 0 |
@@ -349,7 +349,9 @@ Job 015 behavior tests (vm.rs): test_job015_concurrent_creation_before_await (§
 | Dependencies | 15 | 11 | 1 | 3 |
 | Error Handling | 14 | 14 | 0 | 0 |
 | Semantics | 36 | 33 | 3 | 0 |
-| **TOTAL** | **248** | **233** | **6** | **9** |
+| **TOTAL** | **250** | **238** | **6** | **6** |
+
+*(Job 019: §4 rows `LIST_ADD`/`LIST_REMOVE`/`OBJECT_REMOVE`, `CALL_NATIVE`, `LOAD_FUNCTION` (standalone) → Implemented (3 Not → 0). The previously uncategorized header/versioning and validation-pass rows are now counted under ZeroVM Execution (which grows 30 → 32 items, 27 → 29 Implemented). Compiler/Opcodes 37 = 37+0+0. Totals: 250 = 238+6+6. Decisions → ISSUES.md §68a-§68f.)*
 
 *(Job 013: Modules alias/re-export/conflict/live binding rows → Implemented (test_job013_*). Modules now 12 Implemented + 1 Partial (§73 eval failure / try/catch tension — ISSUES.md §62).*
 *(Job 014: Async rows updated — async/await Implemented; task states / task.state / scheduler Partially (cancelled, task.cancel, interleaving → Job 015; ISSUES.md §63). Async now 2 Implemented + 3 Partial + 2 Not. Totals: 243 = 216+8+19.)*
@@ -384,19 +386,19 @@ Job 015 behavior tests (vm.rs): test_job015_concurrent_creation_before_await (§
 - 623 tests passing with 0 failures (Job 016 added 13 tests: 12 required http.* tests + 1 options-type test, against a deterministic local mock server)
 - 727 tests passing with 0 failures (Job 017 added 93 unit tests + 11 CLI integration tests: ZSON/manifest/lockfile parsing, version selectors, install flow, nested/shared/circular dependency resolution, package import + boundary + scope, `zpm run`, and end-to-end `zpm install` → `zpm run start` → `zsc` package import)
 - 765 tests passing with 0 failures (Job 018 added 25 package integration tests + 8 CLI integration tests + 1 superseded/replacement unit test: §90 conflict resolution, §91 remove, §92 update, §93 git source, §94 publish e2e, §95 registry/index, §96 metadata, §97 integrity, §98 cache, §99 source priority, §100 completion checklist)
+- 809 tests passing with 0 failures (Job 019 added 44 unit tests: 4 native-registry tests in src/native.rs, 14 compiler tests for CALL_NATIVE/LOAD_FUNCTION/header emission + module merge, 26 VM tests for the validation pass, CALL_NATIVE execution, collection opcodes and unchanged dynamic-path error text; baseline 765 from Jobs 001-018 re-run unchanged)
 
 ---
 
 ## 18. Not In Scope (Future Jobs)
 
 - Top-level await as literally written in §49's invocation snippet and §112's example: still a compile error by design (rules normative; examples run via `async function main()` wrapper — ISSUES.md §63a/§64a). Async concurrency itself (§102, §103-§105, §109-§112) implemented in Job 015 — see §10
-- http.* (§50/§50.1/§59/§60): implemented in Job 016 — see §11 (nothing of the listed stdlib set remains deferred; only package/zpm completion, bytecode hardening, and the §18 gap list below remain)
+- http.* (§50/§50.1/§59/§60): implemented in Job 016 — see §11 (nothing of the listed stdlib set remains deferred; only package/zpm completion and the §18 gap list below remain — bytecode hardening shipped in Job 019, see §4/§5)
 - Package management (Jobs 017+018): §81-§100 now Implemented in CHECK.md §12 — manifest/lockfile/`.zsc_m`/selectors/`zpm install`+`run` (Job 017), then §90 multi-version resolution, §91 remove, §92 update, §93 git source, §94 publish, §95 registry+index+additional registries, §96 metadata, §97 integrity, §98 cache, §99 source priority, §100 completion (Job 018). Still open as a transport detail: HTTP/remote registry over the network (§95's registry may be remote; implementation is local-filesystem-only, minimum local implementation recorded in ISSUES.md §67) — see §12
 - Default parameters evaluated at call time (Job 008 explicitly out of scope)
 - Closure-in-data-structure shared env fix (heap_object_for_element)
 - GC root coverage for local vars/params
-- Bytecode versioning/validation (Job 019)
-- Native call convention (CALL_NATIVE — formalized Job 019; Job 010 uses soft BuiltIn+GetProperty path)
+- Bytecode versioning/validation (§124-§125) and `CALL_NATIVE` (§145-§146): implemented in Job 019 — see §4 and §5; the dynamic `BuiltIn`+`GetProperty`+`Call` path is retained on purpose for unresolvable callees (ISSUES.md §68c)
 - One-way const marking: `let A=[1]; const C=A` freezes A's object too (documented limitation, ISSUES.md)
 - break/continue crossing try-with-finally (documented gap; return-through-finally IS implemented)
 - Multi-arg print / full print.* API (still single-arg; Job 010 confirmed types work, arity not expanded)
@@ -430,3 +432,10 @@ Job 015 behavior tests (vm.rs): test_job015_concurrent_creation_before_await (§
 - **Un-awaited `task.sleep`/`task.timeout` not rejected**: §111 says `task.sleep()` "harus digunakan dengan await" but the spec defines no detection mechanism; an un-awaited sleep becomes a silent background timer task (ISSUES.md §64d). Spec-level rule without an enforceable consequence — needs spec clarification before a language rule can be invented.
 - **Virtual clock vs wall-clock pacing**: scheduler uses a virtual monotonic clock (deterministic, instant tests); sleep/timeout do not pace against real time (ISSUES.md §64d). No spec section exposes wall-clock time, so nothing observable is missing — flag if a future stdlib exposes real time.
 - **Task memory reclamation (carried from Job 014)**: `ZeroVM.tasks` grows monotonically; results/errors/contexts of terminal tasks are retained forever (no `task.dispose` in spec — GC work).
+
+### Candidate Gaps for Future Work (discovered during Job 019)
+
+- **No bytecode file format.** §124/§125 define a header and a version, but no serialization, no on-disk artifact, and no rule for loading foreign bytecode. `BytecodeHeader` therefore exists only in memory and is checked before execution; a future job that persists or transports bytecode must define the encoding first (ISSUES.md §68d).
+- **`Opcode::Unknown` is unreachable from the compiler.** It exists solely so hand-built/foreign tags fail validation with `InvalidOpcode`; if a real interchange format appears, unknown-tag recovery policy (reject vs. skip) must be specified.
+- **Merged module program under `ZeroVM::run()`.** `compile()` terminates with `Halt` before appended bodies, `merge_modules()` does not, and `EndModule` is a no-op outside `run_modules` — so a merged module program driven through plain `run()` would fall through into function bodies. Not reachable in the product (`zsc`/`zpm` → `run_modules`, single file → `compile()`), recorded as an observation (ISSUES.md §68f).
+- **Unreachable trailing implicit `return null`** after an explicit `return` (compiler.rs:772-775): harmless dead bytecode, unchanged this job (ISSUES.md §68f).

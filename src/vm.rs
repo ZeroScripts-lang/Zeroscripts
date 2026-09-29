@@ -8,6 +8,7 @@ use std::time::Duration;
 use crate::compiler::{BytecodeProgram, Constant, FunctionInfo, Opcode};
 use crate::gc::Gc;
 use crate::heap::{EnvBinding, Heap, HeapObject, HeapRef as HeapRefHandle};
+use crate::native;
 use crate::runtime_value::{RuntimeValue, RuntimeError};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -236,6 +237,8 @@ impl Value {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VmError {
+    InvalidHeader(String),
+    UnsupportedBytecodeVersion(u32),
     InvalidBytecode(String),
     InvalidOpcode(String),
     InvalidOperand(String),
@@ -250,6 +253,10 @@ pub enum VmError {
 impl fmt::Display for VmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            VmError::InvalidHeader(msg) => write!(f, "Invalid bytecode header: {}", msg),
+            VmError::UnsupportedBytecodeVersion(v) => {
+                write!(f, "Unsupported bytecode version: {}", v)
+            }
             VmError::InvalidBytecode(msg) => write!(f, "Invalid bytecode: {}", msg),
             VmError::InvalidOpcode(msg) => write!(f, "Invalid opcode: {}", msg),
             VmError::InvalidOperand(msg) => write!(f, "Invalid operand: {}", msg),
@@ -586,33 +593,126 @@ impl ZeroVM {
         }
     }
 
+    /// Bytecode validation pass (§124): the first layer, run before the
+    /// execution loop. A program that fails validation is never executed.
+    ///
+    /// Checks the header/format (§124, §125), opcode recognition, operand
+    /// format, constant pool and function references, jump targets, function
+    /// metadata (§143) and the program entry point — over the main instruction
+    /// stream and over every function body.
     pub fn validate(&self) -> Result<(), VmError> {
-        if self.program.instructions.is_empty() {
-            return Ok(());
+        self.validate_header()?;
+
+        let instruction_count = self.program.instructions.len();
+        if instruction_count == 0 {
+            if self.program.entry_point != 0 {
+                return Err(VmError::InvalidBytecode(format!(
+                    "Entry point {} outside empty program",
+                    self.program.entry_point
+                )));
+            }
+        } else if self.program.entry_point >= instruction_count {
+            return Err(VmError::InvalidBytecode(format!(
+                "Entry point {} outside program ({} instructions)",
+                self.program.entry_point, instruction_count
+            )));
         }
 
-        for (_i, instruction) in self.program.instructions.iter().enumerate() {
+        Self::validate_stream(&self.program, &self.program.instructions)?;
+
+        // §143: one body per function, each function's entry point covers the
+        // copy of its body appended to the main stream, defaults stay in range.
+        if self.program.functions.len() != self.program.function_bodies.len() {
+            return Err(VmError::InvalidBytecode(format!(
+                "{} function(s) but {} function bodie(s)",
+                self.program.functions.len(),
+                self.program.function_bodies.len()
+            )));
+        }
+
+        for (index, function) in self.program.functions.iter().enumerate() {
+            let body = &self.program.function_bodies[index];
+
+            if function.params.len() != function.param_defaults.len() {
+                return Err(VmError::InvalidOperand(format!(
+                    "Function '{}' has {} parameter(s) but {} default(s)",
+                    function.name,
+                    function.params.len(),
+                    function.param_defaults.len()
+                )));
+            }
+            for default in function.param_defaults.iter().flatten() {
+                if *default >= self.program.constants.len() {
+                    return Err(VmError::InvalidConstantIndex(*default));
+                }
+            }
+
+            let body_end = function.entry_point.saturating_add(body.len());
+            if function.entry_point > instruction_count || body_end > instruction_count {
+                return Err(VmError::InvalidJumpTarget(function.entry_point));
+            }
+
+            Self::validate_stream(&self.program, body)?;
+        }
+
+        Ok(())
+    }
+
+    /// Header and version check (§124, §125). A bytecode version this ZeroVM
+    /// does not support produces a VM Error before execution begins.
+    fn validate_header(&self) -> Result<(), VmError> {
+        if self.program.header.magic != crate::compiler::BYTECODE_MAGIC {
+            return Err(VmError::InvalidHeader(format!(
+                "expected magic '{}', found '{}'",
+                crate::compiler::BYTECODE_MAGIC,
+                self.program.header.magic
+            )));
+        }
+        if !crate::compiler::SUPPORTED_BYTECODE_VERSIONS.contains(&self.program.header.version) {
+            return Err(VmError::UnsupportedBytecodeVersion(
+                self.program.header.version,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Per-instruction checks, shared by the main stream and by function
+    /// bodies (body jumps are body-relative, so the stream length is bound).
+    fn validate_stream(program: &BytecodeProgram, instructions: &[Opcode]) -> Result<(), VmError> {
+        let constant_count = program.constants.len();
+        let function_count = program.functions.len();
+        let instruction_count = instructions.len();
+
+        for instruction in instructions {
             match instruction {
                 Opcode::LoadConst(idx) => {
-                    if *idx >= self.program.constants.len() {
+                    if *idx >= constant_count {
                         return Err(VmError::InvalidConstantIndex(*idx));
+                    }
+                }
+                Opcode::LoadFunction(idx) | Opcode::MakeClosure(idx, _) => {
+                    if *idx >= function_count {
+                        return Err(VmError::InvalidOperand(format!(
+                            "Function index {} out of range",
+                            idx
+                        )));
                     }
                 }
                 Opcode::Jump(target)
                 | Opcode::JumpIfTrue(target)
                 | Opcode::JumpIfFalse(target) => {
-                    if *target >= self.program.instructions.len() {
+                    if *target >= instruction_count {
                         return Err(VmError::InvalidJumpTarget(*target));
                     }
                 }
                 Opcode::TryPush { catch, finally } => {
                     if let Some(t) = catch {
-                        if *t >= self.program.instructions.len() {
+                        if *t >= instruction_count {
                             return Err(VmError::InvalidJumpTarget(*t));
                         }
                     }
                     if let Some(t) = finally {
-                        if *t >= self.program.instructions.len() {
+                        if *t >= instruction_count {
                             return Err(VmError::InvalidJumpTarget(*t));
                         }
                     }
@@ -620,19 +720,33 @@ impl ZeroVM {
                 Opcode::MakeObject(keys) => {
                     for key in keys {
                         if key.is_empty() {
-                            return Err(VmError::InvalidOperand(
-                                "Empty object key".to_string(),
-                            ));
+                            return Err(VmError::InvalidOperand("Empty object key".to_string()));
                         }
                     }
                 }
+                Opcode::DeclareLocal(name, _)
+                | Opcode::LoadLocal(name)
+                | Opcode::StoreLocal(name)
+                | Opcode::DeclareGlobal(name, _)
+                | Opcode::LoadGlobal(name)
+                | Opcode::StoreGlobal(name)
+                | Opcode::LoadCaptured(name)
+                | Opcode::StoreCaptured(name) => {
+                    if name.is_empty() {
+                        return Err(VmError::InvalidOperand("Empty variable name".to_string()));
+                    }
+                }
+                Opcode::CallNative(operation, _) => {
+                    if operation.is_empty() {
+                        return Err(VmError::InvalidOperand(
+                            "Empty native operation name".to_string(),
+                        ));
+                    }
+                }
+                Opcode::Unknown(tag) => {
+                    return Err(VmError::InvalidOpcode(format!("Unknown opcode {}", tag)));
+                }
                 _ => {}
-            }
-        }
-
-        for func in &self.program.functions {
-            if func.entry_point >= self.program.instructions.len() {
-                return Err(VmError::InvalidJumpTarget(func.entry_point));
             }
         }
 
@@ -641,21 +755,7 @@ impl ZeroVM {
 
     /// Install built-in bindings into the shared global scope (§42-§53).
     fn install_builtins(&mut self) {
-        for name in [
-            "print",
-            "type",
-            "number",
-            "string",
-            "boolean",
-            "list",
-            "object",
-            "color",
-            "file",
-            "system",
-            "json",
-            "task",
-            "http",
-        ] {
+        for name in native::BUILTIN_ROOTS {
             self.global_scope.insert(
                 name.to_string(),
                 Binding {
@@ -671,6 +771,7 @@ impl ZeroVM {
     pub fn run(&mut self) -> Result<(), VmError> {
         self.validate()?;
         self.state = ExecutionState::Running;
+        self.pc = self.program.entry_point;
 
         // Globals live in `global_scope` (shared across task contexts); the
         // root frame only hosts the top-level lexical scope stack.
@@ -941,8 +1042,10 @@ impl ZeroVM {
             Opcode::TryPop => self.execute_try_pop(),
             Opcode::FinallyEnd => self.execute_finally_end(),
             Opcode::Call(argc) => self.execute_call(*argc),
+            Opcode::CallNative(operation, argc) => self.execute_call_native(operation, *argc),
             Opcode::Await => self.execute_await(),
             Opcode::Return => self.execute_return(),
+            Opcode::LoadFunction(idx) => self.execute_load_function(*idx),
             Opcode::MakeClosure(func_idx, captured) => {
                 self.execute_make_closure(*func_idx, captured.as_slice())
             }
@@ -950,6 +1053,9 @@ impl ZeroVM {
             Opcode::StoreCaptured(name) => self.execute_store_captured(name),
             Opcode::MakeList(size) => self.execute_make_list(*size),
             Opcode::MakeObject(keys) => self.execute_make_object(keys),
+            Opcode::ListAdd(argc) => self.execute_list_add(*argc),
+            Opcode::ListRemove(argc) => self.execute_list_remove(*argc),
+            Opcode::ObjectRemove(argc) => self.execute_object_remove(*argc),
             Opcode::GetIndex => self.execute_get_index(),
             Opcode::SetIndex => self.execute_set_index(),
             Opcode::GetProperty(name) => self.execute_get_property(name),
@@ -963,6 +1069,12 @@ impl ZeroVM {
                 // Module range end is enforced by run_modules; no-op if hit.
                 Ok(())
             }
+            // Unreachable after validation (§124); kept so a hand-built or
+            // mutated program fails instead of silently doing nothing.
+            Opcode::Unknown(tag) => Err(VmError::InvalidOpcode(format!(
+                "Unknown opcode {}",
+                tag
+            ))),
         }
     }
 
@@ -1112,23 +1224,8 @@ impl ZeroVM {
 
     fn execute_declare_global(&mut self, name: &str, is_const: bool) -> Result<(), VmError> {
         let scope = &mut self.global_scope;
-        const BUILTINS: &[&str] = &[
-            "print",
-            "type",
-            "number",
-            "string",
-            "boolean",
-            "list",
-            "object",
-            "color",
-            "file",
-            "system",
-            "json",
-            "task",
-            "http",
-        ];
         if scope.contains_key(name) {
-            if BUILTINS.contains(&name) {
+            if native::is_builtin_root(name) {
                 return Err(VmError::RuntimeError(format!(
                     "Cannot redeclare built-in '{}'",
                     name
@@ -1659,6 +1756,74 @@ impl ZeroVM {
                 func_value
             ))),
         }
+    }
+
+    /// Pop `argc` values pushed as call arguments (no callee on the stack).
+    fn pop_native_args(&mut self, argc: usize, context: &str) -> Result<Vec<Value>, VmError> {
+        if self.stack.len() < argc {
+            return Err(VmError::StackUnderflow(format!(
+                "{} needs {} argument(s), stack has {}",
+                context,
+                argc,
+                self.stack.len()
+            )));
+        }
+        let mut args = Vec::with_capacity(argc);
+        for _ in 0..argc {
+            args.push(self.pop_stack(context)?);
+        }
+        args.reverse();
+        Ok(args)
+    }
+
+    /// Push a function value for `CALL` — `LOAD_FUNCTION` (§141).
+    fn execute_load_function(&mut self, index: usize) -> Result<(), VmError> {
+        if index >= self.program.functions.len() {
+            return Err(VmError::InvalidOperand(format!(
+                "Function index {} out of range",
+                index
+            )));
+        }
+        self.stack.push(Value::Function(index));
+        self.track_stack_top();
+        Ok(())
+    }
+
+    /// `CALL_NATIVE <operation>` (§145, §146): arguments only, no callee value,
+    /// dispatched through the single native-operation boundary.
+    fn execute_call_native(&mut self, operation: &str, argc: usize) -> Result<(), VmError> {
+        let args = self.pop_native_args(argc, operation)?;
+        let result = self.call_native(operation, &args)?;
+        self.stack.push(result);
+        self.track_stack_top();
+        Ok(())
+    }
+
+    /// `LIST_ADD` (§144) — shares its implementation with `list.add`.
+    fn execute_list_add(&mut self, argc: usize) -> Result<(), VmError> {
+        let args = self.pop_native_args(argc, "list.add")?;
+        let result = self.native_list_add(&args)?;
+        self.stack.push(result);
+        self.track_stack_top();
+        Ok(())
+    }
+
+    /// `LIST_REMOVE` (§144) — shares its implementation with `list.remove`.
+    fn execute_list_remove(&mut self, argc: usize) -> Result<(), VmError> {
+        let args = self.pop_native_args(argc, "list.remove")?;
+        let result = self.native_list_remove(&args)?;
+        self.stack.push(result);
+        self.track_stack_top();
+        Ok(())
+    }
+
+    /// `OBJECT_REMOVE` (§144) — shares its implementation with `object.remove`.
+    fn execute_object_remove(&mut self, argc: usize) -> Result<(), VmError> {
+        let args = self.pop_native_args(argc, "object.remove")?;
+        let result = self.native_object_remove(&args)?;
+        self.stack.push(result);
+        self.track_stack_top();
+        Ok(())
     }
 
     /// Build a function frame's root scope: parameters (with defaults applied),
@@ -2341,19 +2506,25 @@ impl ZeroVM {
         }
     }
 
+    /// Dynamic native call: a `BuiltIn` value reached through `CALL` (for
+    /// example a builtin stored in a variable). Static call sites compile to
+    /// `CALL_NATIVE` instead; both land in `call_native` (§145, §146).
     fn execute_builtin(&mut self, name: &str, argc: usize) -> Result<Value, VmError> {
         // All BuiltIn values (root functions and namespace methods) pop args
-        // and dispatch through call_builtin — the soft CALL_NATIVE boundary.
+        // and dispatch through call_native — the native-call boundary.
         let mut args = Vec::new();
         for _ in 0..argc {
             args.push(self.pop_stack("builtin arg")?);
         }
         args.reverse();
         self.pop_stack("builtin callee")?;
-        self.call_builtin(name, &args)
+        self.call_native(name, &args)
     }
 
-    fn call_builtin(&mut self, name: &str, args: &[Value]) -> Result<Value, VmError> {
+    /// The single native-operation boundary (§145, §146): every standard
+    /// library and builtin call — compiled statically as `CALL_NATIVE`, or
+    /// reached dynamically through a `BuiltIn` value — dispatches here.
+    fn call_native(&mut self, name: &str, args: &[Value]) -> Result<Value, VmError> {
         match name {
             "print" => {
                 if args.is_empty() {
@@ -2500,80 +2671,8 @@ impl ZeroVM {
                 }
             }
             // ---- list.* (Language §34) ----
-            "list.add" => {
-                let r = expect_list_arg(&args, 0, "list.add")?;
-                if args.len() != 2 {
-                    return Err(VmError::RuntimeError(
-                        "list.add expects exactly 2 arguments".to_string(),
-                    ));
-                }
-                let elem = args[1].heap_object_for_element(&mut self.heap);
-                match self.heap.get_mut(&r) {
-                    Ok(HeapObject::List { items, is_const }) => {
-                        if *is_const {
-                            return Err(VmError::RuntimeError(
-                                "Cannot modify const list".to_string(),
-                            ));
-                        }
-                        items.push(elem);
-                    }
-                    _ => {
-                        return Err(VmError::RuntimeError(
-                            "list.add expects a list".to_string(),
-                        ))
-                    }
-                }
-                Ok(Value::Null)
-            }
-            "list.remove" => {
-                let r = expect_list_arg(&args, 0, "list.remove")?;
-                if args.len() != 2 {
-                    return Err(VmError::RuntimeError(
-                        "list.remove expects exactly 2 arguments".to_string(),
-                    ));
-                }
-                let idx = match &args[1] {
-                    Value::Number(n) => {
-                        let i = *n as usize;
-                        if *n < 0.0 || *n != i as f64 {
-                            return Err(VmError::RuntimeError(format!(
-                                "List index {} out of bounds",
-                                n
-                            )));
-                        }
-                        i
-                    }
-                    other => {
-                        return Err(VmError::RuntimeError(format!(
-                            "list.remove index must be number, got {:?}",
-                            other
-                        )))
-                    }
-                };
-                match self.heap.get_mut(&r) {
-                    Ok(HeapObject::List { items, is_const }) => {
-                        if *is_const {
-                            return Err(VmError::RuntimeError(
-                                "Cannot modify const list".to_string(),
-                            ));
-                        }
-                        if idx >= items.len() {
-                            return Err(VmError::RuntimeError(format!(
-                                "List index {} out of bounds (length {})",
-                                idx,
-                                items.len()
-                            )));
-                        }
-                        items.remove(idx);
-                    }
-                    _ => {
-                        return Err(VmError::RuntimeError(
-                            "list.remove expects a list".to_string(),
-                        ))
-                    }
-                }
-                Ok(Value::Null)
-            }
+            "list.add" => self.native_list_add(args),
+            "list.remove" => self.native_list_remove(args),
             "list.length" => {
                 let r = expect_list_arg(&args, 0, "list.length")?;
                 match self.heap.get(&r) {
@@ -2586,49 +2685,7 @@ impl ZeroVM {
                 }
             }
             // ---- object.* (Language §39) ----
-            "object.remove" => {
-                let r = expect_object_arg(&args, 0, "object.remove")?;
-                if args.len() != 2 {
-                    return Err(VmError::RuntimeError(
-                        "object.remove expects exactly 2 arguments".to_string(),
-                    ));
-                }
-                let key = match &args[1] {
-                    Value::Str(s) => s.clone(),
-                    other => {
-                        return Err(VmError::RuntimeError(format!(
-                            "object.remove key must be string, got {:?}",
-                            other
-                        )))
-                    }
-                };
-                match self.heap.get_mut(&r) {
-                    Ok(HeapObject::Object { props, is_const }) => {
-                        if *is_const {
-                            return Err(VmError::RuntimeError(
-                                "Cannot modify const object".to_string(),
-                            ));
-                        }
-                        let before = props.len();
-                        props.retain(|(k, _)| k != &key);
-                        if props.len() == before {
-                            // Spec silent on remove-missing-key (§39 only shows
-                            // successful remove). Analogous to §38 access → ERROR.
-                            // Recorded: ISSUES.md §60a.
-                            return Err(VmError::RuntimeError(format!(
-                                "Key '{}' not found",
-                                key
-                            )));
-                        }
-                    }
-                    _ => {
-                        return Err(VmError::RuntimeError(
-                            "object.remove expects an object".to_string(),
-                        ))
-                    }
-                }
-                Ok(Value::Null)
-            }
+            "object.remove" => self.native_object_remove(args),
             // ---- color.* (StandardLibrary §45) ----
             // ANSI codes written directly; no Chalk/Node dependency (§45).
             // Specific resets (39/22) so bold(color.red(...)) nests correctly.
@@ -2904,6 +2961,130 @@ impl ZeroVM {
                 name
             ))),
         }
+    }
+
+    /// `list.add` / `LIST_ADD` (§144, §34): append to a mutable list. Shared by
+    /// the core opcode and by the native operation so both behave identically.
+    fn native_list_add(&mut self, args: &[Value]) -> Result<Value, VmError> {
+        let r = expect_list_arg(&args, 0, "list.add")?;
+        if args.len() != 2 {
+            return Err(VmError::RuntimeError(
+                "list.add expects exactly 2 arguments".to_string(),
+            ));
+        }
+        let elem = args[1].heap_object_for_element(&mut self.heap);
+        match self.heap.get_mut(&r) {
+            Ok(HeapObject::List { items, is_const }) => {
+                if *is_const {
+                    return Err(VmError::RuntimeError(
+                        "Cannot modify const list".to_string(),
+                    ));
+                }
+                items.push(elem);
+            }
+            _ => {
+                return Err(VmError::RuntimeError(
+                    "list.add expects a list".to_string(),
+                ))
+            }
+        }
+        Ok(Value::Null)
+    }
+
+    /// `list.remove` / `LIST_REMOVE` (§144, §34): remove a list element by index.
+    fn native_list_remove(&mut self, args: &[Value]) -> Result<Value, VmError> {
+        let r = expect_list_arg(&args, 0, "list.remove")?;
+        if args.len() != 2 {
+            return Err(VmError::RuntimeError(
+                "list.remove expects exactly 2 arguments".to_string(),
+            ));
+        }
+        let idx = match &args[1] {
+            Value::Number(n) => {
+                let i = *n as usize;
+                if *n < 0.0 || *n != i as f64 {
+                    return Err(VmError::RuntimeError(format!(
+                        "List index {} out of bounds",
+                        n
+                    )));
+                }
+                i
+            }
+            other => {
+                return Err(VmError::RuntimeError(format!(
+                    "list.remove index must be number, got {:?}",
+                    other
+                )))
+            }
+        };
+        match self.heap.get_mut(&r) {
+            Ok(HeapObject::List { items, is_const }) => {
+                if *is_const {
+                    return Err(VmError::RuntimeError(
+                        "Cannot modify const list".to_string(),
+                    ));
+                }
+                if idx >= items.len() {
+                    return Err(VmError::RuntimeError(format!(
+                        "List index {} out of bounds (length {})",
+                        idx,
+                        items.len()
+                    )));
+                }
+                items.remove(idx);
+            }
+            _ => {
+                return Err(VmError::RuntimeError(
+                    "list.remove expects a list".to_string(),
+                ))
+            }
+        }
+        Ok(Value::Null)
+    }
+
+    /// `object.remove` / `OBJECT_REMOVE` (§144, §39): remove a property by key.
+    fn native_object_remove(&mut self, args: &[Value]) -> Result<Value, VmError> {
+        let r = expect_object_arg(&args, 0, "object.remove")?;
+        if args.len() != 2 {
+            return Err(VmError::RuntimeError(
+                "object.remove expects exactly 2 arguments".to_string(),
+            ));
+        }
+        let key = match &args[1] {
+            Value::Str(s) => s.clone(),
+            other => {
+                return Err(VmError::RuntimeError(format!(
+                    "object.remove key must be string, got {:?}",
+                    other
+                )))
+            }
+        };
+        match self.heap.get_mut(&r) {
+            Ok(HeapObject::Object { props, is_const }) => {
+                if *is_const {
+                    return Err(VmError::RuntimeError(
+                        "Cannot modify const object".to_string(),
+                    ));
+                }
+                let before = props.len();
+                props.retain(|(k, _)| k != &key);
+                if props.len() == before {
+                    // Spec silent on remove-missing-key (§39 only shows
+                    // successful remove). Analogous to §38 access → ERROR.
+                    // Recorded: ISSUES.md §60a.
+                    return Err(VmError::RuntimeError(format!(
+                        "Key '{}' not found",
+                        key
+                    )));
+                }
+            }
+            _ => {
+                return Err(VmError::RuntimeError(
+                    "object.remove expects an object".to_string(),
+                ))
+            }
+        }
+        Ok(Value::Null)
     }
 
     /// Read a list argument as task ids (§103, §104). Every element must be
@@ -3993,33 +4174,10 @@ impl ZeroVM {
                 ))),
             },
             // Namespace method resolution: print.err, string.*, list.*, object.*
-            // Soft CALL_NATIVE path (Bytecode.md §145): BuiltIn + GetProperty
-            // yields a method BuiltIn that Call dispatches via call_builtin.
+            // Dynamic CALL_NATIVE path (Bytecode.md §145): BuiltIn + GetProperty
+            // yields a method BuiltIn that Call dispatches through call_native.
             Value::BuiltIn(base) => {
-                let known: &[&str] = match base.as_str() {
-                    "print" => &["err"],
-                    "string" => &[
-                        "length",
-                        "contains",
-                        "trim",
-                        "split",
-                        "replace",
-                        "startsWith",
-                        "endsWith",
-                        "lower",
-                        "upper",
-                        "indexOf",
-                    ],
-                    "list" => &["add", "remove", "length"],
-                    "object" => &["remove"],
-                    "color" => &["red", "green", "yellow", "blue", "bold"],
-                    "file" => &["read", "write", "exists", "remove", "mkdir"],
-                    "system" => &["args", "env", "os", "arch"],
-                    "json" => &["parse", "stringify"],
-                    "task" => &["state", "all", "race", "cancel", "wait", "timeout", "sleep"],
-                    "http" => &["get", "post", "put", "patch", "delete"],
-                    _ => &[],
-                };
+                let known = native::native_methods(base);
                 if known.contains(&name) {
                     self.stack
                         .push(Value::BuiltIn(format!("{}.{}", base, name)));
@@ -4424,6 +4582,7 @@ fn raw_eq(a: &Value, b: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::BytecodeHeader;
     use crate::compiler::{compile, Constant, FunctionInfo, Opcode};
     use crate::lexer::Lexer;
     use crate::parser::Parser;
@@ -4443,7 +4602,7 @@ mod tests {
 
     #[test]
     fn test_empty_program() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![],
             instructions: vec![Opcode::Halt],
             functions: vec![],
@@ -4456,7 +4615,7 @@ mod tests {
 
     #[test]
     fn test_validate_empty() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![],
             instructions: vec![],
             functions: vec![],
@@ -4468,7 +4627,7 @@ mod tests {
 
     #[test]
     fn test_validate_invalid_constant_index() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0)],
             instructions: vec![Opcode::LoadConst(5)],
             functions: vec![],
@@ -4480,7 +4639,7 @@ mod tests {
 
     #[test]
     fn test_validate_invalid_jump_target() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![],
             instructions: vec![Opcode::Jump(10)],
             functions: vec![],
@@ -4492,7 +4651,7 @@ mod tests {
 
     #[test]
     fn test_validate_invalid_function_entry() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![],
             instructions: vec![Opcode::Halt],
             functions: vec![FunctionInfo {
@@ -4512,7 +4671,7 @@ mod tests {
 
     #[test]
     fn test_validate_valid() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0)],
             instructions: vec![Opcode::LoadConst(0), Opcode::Pop, Opcode::Halt],
             functions: vec![],
@@ -4524,7 +4683,7 @@ mod tests {
 
     #[test]
     fn test_stack_push_pop() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(42.0)],
             instructions: vec![Opcode::LoadConst(0), Opcode::Halt],
             functions: vec![],
@@ -4538,7 +4697,7 @@ mod tests {
 
     #[test]
     fn test_stack_underflow_pop() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![],
             instructions: vec![Opcode::Pop],
             functions: vec![],
@@ -4551,7 +4710,7 @@ mod tests {
 
     #[test]
     fn test_stack_dup() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0)],
             instructions: vec![Opcode::LoadConst(0), Opcode::Dup, Opcode::Halt],
             functions: vec![],
@@ -4566,7 +4725,7 @@ mod tests {
 
     #[test]
     fn test_stack_swap() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(20.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4585,7 +4744,7 @@ mod tests {
 
     #[test]
     fn test_stack_swap_underflow() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0)],
             instructions: vec![Opcode::LoadConst(0), Opcode::Swap],
             functions: vec![],
@@ -4597,7 +4756,7 @@ mod tests {
 
     #[test]
     fn test_constant_access() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![
                 Constant::Number(10.0),
                 Constant::Str("hello".to_string()),
@@ -4624,7 +4783,7 @@ mod tests {
 
     #[test]
     fn test_invalid_constant_index_runtime() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0)],
             instructions: vec![Opcode::LoadConst(5)],
             functions: vec![],
@@ -4636,7 +4795,7 @@ mod tests {
 
     #[test]
     fn test_add_numbers() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(20.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4654,7 +4813,7 @@ mod tests {
 
     #[test]
     fn test_subtract_numbers() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(3.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4672,7 +4831,7 @@ mod tests {
 
     #[test]
     fn test_multiply_numbers() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(3.0), Constant::Number(4.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4690,7 +4849,7 @@ mod tests {
 
     #[test]
     fn test_divide_numbers() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(2.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4708,7 +4867,7 @@ mod tests {
 
     #[test]
     fn test_divide_by_zero() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(0.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4725,7 +4884,7 @@ mod tests {
 
     #[test]
     fn test_modulo_numbers() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(3.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4743,7 +4902,7 @@ mod tests {
 
     #[test]
     fn test_modulo_by_zero() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(0.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4760,7 +4919,7 @@ mod tests {
 
     #[test]
     fn test_power_numbers() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(2.0), Constant::Number(3.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4778,7 +4937,7 @@ mod tests {
 
     #[test]
     fn test_negate() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0)],
             instructions: vec![Opcode::LoadConst(0), Opcode::Neg, Opcode::Halt],
             functions: vec![],
@@ -4791,7 +4950,7 @@ mod tests {
 
     #[test]
     fn test_positive() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0)],
             instructions: vec![Opcode::LoadConst(0), Opcode::Pos, Opcode::Halt],
             functions: vec![],
@@ -4804,7 +4963,7 @@ mod tests {
 
     #[test]
     fn test_not() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Boolean(true)],
             instructions: vec![Opcode::LoadConst(0), Opcode::Not, Opcode::Halt],
             functions: vec![],
@@ -4817,7 +4976,7 @@ mod tests {
 
     #[test]
     fn test_not_on_non_boolean() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0)],
             instructions: vec![Opcode::LoadConst(0), Opcode::Not],
             functions: vec![],
@@ -4829,7 +4988,7 @@ mod tests {
 
     #[test]
     fn test_equality_equal() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(10.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4847,7 +5006,7 @@ mod tests {
 
     #[test]
     fn test_equality_not_equal() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(20.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4865,7 +5024,7 @@ mod tests {
 
     #[test]
     fn test_neq() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(20.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4883,7 +5042,7 @@ mod tests {
 
     #[test]
     fn test_strict_eq_same_type() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(10.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4901,7 +5060,7 @@ mod tests {
 
     #[test]
     fn test_strict_eq_different_type() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Str("10".to_string())],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4919,7 +5078,7 @@ mod tests {
 
     #[test]
     fn test_eq_different_type() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Str("10".to_string())],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4937,7 +5096,7 @@ mod tests {
 
     #[test]
     fn test_gt() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(5.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4955,7 +5114,7 @@ mod tests {
 
     #[test]
     fn test_lt() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(5.0), Constant::Number(10.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4973,7 +5132,7 @@ mod tests {
 
     #[test]
     fn test_gte() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(10.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -4991,7 +5150,7 @@ mod tests {
 
     #[test]
     fn test_lte() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(5.0), Constant::Number(10.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -5009,7 +5168,7 @@ mod tests {
 
     #[test]
     fn test_and() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Boolean(true), Constant::Boolean(false)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -5027,7 +5186,7 @@ mod tests {
 
     #[test]
     fn test_or() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Boolean(true), Constant::Boolean(false)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -5045,7 +5204,7 @@ mod tests {
 
     #[test]
     fn test_and_non_boolean() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Boolean(true)],
             instructions: vec![Opcode::LoadConst(0), Opcode::LoadConst(1), Opcode::And],
             functions: vec![],
@@ -5057,7 +5216,7 @@ mod tests {
 
     #[test]
     fn test_jump() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Number(20.0)],
             instructions: vec![
                 Opcode::Jump(2),
@@ -5075,7 +5234,7 @@ mod tests {
 
     #[test]
     fn test_jump_if_false() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![
                 Constant::Boolean(false),
                 Constant::Number(10.0),
@@ -5099,7 +5258,7 @@ mod tests {
 
     #[test]
     fn test_jump_if_true() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![
                 Constant::Boolean(true),
                 Constant::Number(10.0),
@@ -5123,7 +5282,7 @@ mod tests {
 
     #[test]
     fn test_jump_invalid_target() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![],
             instructions: vec![Opcode::Jump(10)],
             functions: vec![],
@@ -5135,7 +5294,7 @@ mod tests {
 
     #[test]
     fn test_jump_if_false_non_boolean() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0)],
             instructions: vec![Opcode::LoadConst(0), Opcode::JumpIfFalse(0)],
             functions: vec![],
@@ -5147,7 +5306,7 @@ mod tests {
 
     #[test]
     fn test_variable_store_load() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(42.0)],
             instructions: vec![
                 Opcode::DeclareLocal("A".to_string(), false),
@@ -5166,7 +5325,7 @@ mod tests {
 
     #[test]
     fn test_variable_undefined() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![],
             instructions: vec![Opcode::LoadLocal("X".to_string())],
             functions: vec![],
@@ -5178,7 +5337,7 @@ mod tests {
 
     #[test]
     fn test_print() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(42.0)],
             instructions: vec![Opcode::LoadConst(0), Opcode::Print, Opcode::Halt],
             functions: vec![],
@@ -5191,7 +5350,7 @@ mod tests {
 
     #[test]
     fn test_print_string() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Str("hello".to_string())],
             instructions: vec![Opcode::LoadConst(0), Opcode::Print, Opcode::Halt],
             functions: vec![],
@@ -5204,7 +5363,7 @@ mod tests {
 
     #[test]
     fn test_halt() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![
                 Constant::Number(10.0),
                 Constant::Number(20.0),
@@ -5226,7 +5385,7 @@ mod tests {
 
     #[test]
     fn test_make_list() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![
                 Constant::Number(10.0),
                 Constant::Number(20.0),
@@ -5270,7 +5429,7 @@ mod tests {
 
     #[test]
     fn test_make_empty_list() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![],
             instructions: vec![Opcode::MakeList(0), Opcode::Halt],
             functions: vec![],
@@ -5289,7 +5448,7 @@ mod tests {
 
     #[test]
     fn test_make_object() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![
                 Constant::Str("Kael".to_string()),
                 Constant::Number(18.0),
@@ -5328,7 +5487,7 @@ mod tests {
 
     #[test]
     fn test_get_index_list() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![
                 Constant::Number(10.0),
                 Constant::Number(20.0),
@@ -5352,7 +5511,7 @@ mod tests {
 
     #[test]
     fn test_get_index_out_of_bounds() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![
                 Constant::Number(10.0),
                 Constant::Number(5.0),
@@ -5372,7 +5531,7 @@ mod tests {
 
     #[test]
     fn test_get_property() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Str("Kael".to_string())],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -5390,7 +5549,7 @@ mod tests {
 
     #[test]
     fn test_get_property_not_found() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Str("Kael".to_string())],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -5406,7 +5565,7 @@ mod tests {
 
     #[test]
     fn test_add_strings() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![
                 Constant::Str("Hello ".to_string()),
                 Constant::Str("World".to_string()),
@@ -5427,7 +5586,7 @@ mod tests {
 
     #[test]
     fn test_add_null_with_number() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Null, Constant::Number(10.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -5445,7 +5604,7 @@ mod tests {
 
     #[test]
     fn test_add_number_with_null() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0), Constant::Null],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -5463,7 +5622,7 @@ mod tests {
 
     #[test]
     fn test_add_null_null() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Null, Constant::Null],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -5481,7 +5640,7 @@ mod tests {
 
     #[test]
     fn test_negate_null() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Null],
             instructions: vec![Opcode::LoadConst(0), Opcode::Neg, Opcode::Halt],
             functions: vec![],
@@ -5494,7 +5653,7 @@ mod tests {
 
     #[test]
     fn test_pc_out_of_bounds() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![],
             instructions: vec![Opcode::Jump(100)],
             functions: vec![],
@@ -5506,7 +5665,7 @@ mod tests {
 
     #[test]
     fn test_call_non_function() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0)],
             instructions: vec![Opcode::LoadConst(0), Opcode::Call(0)],
             functions: vec![],
@@ -5518,7 +5677,7 @@ mod tests {
 
     #[test]
     fn test_call_wrong_arg_count() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(0.0)],
             instructions: vec![
                 Opcode::LoadConst(0),
@@ -5542,7 +5701,7 @@ mod tests {
 
     #[test]
     fn test_execution_state_running() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(10.0)],
             instructions: vec![Opcode::LoadConst(0)],
             functions: vec![],
@@ -5554,7 +5713,7 @@ mod tests {
 
     #[test]
     fn test_execution_completed() {
-        let bc = BytecodeProgram {
+        let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![],
             instructions: vec![Opcode::Halt],
             functions: vec![],
@@ -5909,7 +6068,7 @@ mod tests {
 
     #[test]
     fn test_runtime_value_round_trip_number() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let rv = Value::Number(42.5).to_runtime_value(&mut vm.heap);
         let back = Value::from_runtime_value(&rv, &vm.heap).unwrap();
         assert_eq!(back, Value::Number(42.5));
@@ -5917,7 +6076,7 @@ mod tests {
 
     #[test]
     fn test_runtime_value_round_trip_boolean() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let rv = Value::Boolean(true).to_runtime_value(&mut vm.heap);
         let back = Value::from_runtime_value(&rv, &vm.heap).unwrap();
         assert_eq!(back, Value::Boolean(true));
@@ -5925,7 +6084,7 @@ mod tests {
 
     #[test]
     fn test_runtime_value_round_trip_null() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let rv = Value::Null.to_runtime_value(&mut vm.heap);
         let back = Value::from_runtime_value(&rv, &vm.heap).unwrap();
         assert_eq!(back, Value::Null);
@@ -5933,7 +6092,7 @@ mod tests {
 
     #[test]
     fn test_runtime_value_round_trip_string() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let rv = Value::Str("hello heap".to_string()).to_runtime_value(&mut vm.heap);
         let back = Value::from_runtime_value(&rv, &vm.heap).unwrap();
         assert_eq!(back, Value::Str("hello heap".to_string()));
@@ -5941,7 +6100,7 @@ mod tests {
 
     #[test]
     fn test_runtime_value_round_trip_list() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         // Build a heap list
         let n = vm.heap.allocate(HeapObject::Number(1.0));
         let s = vm.heap.allocate(HeapObject::Str("two".to_string()));
@@ -5961,7 +6120,7 @@ mod tests {
 
     #[test]
     fn test_runtime_value_round_trip_object() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let x = vm.heap.allocate(HeapObject::Number(10.0));
         let y = vm.heap.allocate(HeapObject::Str("hello".to_string()));
         let obj_ref = vm.heap.allocate(HeapObject::object(vec![
@@ -6121,7 +6280,7 @@ mod tests {
 
     #[test]
     fn test_gc_manual_collect() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let r1 = vm.heap.allocate(HeapObject::Str("keep".to_string()));
         let r2 = vm.heap.allocate(HeapObject::Str("drop".to_string()));
         vm.add_live_ref(r1.clone());
@@ -6134,7 +6293,7 @@ mod tests {
 
     #[test]
     fn test_gc_collect_reachable_list_elements() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let elem = vm.heap.allocate(HeapObject::Str("elem".to_string()));
         let list = vm.heap.allocate(HeapObject::list(vec![elem.clone()]));
         let orphan = vm.heap.allocate(HeapObject::Str("orphan".to_string()));
@@ -6149,7 +6308,7 @@ mod tests {
 
     #[test]
     fn test_gc_collect_reachable_object_values() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let val = vm.heap.allocate(HeapObject::Str("val".to_string()));
         let obj = vm.heap.allocate(HeapObject::object(vec![("key".to_string(), val.clone())]));
         let orphan = vm.heap.allocate(HeapObject::Str("orphan".to_string()));
@@ -6164,7 +6323,7 @@ mod tests {
 
     #[test]
     fn test_gc_collect_unreachable_cycle() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let a = vm.heap.allocate(HeapObject::Str("a".to_string()));
         let b = vm.heap.allocate(HeapObject::Str("b".to_string()));
 
@@ -6179,7 +6338,7 @@ mod tests {
 
     #[test]
     fn test_gc_reachable_cycle_survives() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let a = vm.heap.allocate(HeapObject::Str("a".to_string()));
         let b = vm.heap.allocate(HeapObject::Str("b".to_string()));
 
@@ -6195,7 +6354,7 @@ mod tests {
 
     #[test]
     fn test_gc_stale_refs_cleaned_after_collect() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let r1 = vm.heap.allocate(HeapObject::Str("temp".to_string()));
         vm.add_live_ref(r1.clone());
 
@@ -6206,7 +6365,7 @@ mod tests {
 
     #[test]
     fn test_gc_trigger_on_threshold() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         vm.gc = Gc::new(3);
 
         let r1 = vm.heap.allocate(HeapObject::Str("a".to_string()));
@@ -6233,7 +6392,7 @@ mod tests {
 
     #[test]
     fn test_gc_diamond_graph_via_vm() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let shared = vm.heap.allocate(HeapObject::Str("shared".to_string()));
         let left = vm.heap.allocate(HeapObject::list(vec![shared.clone()]));
         let right = vm.heap.allocate(HeapObject::list(vec![shared.clone()]));
@@ -6252,7 +6411,7 @@ mod tests {
 
     #[test]
     fn test_gc_multiple_live_refs() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let r1 = vm.heap.allocate(HeapObject::Str("a".to_string()));
         let r2 = vm.heap.allocate(HeapObject::Str("b".to_string()));
         let orphan = vm.heap.allocate(HeapObject::Str("orphan".to_string()));
@@ -6268,7 +6427,7 @@ mod tests {
 
     #[test]
     fn test_gc_stats_tracking() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         let _r1 = vm.heap.allocate(HeapObject::Str("a".to_string()));
         let _r2 = vm.heap.allocate(HeapObject::Str("b".to_string()));
 
@@ -6312,7 +6471,7 @@ mod tests {
 
     #[test]
     fn test_gc_automatic_trigger_during_execution() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         vm.gc = Gc::new(5);
 
         for i in 0..20 {
@@ -6335,7 +6494,7 @@ mod tests {
 
     #[test]
     fn test_gc_reachable_objects_survive() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let r1 = vm.heap.allocate(HeapObject::Str("keep1".to_string()));
@@ -6350,7 +6509,7 @@ mod tests {
 
     #[test]
     fn test_gc_unreachable_objects_collected() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let _r1 = vm.heap.allocate(HeapObject::Str("orphan1".to_string()));
@@ -6363,7 +6522,7 @@ mod tests {
 
     #[test]
     fn test_gc_unreachable_cycle_collected() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let a = vm.heap.allocate(HeapObject::Str("a".to_string()));
@@ -6379,7 +6538,7 @@ mod tests {
 
     #[test]
     fn test_gc_reachable_cycle_survives_auto() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let a = vm.heap.allocate(HeapObject::Str("a".to_string()));
@@ -6396,7 +6555,7 @@ mod tests {
 
     #[test]
     fn test_gc_multiple_roots_safe() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let r1 = vm.heap.allocate(HeapObject::Str("root1".to_string()));
@@ -6425,7 +6584,7 @@ mod tests {
 
     #[test]
     fn test_gc_invalid_ref_after_collect() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let r1 = vm.heap.allocate(HeapObject::Str("temp".to_string()));
@@ -6437,7 +6596,7 @@ mod tests {
 
     #[test]
     fn test_gc_manual_debug_available() {
-        let mut vm = ZeroVM::new(BytecodeProgram { constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let _r1 = vm.heap.allocate(HeapObject::Str("a".to_string()));
@@ -9229,5 +9388,425 @@ main()"#
         let output = run_source(&src).unwrap();
         assert_eq!(output, vec!["caught"]);
         assert!(recs.lock().unwrap().is_empty());
+    }
+
+    // ---- Job 019: validation pass before execution, CALL_NATIVE, LOAD_FUNCTION ----
+
+    fn hand_built(constants: Vec<Constant>, instructions: Vec<Opcode>) -> BytecodeProgram {
+        BytecodeProgram {
+            header: BytecodeHeader::current(),
+            entry_point: 0,
+            constants,
+            instructions,
+            functions: vec![],
+            function_bodies: vec![],
+        }
+    }
+
+    fn one_function_body(
+        constants: Vec<Constant>,
+        instructions: Vec<Opcode>,
+        body: Vec<Opcode>,
+        entry_point: usize,
+    ) -> BytecodeProgram {
+        BytecodeProgram {
+            header: BytecodeHeader::current(),
+            entry_point: 0,
+            constants,
+            instructions,
+            functions: vec![FunctionInfo {
+                name: "f".to_string(),
+                params: vec![],
+                param_defaults: vec![],
+                entry_point,
+                local_count: 0,
+                captured_vars: vec![],
+                is_async: false,
+            }],
+            function_bodies: vec![body],
+        }
+    }
+
+    #[test]
+    fn test_job019_header_written_by_compiler() {
+        let bc = compile_source("print(\"ran\")");
+        let vm = ZeroVM::new(bc);
+        assert!(vm.validate().is_ok());
+    }
+
+    #[test]
+    fn test_job019_unsupported_version_rejected_before_execution() {
+        let mut bc = compile_source("print(\"ran\")");
+        bc.header.version = 99;
+        let mut vm = ZeroVM::new(bc);
+        assert_eq!(
+            vm.run().unwrap_err(),
+            VmError::UnsupportedBytecodeVersion(99)
+        );
+        assert!(vm.get_output().is_empty());
+    }
+
+    #[test]
+    fn test_job019_bad_magic_rejected_before_execution() {
+        let mut bc = compile_source("print(\"ran\")");
+        bc.header.magic = "NOPE".to_string();
+        let mut vm = ZeroVM::new(bc);
+        match vm.run() {
+            Err(VmError::InvalidHeader(message)) => {
+                assert!(message.contains("magic"), "{}", message)
+            }
+            other => panic!("expected InvalidHeader, got {:?}", other),
+        }
+        assert!(vm.get_output().is_empty());
+    }
+
+    #[test]
+    fn test_job019_unsupported_version_constant_is_not_a_supported_version() {
+        // §125: exactly one accepted format version at a time.
+        assert!(crate::compiler::SUPPORTED_BYTECODE_VERSIONS.contains(&1));
+        assert!(!crate::compiler::SUPPORTED_BYTECODE_VERSIONS.contains(&2));
+    }
+
+    #[test]
+    fn test_job019_unknown_opcode_rejected_before_execution() {
+        let bc = hand_built(vec![], vec![Opcode::Unknown(255), Opcode::Halt]);
+        let mut vm = ZeroVM::new(bc);
+        assert!(matches!(vm.run().unwrap_err(), VmError::InvalidOpcode(_)));
+        assert!(vm.get_output().is_empty());
+        assert!(vm.validate().is_err());
+    }
+
+    #[test]
+    fn test_job019_invalid_jump_in_function_body_rejected_before_execution() {
+        // Main stream is valid (Halt first, so execution would stop
+        // immediately); only the function body is malformed.
+        let bc = one_function_body(
+            vec![Constant::Null],
+            vec![Opcode::Halt, Opcode::LoadConst(0), Opcode::Jump(1)],
+            vec![Opcode::LoadConst(0), Opcode::Jump(99)],
+            1,
+        );
+        let mut vm = ZeroVM::new(bc);
+        assert_eq!(
+            vm.run().unwrap_err(),
+            VmError::InvalidJumpTarget(99)
+        );
+        assert!(vm.get_output().is_empty());
+    }
+
+    #[test]
+    fn test_job019_invalid_constant_in_function_body_rejected_before_execution() {
+        let bc = one_function_body(
+            vec![Constant::Null],
+            vec![Opcode::Halt, Opcode::LoadConst(0)],
+            vec![Opcode::LoadConst(9)],
+            1,
+        );
+        let mut vm = ZeroVM::new(bc);
+        assert_eq!(
+            vm.run().unwrap_err(),
+            VmError::InvalidConstantIndex(9)
+        );
+        assert!(vm.get_output().is_empty());
+    }
+
+    #[test]
+    fn test_job019_entry_point_out_of_range_rejected() {
+        let bc = BytecodeProgram {
+            header: BytecodeHeader::current(),
+            entry_point: 5,
+            constants: vec![],
+            instructions: vec![Opcode::Halt],
+            functions: vec![],
+            function_bodies: vec![],
+        };
+        let mut vm = ZeroVM::new(bc);
+        assert!(matches!(vm.run().unwrap_err(), VmError::InvalidBytecode(_)));
+        assert!(vm.get_output().is_empty());
+    }
+
+    #[test]
+    fn test_job019_function_body_count_mismatch_rejected() {
+        let mut bc = hand_built(
+            vec![Constant::Null],
+            vec![Opcode::Halt, Opcode::LoadConst(0)],
+        );
+        bc.functions = vec![FunctionInfo {
+            name: "f".to_string(),
+            params: vec![],
+            param_defaults: vec![],
+            entry_point: 1,
+            local_count: 0,
+            captured_vars: vec![],
+            is_async: false,
+        }];
+        let mut vm = ZeroVM::new(bc);
+        assert!(matches!(vm.run().unwrap_err(), VmError::InvalidBytecode(_)));
+        assert!(vm.get_output().is_empty());
+    }
+
+    #[test]
+    fn test_job019_param_default_out_of_range_rejected() {
+        let mut bc = hand_built(vec![], vec![Opcode::Halt]);
+        bc.functions = vec![FunctionInfo {
+            name: "f".to_string(),
+            params: vec!["a".to_string()],
+            param_defaults: vec![Some(9)],
+            entry_point: 0,
+            local_count: 0,
+            captured_vars: vec![],
+            is_async: false,
+        }];
+        bc.function_bodies = vec![vec![Opcode::Halt]];
+        let mut vm = ZeroVM::new(bc);
+        assert_eq!(vm.run().unwrap_err(), VmError::InvalidConstantIndex(9));
+    }
+
+    #[test]
+    fn test_job019_param_default_count_mismatch_rejected() {
+        let mut bc = hand_built(vec![], vec![Opcode::Halt]);
+        bc.functions = vec![FunctionInfo {
+            name: "f".to_string(),
+            params: vec!["a".to_string(), "b".to_string()],
+            param_defaults: vec![None],
+            entry_point: 0,
+            local_count: 0,
+            captured_vars: vec![],
+            is_async: false,
+        }];
+        bc.function_bodies = vec![vec![Opcode::Halt]];
+        let mut vm = ZeroVM::new(bc);
+        assert!(matches!(vm.run().unwrap_err(), VmError::InvalidOperand(_)));
+    }
+
+    #[test]
+    fn test_job019_empty_variable_operand_rejected() {
+        let bc = hand_built(vec![], vec![Opcode::LoadLocal("".to_string()), Opcode::Halt]);
+        let mut vm = ZeroVM::new(bc);
+        assert!(matches!(vm.run().unwrap_err(), VmError::InvalidOperand(_)));
+        assert!(vm.get_output().is_empty());
+    }
+
+    #[test]
+    fn test_job019_empty_native_operation_rejected() {
+        let bc = hand_built(vec![], vec![Opcode::CallNative("".to_string(), 0), Opcode::Halt]);
+        let mut vm = ZeroVM::new(bc);
+        assert!(matches!(vm.run().unwrap_err(), VmError::InvalidOperand(_)));
+        assert!(vm.get_output().is_empty());
+    }
+
+    #[test]
+    fn test_job019_empty_object_key_rejected() {
+        let bc = hand_built(vec![], vec![Opcode::MakeObject(vec!["".to_string()]), Opcode::Halt]);
+        let mut vm = ZeroVM::new(bc);
+        assert!(matches!(vm.run().unwrap_err(), VmError::InvalidOperand(_)));
+    }
+
+    #[test]
+    fn test_job019_make_closure_target_out_of_range_rejected() {
+        let bc = hand_built(
+            vec![],
+            vec![Opcode::MakeClosure(7, vec![]), Opcode::Halt],
+        );
+        let mut vm = ZeroVM::new(bc);
+        assert!(matches!(vm.run().unwrap_err(), VmError::InvalidOperand(_)));
+        assert!(vm.get_output().is_empty());
+    }
+
+    #[test]
+    fn test_job019_call_native_executes_builtin() {
+        let bc = hand_built(
+            vec![Constant::Str("hi".to_string())],
+            vec![
+                Opcode::LoadConst(0),
+                Opcode::CallNative("print".to_string(), 1),
+                Opcode::Halt,
+            ],
+        );
+        let mut vm = ZeroVM::new(bc);
+        vm.run().unwrap();
+        assert_eq!(vm.get_output(), &["hi"]);
+    }
+
+    #[test]
+    fn test_job019_unknown_native_operation_is_runtime_error() {
+        let bc = hand_built(
+            vec![],
+            vec![
+                Opcode::CallNative("nope".to_string(), 0),
+                Opcode::Halt,
+            ],
+        );
+        let mut vm = ZeroVM::new(bc);
+        match vm.run() {
+            Err(VmError::RuntimeError(message)) => {
+                assert!(message.contains("Unknown built-in 'nope'"), "{}", message)
+            }
+            other => panic!("expected RuntimeError, got {:?}", other),
+        }
+        assert!(vm.get_output().is_empty());
+    }
+
+    #[test]
+    fn test_job019_native_call_arity_error_is_runtime_error() {
+        let bc = hand_built(
+            vec![Constant::Null],
+            vec![
+                Opcode::LoadConst(0),
+                Opcode::LoadConst(0),
+                Opcode::CallNative("type".to_string(), 2),
+                Opcode::Halt,
+            ],
+        );
+        let mut vm = ZeroVM::new(bc);
+        assert!(matches!(vm.run().unwrap_err(), VmError::RuntimeError(_)));
+    }
+
+    #[test]
+    fn test_job019_dynamic_builtin_reference_still_works() {
+        let output = run_source(
+            "let f = string.upper\nprint(f(\"ab\"))\nprint(type(list.length))",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["AB", "function"]);
+    }
+
+    #[test]
+    fn test_job019_unknown_method_error_message_unchanged() {
+        let err = run_source("print(string.bogus(\"x\"))").unwrap_err();
+        assert!(
+            err.to_string().contains("Property 'bogus' not found"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_job019_shadowed_builtin_parameter_is_used_as_local() {
+        let err = run_source("function f(print) { print(7) }\nf(5)").unwrap_err();
+        assert!(err.to_string().contains("Cannot call"), "{}", err);
+    }
+
+    #[test]
+    fn test_job019_load_function_executes() {
+        let output =
+            run_source("function f() { return 42 }\nlet g = f\nprint(g())").unwrap();
+        assert_eq!(output, vec!["42"]);
+    }
+
+    #[test]
+    fn test_job019_load_function_recursive_still_works() {
+        let output = run_source(
+            "function fact(n) { if n <= 1 { return 1 } return n * fact(n - 1) }\nprint(fact(5))",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["120"]);
+    }
+
+    /// One representative call per native category after the CALL_NATIVE
+    /// refactor: conversions, type, print/print.err, string, list, object,
+    /// color, json, file, system, task.
+    /// One representative call per native category after the CALL_NATIVE
+    /// refactor: conversions, type, print, string, list, object, color,
+    /// json, system, task.
+    #[test]
+    fn test_job019_representative_builtins_after_native_refactor() {
+        let output = run_source(
+            "print(type(1))\n\
+             print(number(\"7\") + 1)\n\
+             print(string(9))\n\
+             print(boolean(true))\n\
+             print(string.upper(\"ab\"))\n\
+             print(string.split(\"a,b\", \",\")[1])\n\
+             let A = [1]\n\
+             list.add(A, 2)\n\
+             print(list.length(A))\n\
+             let O = { k: 1, j: 2 }\n\
+             object.remove(O, \"k\")\n\
+             print(O)\n\
+             print(type(color.red(\"r\")))\n\
+             print(json.stringify([1]))\n\
+             print(type(system.os()))\n\
+             async function f() { return 1 }\n\
+             let t = f()\n\
+             print(type(task.state(t)))\n\
+             try { string.bogus(\"x\") } catch e { print(\"caught\") }",
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            vec![
+                "number",
+                "8",
+                "9",
+                "true",
+                "AB",
+                "b",
+                "2",
+                "{j: 2}",
+                "string",
+                "[1]",
+                "string",
+                "string",
+                "caught",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_job019_collection_instructions_execute() {
+        let output = run_source(
+            "let A = [1, 2]\nlist.remove(A, 0)\nprint(A[0])\n\
+             let O = { k: 1, j: 2 }\nobject.remove(O, \"k\")\nprint(O)",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["2", "{j: 2}"]);
+    }
+
+    #[test]
+    fn test_job019_module_programs_get_header_and_validate() {
+        fn parse_program(source: &str) -> crate::ast::Program {
+            let mut lexer = Lexer::new(source);
+            let tokens = lexer.tokenize().unwrap();
+            let mut parser = Parser::new(tokens);
+            parser.parse().unwrap()
+        }
+
+        let a = crate::compiler::compile_module("./a.zs", &parse_program("print(\"a\")")).unwrap();
+        let a_len = a.instructions.len();
+        let b = crate::compiler::compile_module(
+            "./b.zs",
+            &parse_program("export function f() { return 1 }"),
+        )
+        .unwrap();
+        let b_len = b.instructions.len();
+
+        let merged = crate::compiler::merge_modules(&[a, b]);
+        assert_eq!(merged.header.magic, crate::compiler::BYTECODE_MAGIC);
+        assert_eq!(merged.entry_point, 0);
+        assert_eq!(merged.functions.len(), merged.function_bodies.len());
+
+        let modules = vec![
+            crate::module::ModuleMeta {
+                path: "./a.zs".to_string(),
+                start: 0,
+                end: a_len,
+                exports: vec![],
+                imports: vec![],
+                re_exports: vec![],
+            },
+            crate::module::ModuleMeta {
+                path: "./b.zs".to_string(),
+                start: a_len,
+                end: a_len + b_len,
+                exports: vec!["f".to_string()],
+                imports: vec![],
+                re_exports: vec![],
+            },
+        ];
+
+        let mut vm = ZeroVM::new(merged);
+        vm.run_modules(&modules).unwrap();
+        assert_eq!(vm.get_output(), &["a"]);
     }
 }

@@ -8,6 +8,7 @@ pub mod heap;
 pub mod json;
 pub mod lexer;
 pub mod module;
+pub mod native;
 pub mod package;
 pub mod parser;
 pub mod runtime_value;
