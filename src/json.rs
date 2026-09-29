@@ -73,6 +73,78 @@ pub fn stringify(value: &JsonValue) -> Result<String, String> {
     Ok(out)
 }
 
+/// Pretty-print a value as ZSON: 4-space indentation, bare identifier keys
+/// where the ZSON grammar allows them (§82, §84, §96), scalars in the same
+/// canonical form `stringify` uses, and a trailing newline so the result is
+/// a well-formed text file. Comments and original layout are not preserved.
+pub fn render_zson(value: &JsonValue) -> Result<String, String> {
+    let mut out = String::new();
+    write_pretty(value, 0, &mut out)?;
+    out.push('\n');
+    Ok(out)
+}
+
+/// A key may be written bare exactly when the ZSON lexer accepts it as an
+/// identifier: first character alphabetic or `_`, the rest alphanumeric or
+/// `_`. Anything else is quoted.
+fn bare_key_ok(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn write_pretty(v: &JsonValue, indent: usize, out: &mut String) -> Result<(), String> {
+    let pad = " ".repeat(indent * 4);
+    let inner = " ".repeat((indent + 1) * 4);
+    match v {
+        JsonValue::Object(entries) => {
+            if entries.is_empty() {
+                out.push_str("{}");
+                return Ok(());
+            }
+            out.push_str("{\n");
+            for (i, (k, val)) in entries.iter().enumerate() {
+                out.push_str(&inner);
+                if bare_key_ok(k) {
+                    out.push_str(k);
+                } else {
+                    write_string(k, out);
+                }
+                out.push_str(": ");
+                write_pretty(val, indent + 1, out)?;
+                if i + 1 < entries.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&pad);
+            out.push('}');
+        }
+        JsonValue::Array(items) => {
+            if items.is_empty() {
+                out.push_str("[]");
+                return Ok(());
+            }
+            out.push_str("[\n");
+            for (i, item) in items.iter().enumerate() {
+                out.push_str(&inner);
+                write_pretty(item, indent + 1, out)?;
+                if i + 1 < items.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&pad);
+            out.push(']');
+        }
+        scalar => write_value(scalar, out)?,
+    }
+    Ok(())
+}
+
 fn write_value(v: &JsonValue, out: &mut String) -> Result<(), String> {
     match v {
         JsonValue::Null => out.push_str("null"),

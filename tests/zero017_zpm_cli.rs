@@ -43,6 +43,9 @@ fn with_zsc_on_path(cmd: &mut Command) -> &mut Command {
 fn zpm(cwd: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_zpm"));
     c.current_dir(cwd);
+    // Job 018: install consults the cache (§98) — point it at the test's
+    // own directory so no test reads the shared $HOME cache.
+    c.env("ZPM_CACHE", cwd.join(".zsc_cache"));
     c
 }
 

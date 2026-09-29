@@ -2,6 +2,8 @@ pub mod ast;
 pub mod compiler;
 pub mod error;
 pub mod gc;
+pub mod git;
+pub mod hash;
 pub mod heap;
 pub mod json;
 pub mod lexer;

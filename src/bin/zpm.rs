@@ -1,21 +1,29 @@
-//! `zpm` — ZeroScript Package Manager (§85, §86).
+//! `zpm` — ZeroScript Package Manager (§85, §91–§95).
 //!
-//! Job 017 implements `install` and `run`. `remove`, `update`, git sources
-//! and remote registries are Job 018 (§91-§95).
+//! Commands: `install` (bare, by name, or by `git:` source), `remove`,
+//! `update`, `publish`, `run`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use zeroscript::package::{install, run_script, Project, Registry, MANIFEST_FILE};
+use zeroscript::git::GitSource;
+use zeroscript::package::{
+    add_dependency, install, probe_git, publish, remove_dependency, run_script, update,
+    InstallReport, Project, Registry, Sources, MANIFEST_FILE,
+};
 
 const USAGE: &str = "usage: zpm [--registry <dir>] <command> [args]
 
 commands:
-  install                 resolve dependencies and update .zsc_m/ + project.lock.zson
-  run <script> [args...]  run a script from project.zson (§86)
+  install [pkg|git:<url>[#ref]]  resolve dependencies into .zsc_m/ + project.lock.zson;
+                                 with an argument, declare it first (§100)
+  remove <pkg>                undeclare a direct dependency and prune .zsc_m/ (§91)
+  update                      re-resolve to the newest matching versions (§92)
+  publish                     copy the package into the registry (§94)
+  run <script> [args...]      run a script from project.zson (§86)
 
 options:
-  --registry <dir>        local package source (default: $ZPM_REGISTRY or <project>/registry)
-  -h, --help              show this help";
+  --registry <dir>            local package source, repeatable (default: $ZPM_REGISTRY or <project>/registry)
+  -h, --help                  show this help";
 
 fn fail(msg: &str) -> ! {
     eprintln!("{}", msg);
@@ -40,43 +48,134 @@ fn find_project() -> Project {
     }
 }
 
-fn registry_for(project_root: &Path, flag: Option<String>) -> Registry {
-    if let Some(dir) = flag {
-        return Registry::new(dir);
+/// §95: registries in configuration order — explicit `--registry` flags win
+/// over `$ZPM_REGISTRY`, which wins over the project's `registry/`.
+fn registries_for(project_root: &Path, flags: &[String]) -> Vec<Registry> {
+    if !flags.is_empty() {
+        return flags.iter().map(|d| Registry::new(d.clone())).collect();
     }
     if let Ok(dir) = std::env::var("ZPM_REGISTRY") {
         if !dir.is_empty() {
-            return Registry::new(dir);
+            return vec![Registry::new(dir)];
         }
     }
-    Registry::new(project_root.join("registry"))
+    vec![Registry::new(project_root.join("registry"))]
 }
 
-fn cmd_install(registry_flag: Option<String>, extra: &[String]) -> ! {
-    if let Some(arg) = extra.first() {
-        fail(&format!(
-            "ERROR: unexpected argument '{}' — installing a named package is Job 018",
-            arg
-        ));
+/// Everything `zpm install` / `update` / `remove` reads from (§99): the
+/// configured registries plus the cache (`$ZPM_CACHE` or `$HOME/.zsc_cache`,
+/// §98).
+fn sources_for(project_root: &Path, flags: &[String]) -> Sources {
+    Sources::new().with_registries(registries_for(project_root, flags))
+}
+
+/// The registry a publish targets: `--registry` flags, then `$ZPM_REGISTRY`,
+/// then none — §94 names no default publishing location, so publishing
+/// without one is an error rather than a guess.
+fn publish_registry(flags: &[String]) -> Option<PathBuf> {
+    if let Some(dir) = flags.first() {
+        return Some(PathBuf::from(dir));
+    }
+    match std::env::var("ZPM_REGISTRY") {
+        Ok(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => None,
+    }
+}
+
+fn print_report(report: &InstallReport) {
+    if report.resolved.is_empty() {
+        println!("No dependencies.");
+    }
+    for (name, version) in &report.resolved {
+        let newly = report
+            .installed
+            .iter()
+            .any(|(n, v)| n == name && v == version);
+        if newly {
+            println!("+ {}@{}", name, version);
+        } else {
+            println!("  {}@{} (up to date)", name, version);
+        }
+    }
+}
+
+fn cmd_install(registry_flags: &[String], extra: &[String]) -> ! {
+    let project = find_project();
+    match extra {
+        [] => {}
+        [spec] => {
+            // §100: "Dependency harus dideklarasikan secara eksplisit" —
+            // an argument to `install` declares the dependency first.
+            if spec.starts_with("git:") {
+                let source = match GitSource::parse(spec) {
+                    Ok(s) => s,
+                    Err(e) => fail(&format!("ERROR: {}", e)),
+                };
+                let (name, _) = match probe_git(&source) {
+                    Ok(id) => id,
+                    Err(e) => fail(&e.to_string()),
+                };
+                if let Err(e) = add_dependency(&project.root, &name, spec) {
+                    fail(&e.to_string());
+                }
+            } else if let Err(e) = add_dependency(&project.root, spec, "x") {
+                fail(&e.to_string());
+            }
+        }
+        _ => fail("ERROR: usage: zpm install [package|git:<url>[#ref]]"),
+    }
+    let sources = sources_for(&project.root, registry_flags);
+    match install(&project.root, &sources) {
+        Ok(report) => {
+            print_report(&report);
+            std::process::exit(0);
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+fn cmd_remove(registry_flags: &[String], extra: &[String]) -> ! {
+    let name = match extra {
+        [name] => name.as_str(),
+        _ => fail("ERROR: usage: zpm remove <package>"),
+    };
+    let project = find_project();
+    let sources = sources_for(&project.root, registry_flags);
+    match remove_dependency(&project.root, name, &sources) {
+        Ok(report) => {
+            print_report(&report);
+            std::process::exit(0);
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+fn cmd_update(registry_flags: &[String], extra: &[String]) -> ! {
+    if !extra.is_empty() {
+        fail("ERROR: usage: zpm update");
     }
     let project = find_project();
-    let registry = registry_for(&project.root, registry_flag);
-    match install(&project.root, &registry) {
+    let sources = sources_for(&project.root, registry_flags);
+    match update(&project.root, &sources) {
         Ok(report) => {
-            if report.resolved.is_empty() {
-                println!("No dependencies.");
-            }
-            for (name, version) in &report.resolved {
-                let newly = report
-                    .installed
-                    .iter()
-                    .any(|(n, v)| n == name && v == version);
-                if newly {
-                    println!("+ {}@{}", name, version);
-                } else {
-                    println!("  {}@{} (up to date)", name, version);
-                }
-            }
+            print_report(&report);
+            std::process::exit(0);
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+fn cmd_publish(registry_flags: &[String], extra: &[String]) -> ! {
+    if !extra.is_empty() {
+        fail("ERROR: usage: zpm publish");
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => fail(&format!("ERROR: Cannot determine current directory: {}", e)),
+    };
+    match publish(&cwd, publish_registry(registry_flags).as_deref()) {
+        Ok(dir) => {
+            println!("Published to {}", dir.display());
             std::process::exit(0);
         }
         Err(e) => fail(&e.to_string()),
@@ -104,7 +203,7 @@ fn cmd_run(args: &[String]) -> ! {
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
 
-    let mut registry_flag: Option<String> = None;
+    let mut registry_flags: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -116,7 +215,7 @@ fn main() {
                 let value = argv.get(i + 1).unwrap_or_else(|| {
                     fail("ERROR: --registry requires a directory argument")
                 });
-                registry_flag = Some(value.clone());
+                registry_flags.push(value.clone());
                 i += 2;
             }
             _ => break,
@@ -130,7 +229,10 @@ fn main() {
     };
 
     match command {
-        "install" => cmd_install(registry_flag, &rest[1..]),
+        "install" => cmd_install(&registry_flags, &rest[1..]),
+        "remove" => cmd_remove(&registry_flags, &rest[1..]),
+        "update" => cmd_update(&registry_flags, &rest[1..]),
+        "publish" => cmd_publish(&registry_flags, &rest[1..]),
         "run" => cmd_run(&rest[1..]),
         "--help" | "-h" => {
             println!("{}", USAGE);

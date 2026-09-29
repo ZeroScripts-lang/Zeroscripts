@@ -13,7 +13,11 @@ use crate::ast::Stmt;
 use crate::compiler::{compile_module, merge_modules, BytecodeProgram, ModuleUnit};
 use crate::error::{CompilerError, LexerError, ParserError};
 use crate::lexer::Lexer;
-use crate::package::{Project, PACKAGE_FILE};
+use crate::package::{
+    is_versioned_layout, resolve_installed, scope_id, Project, PACKAGE_FILE, PROJECT_SCOPE,
+    VERSIONS_DIR,
+};
+use crate::version::Version;
 use crate::parser::Parser;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -146,8 +150,15 @@ struct Loader {
     /// Project context for package imports; `None` when no project.zson was
     /// found up the tree from the entry module.
     project: Option<Project>,
-    /// package name → dependency names declared by its package.zson (§89).
-    scope_cache: HashMap<String, Result<Vec<String>, String>>,
+    /// installed package directory → dependency names declared by its
+    /// package.zson (§89); keyed by directory so a §90 versioned owner
+    /// reads its own copy.
+    scope_cache: HashMap<PathBuf, Result<Vec<String>, String>>,
+    /// The §90 scope graph of the installed tree (scope id → dependencies
+    /// with the version placed for them). Resolved lazily and only when a
+    /// multi-version target forces a scope lookup — flat installs (§82/§85)
+    /// never need it.
+    scopes: Option<HashMap<String, Vec<(String, Version)>>>,
     /// gray = currently on DFS stack (cycle detection); black = done.
     gray: Vec<PathBuf>,
     black: HashMap<PathBuf, ()>,
@@ -160,6 +171,7 @@ impl Loader {
         Loader {
             project,
             scope_cache: HashMap::new(),
+            scopes: None,
             gray: Vec::new(),
             black: HashMap::new(),
             order: Vec::new(),
@@ -190,14 +202,28 @@ impl Loader {
         Ok(path)
     }
 
-    /// `.zsc_m/<name>/` when `path` lives inside an installed package.
+    /// The boundary directory of the installed package `path` lives in
+    /// (§81): `.zsc_m/<name>/` for a single-copy install, the §90 version
+    /// directory `.zsc_m/<name>/versions/<v>/` inside a multi-version one.
     fn package_root_of(&self, path: &Path) -> Option<PathBuf> {
         let root = self.project.as_ref()?.deps_dir();
         let rel = path.strip_prefix(&root).ok()?;
-        if rel.components().count() < 2 {
+        let mut comps = rel.components();
+        let name = comps.next()?;
+        let rest: Vec<String> = comps
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if rest.is_empty() {
+            // `.zsc_m/<name>` itself is not inside the package's files.
             return None;
         }
-        Some(root.join(rel.components().next()?))
+        if rest.len() >= 2
+            && rest[0] == VERSIONS_DIR
+            && rest[1].parse::<Version>().is_ok()
+        {
+            return Some(root.join(name).join(VERSIONS_DIR).join(&rest[1]));
+        }
+        Some(root.join(name))
     }
 
     fn package_name_of(&self, path: &Path) -> Option<String> {
@@ -209,22 +235,20 @@ impl Loader {
         Some(rel.components().next()?.as_os_str().to_string_lossy().into_owned())
     }
 
-    /// Dependency names declared by an installed package (§88, §89).
-    fn package_dependencies(&mut self, name: &str) -> Result<Vec<String>, ModuleError> {
-        if let Some(cached) = self.scope_cache.get(name) {
+    /// Dependency names declared by the package installed at `dir` (§88,
+    /// §89), cached per directory so each §90 copy speaks for itself.
+    fn package_dependencies(&mut self, dir: &Path) -> Result<Vec<String>, ModuleError> {
+        if let Some(cached) = self.scope_cache.get(dir) {
             return cached.clone().map_err(ModuleError::Package);
         }
-        let result = match self.project.as_ref() {
-            Some(project) => project
-                .package_dependencies(name)
-                .map_err(|e| e.message()),
-            None => Err(format!("Package '{}' is not installed", name)),
-        };
-        self.scope_cache.insert(name.to_string(), result.clone());
+        let result = crate::package::package_dependencies_at(dir).map_err(|e| e.message());
+        self.scope_cache.insert(dir.to_path_buf(), result.clone());
         result.map_err(ModuleError::Package)
     }
 
-    /// §87: the installed version must be the one project.lock.zson locks.
+    /// §87: the installed version must be one project.lock.zson locks. In
+    /// the §90 layout each name carries one entry per installed version, so
+    /// membership in `entries_for` replaces the single plain-key check.
     /// Installed `package.zson` metadata is validated whenever it exists —
     /// an unreadable copy cannot be checked against the lock (§96).
     fn check_locked(&self, name: &str, dir: &Path) -> Result<(), ModuleError> {
@@ -232,39 +256,103 @@ impl Loader {
             Some(p) => p,
             None => return Ok(()),
         };
-        let locked = project.lock.as_ref().and_then(|l| l.get(name)).cloned();
+        let entries: Vec<String> = project
+            .lock
+            .as_ref()
+            .map(|l| {
+                l.entries_for(name)
+                    .iter()
+                    .map(|e| e.version.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let locked_list = entries.join(", ");
         let meta_path = dir.join(PACKAGE_FILE);
         let text = match std::fs::read_to_string(&meta_path) {
             Ok(t) => t,
             Err(_) => {
-                return match locked {
-                    Some(locked) => Err(ModuleError::Package(
-                        crate::package::PackageError::VersionMismatch {
-                            package: name.to_string(),
-                            installed: format!("unknown ({} missing)", PACKAGE_FILE),
-                            locked: locked.to_string(),
-                        }
-                        .message(),
-                    )),
-                    None => Ok(()),
+                if entries.is_empty() {
+                    return Ok(());
                 }
-            }
-        };
-        let meta = crate::package::parse_package_meta(&text, &meta_path.display().to_string())
-            .map_err(|e| ModuleError::Package(e.message()))?;
-        if let Some(locked) = locked {
-            if meta.version != locked.to_string() {
                 return Err(ModuleError::Package(
                     crate::package::PackageError::VersionMismatch {
                         package: name.to_string(),
-                        installed: meta.version,
-                        locked: locked.to_string(),
+                        installed: format!("unknown ({} missing)", PACKAGE_FILE),
+                        locked: locked_list,
                     }
                     .message(),
                 ));
             }
+        };
+        let meta = crate::package::parse_package_meta(&text, &meta_path.display().to_string())
+            .map_err(|e| ModuleError::Package(e.message()))?;
+        if entries.is_empty() || entries.iter().any(|l| *l == meta.version) {
+            return Ok(());
         }
-        Ok(())
+        Err(ModuleError::Package(
+            crate::package::PackageError::VersionMismatch {
+                package: name.to_string(),
+                installed: meta.version,
+                locked: locked_list,
+            }
+            .message(),
+        ))
+    }
+
+    /// The §90 scope of the module that imports something: the scope id of
+    /// the package directory it lives in, or `PROJECT_SCOPE` for the
+    /// project's own files. Versioned owners take the version from their
+    /// path; a flat owner falls back to its installed (then locked)
+    /// version (§87).
+    fn owner_scope_key(&self, importer: &Path) -> String {
+        let deps_dir = match self.project.as_ref() {
+            Some(p) => p.deps_dir(),
+            None => return PROJECT_SCOPE.to_string(),
+        };
+        let rel = match importer.strip_prefix(&deps_dir) {
+            Ok(r) => r,
+            Err(_) => return PROJECT_SCOPE.to_string(),
+        };
+        let mut comps = rel.components();
+        let name = match comps.next() {
+            Some(n) => n.as_os_str().to_string_lossy().into_owned(),
+            None => return PROJECT_SCOPE.to_string(),
+        };
+        let rest: Vec<String> = comps
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if rest.len() >= 2 && rest[0] == VERSIONS_DIR {
+            if let Ok(v) = rest[1].parse::<Version>() {
+                return scope_id(&name, &v);
+            }
+        }
+        let project = self.project.as_ref();
+        if let Some(v) = project.and_then(|p| p.installed_version(&name).ok().flatten()) {
+            return scope_id(&name, &v);
+        }
+        if let Some(v) = project.and_then(|p| p.lock.as_ref().and_then(|l| l.get(&name))) {
+            return scope_id(&name, v);
+        }
+        PROJECT_SCOPE.to_string()
+    }
+
+    /// The §90 scope graph of the installed tree, computed on first use.
+    fn scopes(&mut self) -> Result<&HashMap<String, Vec<(String, Version)>>, ModuleError> {
+        if self.scopes.is_none() {
+            let project = match self.project.as_ref() {
+                Some(p) => p,
+                None => {
+                    return Err(ModuleError::Package(format!(
+                        "Cannot resolve dependency scopes without {}",
+                        crate::package::MANIFEST_FILE
+                    )))
+                }
+            };
+            let resolution =
+                resolve_installed(project).map_err(|e| ModuleError::Package(e.message()))?;
+            self.scopes = Some(resolution.scopes);
+        }
+        Ok(self.scopes.as_ref().expect("scopes set above"))
     }
 
     /// Bare import → package (§81). `"pkg/sub"` → `.zsc_m/pkg/sub.zs`,
@@ -295,8 +383,9 @@ impl Loader {
         // §89: a module sees only the dependencies declared by its owner —
         // the project's own dependencies, or those of the package it is in.
         let owner = self.package_name_of(importer);
-        let visible: Vec<String> = match &owner {
-            Some(owner_name) => self.package_dependencies(owner_name)?,
+        let owner_root = self.package_root_of(importer);
+        let visible: Vec<String> = match &owner_root {
+            Some(owner_dir) => self.package_dependencies(owner_dir)?,
             None => match self.project.as_ref() {
                 Some(p) => p.direct_dependencies(),
                 None => Vec::new(),
@@ -313,7 +402,30 @@ impl Loader {
             )));
         }
 
-        let dir = deps_dir.join(pkg);
+        // §90: a name installed in several versions lives under
+        // `versions/<v>/` — pick the copy the importer's own scope requires
+        // (§100). A single-copy install needs no scope lookup.
+        let base = deps_dir.join(pkg);
+        let dir = if is_versioned_layout(&deps_dir, pkg) {
+            let key = self.owner_scope_key(importer);
+            let wanted: Option<Version> = {
+                let scopes = self.scopes()?;
+                scopes
+                    .get(&key)
+                    .and_then(|deps| deps.iter().find(|(n, _)| n == pkg).map(|(_, v)| v.clone()))
+            };
+            match wanted {
+                Some(v) => base.join(VERSIONS_DIR).join(v.to_string()),
+                None => {
+                    return Err(ModuleError::Package(format!(
+                        "Package '{}' is not installed — run `zpm install`",
+                        pkg
+                    )))
+                }
+            }
+        } else {
+            base
+        };
         if !dir.is_dir() {
             return Err(ModuleError::Package(format!(
                 "Package '{}' is not installed — run `zpm install`",
