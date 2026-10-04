@@ -2031,8 +2031,22 @@ fn resolve_graph(
     project: &Project,
     pool: &dyn Pool,
     lock: Option<&Lockfile>,
+    pending: Option<(&str, &str)>,
 ) -> Result<Resolution, PackageError> {
-    let seed = seed_reqs(project)?;
+    let mut seed = seed_reqs(project)?;
+    // §67k: a staged (not yet written) declaration participates in resolution
+    // so the manifest only changes after the install fully succeeds.
+    if let Some((name, raw)) = pending {
+        if !seed.iter().any(|(_, n, _)| n == name) {
+            let req = DepReq::parse(raw).map_err(|e| {
+                PackageError::Manifest(format!(
+                    "{}: dependency '{}': {}",
+                    MANIFEST_FILE, name, e
+                ))
+            })?;
+            seed.push((PROJECT_SCOPE.to_string(), name.to_string(), req));
+        }
+    }
     let mut reqs = seed.clone();
     let placed;
     let mut rounds = 0usize;
@@ -2078,14 +2092,14 @@ fn resolve_graph(
 pub fn resolve(root: &Path, sources: &Sources) -> Result<Resolution, PackageError> {
     let project = Project::open(root)?;
     let pool = InstallPool::new(&project, sources);
-    resolve_graph(&project, &pool, project.lock.as_ref())
+    resolve_graph(&project, &pool, project.lock.as_ref(), None)
 }
 
 /// Recover the §90 dependency scopes of what is already installed (§87,
 /// §90) — the module loader's view of a multi-version `.zsc_m/`.
 pub fn resolve_installed(project: &Project) -> Result<Resolution, PackageError> {
     let pool = InstalledPool::new(project);
-    resolve_graph(project, &pool, project.lock.as_ref())
+    resolve_graph(project, &pool, project.lock.as_ref(), None)
 }
 
 
@@ -2235,9 +2249,41 @@ fn lock_identity(
 /// of the tree (§91) → write the lockfile (§84) — the lockfile only after
 /// a completely successful run.
 pub fn install(root: &Path, sources: &Sources) -> Result<InstallReport, PackageError> {
+    install_inner(root, sources, None)
+}
+
+/// Declare `name: requirement` and install it in one operation, without
+/// touching `project.zson` until the whole pipeline (resolve + materialize)
+/// has succeeded (ISSUES.md §67k prepare-then-commit). Any failure leaves
+/// the manifest byte-identical; an already-present declaration behaves like
+/// a plain `install` (§100: existing declarations are not rewritten).
+pub fn install_with_declared(
+    root: &Path,
+    sources: &Sources,
+    name: &str,
+    requirement: &str,
+) -> Result<InstallReport, PackageError> {
+    match stage_dependency(root, name, requirement)? {
+        ManifestStage::Existing(_) => install(root, sources),
+        ManifestStage::Staged(text) => {
+            let report = install_inner(root, sources, Some((name, requirement)))?;
+            // Commit: only after the full install succeeded (§67k).
+            std::fs::write(root.join(MANIFEST_FILE), text).map_err(|e| {
+                PackageError::Io(format!("Cannot write {}: {}", MANIFEST_FILE, e))
+            })?;
+            Ok(report)
+        }
+    }
+}
+
+fn install_inner(
+    root: &Path,
+    sources: &Sources,
+    pending: Option<(&str, &str)>,
+) -> Result<InstallReport, PackageError> {
     let project = Project::open(root)?;
     let pool = InstallPool::new(&project, sources);
-    let resolution = resolve_graph(&project, &pool, project.lock.as_ref())?;
+    let resolution = resolve_graph(&project, &pool, project.lock.as_ref(), pending)?;
     materialize(&project, &pool, &resolution)
 }
 
@@ -2248,7 +2294,7 @@ pub fn install(root: &Path, sources: &Sources) -> Result<InstallReport, PackageE
 pub fn update(root: &Path, sources: &Sources) -> Result<InstallReport, PackageError> {
     let project = Project::open(root)?;
     let pool = InstallPool::for_update(sources);
-    let resolution = resolve_graph(&project, &pool, None)?;
+    let resolution = resolve_graph(&project, &pool, None, None)?;
     materialize(&project, &pool, &resolution)
 }
 
@@ -2495,6 +2541,31 @@ pub fn remove_dependency(
 /// untouched (`false`), one with a different requirement is not silently
 /// replaced.
 pub fn add_dependency(root: &Path, name: &str, requirement: &str) -> Result<bool, PackageError> {
+    match stage_dependency(root, name, requirement)? {
+        ManifestStage::Existing(matches) => Ok(matches),
+        ManifestStage::Staged(text) => {
+            std::fs::write(root.join(MANIFEST_FILE), text)
+                .map_err(|e| PackageError::Io(format!("Cannot write {}: {}", MANIFEST_FILE, e)))?;
+            Ok(true)
+        }
+    }
+}
+
+/// The post-declaration manifest text for `name: requirement`, prepared in
+/// memory without touching disk (ISSUES.md §67k, prepare-then-commit).
+/// `Existing(matches)` means the declaration is already present — §100 leaves
+/// it untouched regardless of whether the requirement matches (`matches` is
+/// `add_dependency`'s bool). `Staged(text)` is the text to write on commit.
+enum ManifestStage {
+    Existing(bool),
+    Staged(String),
+}
+
+fn stage_dependency(
+    root: &Path,
+    name: &str,
+    requirement: &str,
+) -> Result<ManifestStage, PackageError> {
     safe_package_name(name)
         .map_err(|e| PackageError::Manifest(format!("{}: {}", MANIFEST_FILE, e)))?;
     DepReq::parse(requirement).map_err(|e| {
@@ -2507,7 +2578,7 @@ pub fn add_dependency(root: &Path, name: &str, requirement: &str) -> Result<bool
         .iter()
         .find(|(n, _)| n == name)
     {
-        return Ok(existing == requirement);
+        return Ok(ManifestStage::Existing(existing == requirement));
     }
     let path = root.join(MANIFEST_FILE);
     let text = std::fs::read_to_string(&path)
@@ -2544,11 +2615,9 @@ pub fn add_dependency(root: &Path, name: &str, requirement: &str) -> Result<bool
             )))
         }
     }
-    std::fs::write(&path, json::render_zson(&v).map_err(|e| {
+    Ok(ManifestStage::Staged(json::render_zson(&v).map_err(|e| {
         PackageError::Manifest(format!("{}: {}", MANIFEST_FILE, e))
-    })?)
-    .map_err(|e| PackageError::Io(format!("Cannot write {}: {}", MANIFEST_FILE, e)))?;
-    Ok(true)
+    })?))
 }
 
 /// Walk up from `start` to the nearest directory holding a

@@ -37,11 +37,12 @@ pub enum HeapObject {
     Null,
     List {
         items: Vec<HeapRef>,
-        is_const: bool,
     },
     Object {
         props: Vec<(String, HeapRef)>,
-        is_const: bool,
+        /// Internal identity of a caught error object (ISSUES §59a). Not
+        /// observable from ZeroScript: an error object is an ordinary object.
+        is_error: bool,
     },
     Function {
         index: usize,
@@ -62,33 +63,28 @@ pub enum HeapObject {
 
 impl HeapObject {
     pub fn list(items: Vec<HeapRef>) -> Self {
-        HeapObject::List {
-            items,
-            is_const: false,
-        }
+        HeapObject::List { items }
     }
 
     pub fn object(props: Vec<(String, HeapRef)>) -> Self {
         HeapObject::Object {
             props,
-            is_const: false,
+            is_error: false,
         }
     }
 
-    pub fn is_const_collection(&self) -> bool {
-        match self {
-            HeapObject::List { is_const, .. } | HeapObject::Object { is_const, .. } => *is_const,
-            _ => false,
+    /// Object carrying the internal error identity (ISSUES §59a).
+    pub fn error_object(props: Vec<(String, HeapRef)>) -> Self {
+        HeapObject::Object {
+            props,
+            is_error: true,
         }
     }
 
-    pub fn mark_const_collection(&mut self) {
-        match self {
-            HeapObject::List { is_const, .. } | HeapObject::Object { is_const, .. } => {
-                *is_const = true
-            }
-            _ => {}
-        }
+    /// `true` only for heap objects created as a caught error (ISSUES §59a);
+    /// plain objects are never error objects, whatever fields they carry.
+    pub fn is_error_object(&self) -> bool {
+        matches!(self, HeapObject::Object { is_error: true, .. })
     }
 }
 

@@ -107,6 +107,12 @@ res.body
 
 ZeroScript tidak otomatis mengubah JSON response menjadi object.
 
+Redirect:
+
+- Operasi "http.*" mengikuti respons redirect (status "3xx" dengan header "Location") secara otomatis.
+- Redirect dibatasi maksimal 10 kali. Jika jumlah redirect melebihi batas tersebut → ERROR.
+- Batas ini berlaku sama untuk semua method HTTP dan semua operasi "http.*".
+
 50.1 HTTP ADDITIONAL CONCEPT 
 - . HTTP — Request
 API dasar tetap:
@@ -336,5 +342,49 @@ res.headers berupa object dengan:
     "content-length": "1234"
 }
 Header response bersifat read-only terhadap response tersebut. Mengubah res.headers tidak mengubah response atau request yang sudah terjadi
+
+---
+
+157. Console Input
+
+Standard input:
+
+input()
+
+"input()" membaca satu baris dari standard input (stdin) sampai newline dan mengembalikan string tanpa newline di akhir.
+
+let nama = input()
+print(nama)
+
+Prompt
+
+"input()" menerima 0 atau 1 argument. Jika diberikan, argument harus string; string tersebut ditampilkan ke standard output sebelum runtime menunggu baris.
+
+input("Nama: ")
+
+Prompt dicetak persis seperti yang diberikan — tanpa spasi atau newline otomatis.
+
+let nama = input("Nama: ")
+print("Halo, " + nama)
+
+Jika argument lebih dari satu → ERROR. Jika argument yang diberikan bukan string → ERROR.
+
+Aturan:
+
+- Mengembalikan satu baris tanpa newline. CRLF ("\r\n") dinormalisasi menjadi pemotongan pada "\n".
+- Baris kosong (user hanya menekan Enter) menghasilkan "".
+- EOF (end of file — Ctrl+D pada terminal, `zsc app.zs < /dev/null`, atau pipe tanpa isi) menghasilkan null.
+- "input()" bersifat blocking: selama menunggu baris, eksekusi runtime berhenti. Task lain (termasuk timer dan scheduler) tidak dijalankan sampai satu baris tersedia atau EOF tercapai.
+- Kegagalan I/O pada standard input adalah runtime error dan dapat ditangani dengan try/catch (§148).
+- "input()" adalah operasi I/O melalui boundary runtime, bukan akses langsung ke memori VM (§148).
+
+Perbedaan baris kosong dan EOF:
+
+let a = input()   // user menekan Enter → ""
+let b = input()   // stdin habis → null
+
+if (b == null) {
+    print("Tidak ada input")
+}
 
 ---

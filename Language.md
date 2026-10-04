@@ -806,11 +806,12 @@ let A = [10, "Hello", true, null]
 
 "let" list dapat dimodifikasi.
 
-"const" list immutable, termasuk element mutation.
+"const" list: binding-nya immutable, tetapi element mutation tetap diperbolehkan.
 
 const A = [10, 20]
 
-A[0] = 30 // ERROR
+A[0] = 30
+A = [40] // ERROR
 
 Standard library:
 
@@ -839,7 +840,7 @@ tambah(X)
 print(X)
 // [10, 20, 30, 40]
 
-Jika source adalah "const", mutation melalui function juga menghasilkan ERROR.
+"const" hanya membuat binding immutable; mutation melalui function terhadap isi list/object tetap diperbolehkan.
 
 Function yang mengembalikan list/object menghasilkan value yang dapat dimodifikasi jika disimpan ke "let".
 
@@ -934,17 +935,14 @@ user["kota"] = "Bandung"
 
 Key baru dapat ditambahkan.
 
-"const" object immutable, termasuk:
-
-- mengubah value,
-- menambahkan key,
-- menghapus key.
+"const" object: binding-nya immutable, tetapi mengubah value, menambahkan key, dan menghapus key tetap diperbolehkan.
 
 const user = {
     nama: "Kael"
 }
 
-user.nama = "Budi" // ERROR
+user.nama = "Budi"
+user = {} // ERROR
 
 Menghapus key:
 
@@ -1011,7 +1009,20 @@ try {
     print.err(e)
 }
 
-"e" merupakan local variable yang berisi error.
+"e" merupakan local variable berbentuk object yang berisi informasi error.
+
+e.type          // string kategori error
+e.message       // string pesan error
+e.location      // object "{file, line, column}" atau "null"
+
+"e.type" menggunakan kategori error seperti "TypeError", "ReferenceError",
+"RuntimeError", "SyntaxError", "IndexError", "KeyError", "DivisionError",
+"ArgumentError", dan "CancellationError" sesuai jenis kegagalan.
+
+type(e)         // "object"
+string(e)       // "e.message"
+
+print.err(e) menampilkan pesan error sehingga output tetap mudah dibaca.
 
 "finally" selalu dijalankan.
 
@@ -1024,6 +1035,9 @@ try {
 }
 
 Syntax/parse error tidak ditangkap karena terjadi sebelum program dapat dieksekusi.
+
+Kegagalan parse saat runtime, misalnya "json.parse" pada string JSON yang rusak,
+dilaporkan sebagai "SyntaxError" yang dapat ditangkap oleh "catch".
 
 ---
 

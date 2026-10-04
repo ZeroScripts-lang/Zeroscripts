@@ -60,6 +60,8 @@ name wajib berupa string.
 
 version wajib berupa string.
 
+Version project hanya divalidasi sebagai string — format SemVer tidak diwajibkan dan tidak diperiksa untuk "version" pada "project.zson". Pemeriksaan format versi berlaku untuk versi package (section Package Versioning dan metadata package), bukan untuk version project.
+
 dependencies berupa object.
 
 Nama package menjadi key pada dependencies.
@@ -373,6 +375,8 @@ Aturan
 - Script dapat menjalankan "zsc", "zerovm", atau command lain yang tersedia pada environment.
 - "zpm" tidak mengubah isi command yang ditulis programmer.
 - Script dapat menerima argument tambahan.
+- Kode keluar "zpm run" adalah kode keluar dari proses yang menjalankan script.
+- Jika proses tersebut berakhir karena sinyal dan tidak memiliki kode keluar, "zpm" keluar dengan kode -1 (dilaporkan sistem sebagai 255).
 
 Contoh:
 
@@ -1179,6 +1183,14 @@ Aturan Umum
 - Package manager tidak mengubah source code project.
 - Registry dan Git hanya menjadi sumber distribusi; keduanya tidak mengubah aturan module system ZeroScript.
 - Package system tidak menjadi bagian dari syntax bahasa ZeroScript.
+
+Nama Binary dan Kode Keluar
+
+- Compiler dan VM ZeroScript dijalankan melalui binary "zsc".
+- Package manager dijalankan melalui binary "zpm".
+- "zsc" dan "zpm" keluar dengan kode 0 ketika perintah berhasil.
+- "zsc" dan "zpm" keluar dengan kode 1 ketika perintah gagal (file tidak ditemukan, manifest tidak valid, resolusi dependency gagal, runtime error, atau penggunaan perintah yang salah).
+- "zpm run" meneruskan kode keluar script sebagai kode keluar "zpm" (lihat section 86).
 
 Dengan Section 100, core package dan dependency system ZeroScript dianggap selesai untuk spesifikasi tahap ini.
 

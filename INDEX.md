@@ -3,7 +3,7 @@
 Dokumen asli `ZeroScript.md` dipecah menjadi beberapa file domain di bawah ini.
 Nomor dan urutan section asli dipertahankan apa adanya di masing-masing file.
 
-> Catatan: Section 130 (ZeroVM Closure Environment) ditambahkan atas permintaan user — section ini tidak ada di file ZeroScript.md yang diupload sebelumnya. Section 67 (Module Re-export) sebelumnya sempat kepotong karena diawali typo "Gas " di dokumen asli sehingga tidak terdeteksi sebagai heading; sudah diperbaiki dan dipisah ke Modules.md.
+> Catatan: Section 130 (ZeroVM Closure Environment) ditambahkan atas permintaan user — section ini tidak ada di file ZeroScript.md yang diupload sebelumnya. Section 67 (Module Re-export) sebelumnya sempat kepotong karena diawali typo "Gas " di dokumen asli sehingga tidak terdeteksi sebagai heading; sudah diperbaiki dan dipisah ke Modules.md. Section 57 (Planned / Not Yet Finalized) dihapus dari ISSUES.md atas permintaan user (2026-10-01) — isinya histori perancangan awal spec, bukan issue.
 
 | Section | Judul | File |
 |---|---|---|
@@ -64,7 +64,6 @@ Nomor dan urutan section asli dipertahankan apa adanya di masing-masing file.
 | 54 | Explicit Type Conversion | Language.md |
 | 55 | Runtime Architecture | Runtime.md |
 | 56 | Current Design Philosophy | Language.md |
-| 57 | Planned / Not Yet Finalized | ISSUES.md |
 | 58 | String API — tambahan | StandardLibrary.md |
 | 59 | HTTP Query Parameters | StandardLibrary.md |
 | 60 | HTTP Headers | StandardLibrary.md |
@@ -164,6 +163,7 @@ Nomor dan urutan section asli dipertahankan apa adanya di masing-masing file.
 | 154 | ZeroScript Runtime Error Reporting | Runtime.md |
 | 155 | ZeroScript Debug Information | Runtime.md |
 | 156 | ZeroScript Core Specification Completion | Runtime.md |
+| 157 | Console Input | StandardLibrary.md |
 
 ## Ringkasan File
 - **Language.md** — ZeroScript — Language Specification (45 section)
@@ -172,6 +172,6 @@ Nomor dan urutan section asli dipertahankan apa adanya di masing-masing file.
 - **Async.md** — ZeroScript — Asynchronous Tasks & Concurrency (14 section)
 - **Bytecode.md** — ZeroScript — Bytecode & Instruction Set (19 section)
 - **ZeroVM.md** — ZeroScript — ZeroVM Architecture & Runtime Model (14 section)
-- **StandardLibrary.md** — ZeroScript — Standard Library (11 section)
+- **StandardLibrary.md** — ZeroScript — Standard Library (12 section)
 - **Runtime.md** — ZeroScript — Runtime Configuration & Operations (11 section)
-- **ISSUES.md** — ZeroScript — Open Issues / Not Yet Finalized (1 section)
+- **ISSUES.md** — ZeroScript — Open Issues / Not Yet Finalized (tanpa section bernomor — berisi analisis ambiguity per job 58-68; §57 dihapus 2026-10-01)

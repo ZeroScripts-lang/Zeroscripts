@@ -1,6 +1,7 @@
 use crate::ast::*;
 use crate::error::CompilerError;
 use crate::native;
+use std::collections::HashSet;
 
 /// Magic marker of a ZeroScript bytecode image (§125 conceptual header).
 pub const BYTECODE_MAGIC: &str = "ZERO";
@@ -35,6 +36,12 @@ impl BytecodeHeader {
         self.magic == BYTECODE_MAGIC && SUPPORTED_BYTECODE_VERSIONS.contains(&self.version)
     }
 }
+
+/// Sentinel on top of every continuation marker (ISSUES §59d). The marker is
+/// four value-stack slots — `[scope-pops, target pc, handler-pops, marker]` —
+/// pushed on every entry into a `finally` body and consumed by `FinallyEnd`.
+/// The NUL prefix keeps it distinguishable from program string constants.
+pub const FINALLY_MARKER: &str = "\u{0}zerovm:finally-marker";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Opcode {
@@ -203,6 +210,27 @@ struct LoopContext {
     break_jumps: Vec<usize>,
     continue_jumps: Vec<usize>,
     scope_depth: usize, // compiler scopes.len() before the loop body scope was pushed
+    /// Live try handlers (ISSUES §59d) when the loop began — crossing count =
+    /// current live handlers minus this snapshot.
+    handler_depth: usize,
+    /// Patchable constants holding the final break/continue destinations of
+    /// chain markers whose last `finally` belongs to this loop.
+    break_record_targets: Vec<usize>,
+    continue_record_targets: Vec<usize>,
+}
+
+/// One `try` region with a handler (catch and/or finally) during compilation.
+struct TryContext {
+    /// compiler scopes.len() at TryPush — the try-outer (finally-entry) depth.
+    scope_depth: usize,
+    has_finally: bool,
+    /// True while compiling the finally body itself: at runtime that try's
+    /// handler is already popped, so it never counts as a live crossing handler.
+    in_finally: bool,
+    /// Patchable constants and jumps registered by break/continue chains whose
+    /// target is this try's finally entry (patched when finally_pc is known).
+    finally_target_consts: Vec<usize>,
+    finally_entry_jumps: Vec<usize>,
 }
 
 /// A call the compiler can resolve statically to the native-call boundary
@@ -242,6 +270,11 @@ struct Compiler {
     function_bodies: Vec<Vec<Opcode>>,
     scopes: Vec<Vec<ScopeVar>>,
     loop_contexts: Vec<LoopContext>,
+    try_contexts: Vec<TryContext>,
+    /// Constant indices that are patched in place (marker targets). Excluded
+    /// from deduplication so neither they nor ordinary constants can alias
+    /// each other and be corrupted by a later patch.
+    patchable_constants: HashSet<usize>,
     captured_vars: Vec<(String, bool)>,
     scope_depth: usize,
     /// Index of the current function's base scope. 0 = global/top-level program.
@@ -266,6 +299,8 @@ impl Compiler {
             function_bodies: Vec::new(),
             scopes: vec![Vec::new()],
             loop_contexts: Vec::new(),
+            try_contexts: Vec::new(),
+            patchable_constants: HashSet::new(),
             captured_vars: Vec::new(),
             scope_depth: 0,
             function_base: 0,
@@ -288,6 +323,8 @@ impl Compiler {
             function_bodies: Vec::new(),
             scopes: vec![Vec::new(), Vec::new()],
             loop_contexts: Vec::new(),
+            try_contexts: Vec::new(),
+            patchable_constants: HashSet::new(),
             captured_vars: Vec::new(),
             scope_depth: 0,
             function_base: 1,
@@ -334,9 +371,10 @@ impl Compiler {
     }
 
     fn add_constant(&mut self, constant: Constant) -> usize {
-        // Deduplicate constants
+        // Deduplicate constants — but never alias a patchable marker target:
+        // its value changes later and would corrupt this constant with it.
         for (i, existing) in self.constants.iter().enumerate() {
-            if *existing == constant {
+            if *existing == constant && !self.patchable_constants.contains(&i) {
                 return i;
             }
         }
@@ -565,10 +603,14 @@ impl Compiler {
 
     fn push_loop_context(&mut self) {
         let scope_depth = self.scopes.len();
+        let handler_depth = self.live_handler_count();
         self.loop_contexts.push(LoopContext {
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             scope_depth,
+            handler_depth,
+            break_record_targets: Vec::new(),
+            continue_record_targets: Vec::new(),
         });
     }
 
@@ -596,6 +638,149 @@ impl Compiler {
         for _ in 0..count {
             self.emit(Opcode::PopScope);
         }
+    }
+
+    /// Try handlers that are live at runtime right now (ISSUES §59d): a ctx
+    /// compiling its finally body corresponds to a handler that every entry
+    /// path pops before entering the finally, so it does not count.
+    fn live_handler_count(&self) -> usize {
+        self.try_contexts
+            .iter()
+            .filter(|t| !t.in_finally)
+            .count()
+    }
+
+    /// Add a constant without deduplication — used for marker target values
+    /// that are patched in place after the destination pc becomes known.
+    fn add_patchable_constant(&mut self, constant: Constant) -> usize {
+        let index = self.constants.len();
+        self.constants.push(constant);
+        self.patchable_constants.insert(index);
+        index
+    }
+
+    /// Push one four-slot continuation marker: `[scope-pops, target, handler-
+    /// pops, sentinel]` (sentinel on top), consumed by `FinallyEnd`.
+    fn emit_finally_marker(&mut self, scope_pops: usize, target: usize, handler_pops: usize) -> usize {
+        let pops_const = self.add_constant(Constant::Number(scope_pops as f64));
+        let target_const = self.add_patchable_constant(Constant::Number(target as f64));
+        let handlers_const = self.add_constant(Constant::Number(handler_pops as f64));
+        let marker_const = self.add_constant(Constant::Str(FINALLY_MARKER.to_string()));
+        self.emit(Opcode::LoadConst(pops_const));
+        self.emit(Opcode::LoadConst(target_const));
+        self.emit(Opcode::LoadConst(handlers_const));
+        self.emit(Opcode::LoadConst(marker_const));
+        target_const
+    }
+
+    /// Compile `break` (`is_break`) or `continue` (§21, §22; ISSUES §59d).
+    ///
+    /// The jump must run the `finally` of every try region it leaves, so each
+    /// crossed try with a finally gets a continuation marker chained innermost
+    /// first: handlers are popped, scopes unwind to the first finally's entry
+    /// depth, and the chain enters that finally. Every `FinallyEnd` consumes
+    /// one marker — popping the next crossed handlers, unwinding scopes, and
+    /// jumping to the next finally entry — until the last marker lands on the
+    /// loop destination. Tries without a finally only get their handler popped.
+    fn compile_early_exit(&mut self, is_break: bool) {
+        let (loop_depth, handler_depth) = {
+            let ctx = self.loop_contexts.last().unwrap();
+            (ctx.scope_depth, ctx.handler_depth)
+        };
+
+        // Inside a finally body there is a live marker driving its FinallyEnd;
+        // this jump replaces that continuation, so discard the marker first.
+        if self.try_contexts.last().map_or(false, |t| t.in_finally) {
+            for _ in 0..4 {
+                self.emit(Opcode::Pop);
+            }
+        }
+
+        // Crossed handlers = live handlers pushed after the loop began.
+        // Contexts compiling a finally body belong to already-popped handlers.
+        let live: Vec<usize> = (0..self.try_contexts.len())
+            .filter(|&i| !self.try_contexts[i].in_finally)
+            .collect();
+        let crossed = live.len().saturating_sub(handler_depth);
+
+        if crossed == 0 {
+            self.unwind_scopes_to(loop_depth);
+            let jump = self.emit(Opcode::Jump(0));
+            if is_break {
+                self.add_break_jump(jump);
+            } else {
+                self.add_continue_jump(jump);
+            }
+            return;
+        }
+
+        // Crossed tries innermost first, and the ones that own a finally with
+        // their 1-based position from the inner side (positions are strictly
+        // increasing, matching handler-pop counts in the chain).
+        let crossing: Vec<usize> = live[live.len() - crossed..].iter().rev().copied().collect();
+        let with_finally: Vec<(usize, usize)> = crossing
+            .iter()
+            .enumerate()
+            .filter(|&(_, i)| self.try_contexts[*i].has_finally)
+            .map(|(p, &i)| (p + 1, i))
+            .collect();
+
+        if with_finally.is_empty() {
+            // Nothing to run: pop every crossed handler, then leave the loop.
+            self.unwind_scopes_to(loop_depth);
+            for _ in 0..crossed {
+                self.emit(Opcode::TryPop);
+            }
+            let jump = self.emit(Opcode::Jump(0));
+            if is_break {
+                self.add_break_jump(jump);
+            } else {
+                self.add_continue_jump(jump);
+            }
+            return;
+        }
+
+        // Enter the innermost crossed finally: pop handlers up to and including
+        // it, unwind to its entry depth, then chain markers for all of them.
+        let first_pos = with_finally[0].0;
+        let first_ctx = with_finally[0].1;
+        self.unwind_scopes_to(self.try_contexts[first_ctx].scope_depth);
+        for _ in 0..first_pos {
+            self.emit(Opcode::TryPop);
+        }
+
+        // Outermost marker first, so the innermost finally's sits on top.
+        for w in (0..with_finally.len()).rev() {
+            let (pos, ctx) = with_finally[w];
+            let (scope_pops, handler_pops, next_ctx) = if w + 1 < with_finally.len() {
+                let (next_pos, next_ctx) = with_finally[w + 1];
+                let scope_pops = self.try_contexts[ctx].scope_depth
+                    - self.try_contexts[next_ctx].scope_depth;
+                (scope_pops, next_pos - pos, Some(next_ctx))
+            } else {
+                let scope_pops = self.try_contexts[ctx].scope_depth - loop_depth;
+                (scope_pops, crossed - pos, None)
+            };
+            let target_const = self.emit_finally_marker(scope_pops, 0, handler_pops);
+            match next_ctx {
+                // Intermediate target: entry of the next crossed finally
+                // (patched when that try's finally pc becomes known).
+                Some(next) => self.try_contexts[next].finally_target_consts.push(target_const),
+                // Last target: the loop destination (patched when the loop ends).
+                None => {
+                    let record_targets = if is_break {
+                        &mut self.loop_contexts.last_mut().unwrap().break_record_targets
+                    } else {
+                        &mut self.loop_contexts.last_mut().unwrap().continue_record_targets
+                    };
+                    record_targets.push(target_const);
+                }
+            }
+        }
+
+        // First jump of the chain enters the innermost crossed finally.
+        let jump = self.emit(Opcode::Jump(0));
+        self.try_contexts[first_ctx].finally_entry_jumps.push(jump);
     }
 
     fn compile_program(&mut self, program: &Program) -> Result<(), CompilerError> {
@@ -739,6 +924,8 @@ impl Compiler {
                 let saved_function_base = self.function_base;
                 let saved_bodies_count = self.function_bodies.len();
                 let saved_loop_contexts = std::mem::take(&mut self.loop_contexts);
+                let saved_try_contexts = std::mem::take(&mut self.try_contexts);
+                let saved_patchable = std::mem::take(&mut self.patchable_constants);
                 let saved_in_async = self.in_async;
                 self.in_async = *is_async;
 
@@ -791,6 +978,8 @@ impl Compiler {
                 self.scope_depth = saved_scope_depth;
                 self.function_base = saved_function_base;
                 self.loop_contexts = saved_loop_contexts;
+                self.try_contexts = saved_try_contexts;
+                self.patchable_constants = saved_patchable;
                 self.in_async = saved_in_async;
 
                 // Merge function constants into main pool
@@ -945,6 +1134,14 @@ impl Compiler {
                 for jump in loop_ctx.break_jumps {
                     self.patch_jump(jump);
                 }
+                // Chain markers (ISSUES §59d) whose last finally lands on break
+                for c in loop_ctx.break_record_targets {
+                    self.constants[c] = Constant::Number(self.instructions.len() as f64);
+                }
+                // ... and on continue
+                for c in loop_ctx.continue_record_targets {
+                    self.constants[c] = Constant::Number(loop_start as f64);
+                }
 
                 // Patch continue jumps
                 for jump in loop_ctx.continue_jumps {
@@ -973,6 +1170,14 @@ impl Compiler {
                 for jump in loop_ctx.break_jumps {
                     self.patch_jump(jump);
                 }
+                // Chain markers (ISSUES §59d) whose last finally lands on break
+                for c in loop_ctx.break_record_targets {
+                    self.constants[c] = Constant::Number(self.instructions.len() as f64);
+                }
+                // ... and on continue
+                for c in loop_ctx.continue_record_targets {
+                    self.constants[c] = Constant::Number(loop_start as f64);
+                }
 
                 // Patch continue jumps
                 for jump in loop_ctx.continue_jumps {
@@ -985,20 +1190,14 @@ impl Compiler {
                 if self.loop_contexts.is_empty() {
                     return Err(CompilerError::new("break outside of loop"));
                 }
-                let target_depth = self.loop_contexts.last().unwrap().scope_depth;
-                self.unwind_scopes_to(target_depth);
-                let jump = self.emit(Opcode::Jump(0));
-                self.add_break_jump(jump);
+                self.compile_early_exit(true);
                 Ok(())
             }
             Stmt::Continue { .. } => {
                 if self.loop_contexts.is_empty() {
                     return Err(CompilerError::new("continue outside of loop"));
                 }
-                let target_depth = self.loop_contexts.last().unwrap().scope_depth;
-                self.unwind_scopes_to(target_depth);
-                let jump = self.emit(Opcode::Jump(0));
-                self.add_continue_jump(jump);
+                self.compile_early_exit(false);
                 Ok(())
             }
             Stmt::Switch {
@@ -1084,13 +1283,29 @@ impl Compiler {
                     finally: None,
                 });
 
+                self.try_contexts.push(TryContext {
+                    scope_depth: self.scopes.len(),
+                    has_finally,
+                    in_finally: false,
+                    finally_target_consts: Vec::new(),
+                    finally_entry_jumps: Vec::new(),
+                });
+
                 self.push_scope();
                 for stmt in body {
                     self.compile_statement(stmt)?;
                 }
                 self.pop_scope();
                 self.emit(Opcode::TryPop);
-                // Success path: skip catch, go to finally (or after)
+                // Success path: skip catch, go to finally (or after). With a
+                // finally, the continuation marker is pushed right here so
+                // FinallyEnd knows where to resume after the block (§43, ISSUES §59d).
+                let success_marker = if has_finally {
+                    Some(self.emit_finally_marker(0, 0, 0))
+                } else {
+                    None
+                };
+                let mut catch_marker = None;
                 let jump_skip_catch = self.emit(Opcode::Jump(0));
 
                 let mut catch_pc = None;
@@ -1107,6 +1322,11 @@ impl Compiler {
                     }
                     self.pop_scope();
                     self.emit(Opcode::TryPop);
+                    // Catch completed normally: continue into the finally with
+                    // the same continuation as the success path (§43).
+                    if has_finally {
+                        catch_marker = Some(self.emit_finally_marker(0, 0, 0));
+                    }
                 }
                 let jump_to_finally = if has_catch {
                     Some(self.emit(Opcode::Jump(0)))
@@ -1115,12 +1335,25 @@ impl Compiler {
                 };
 
                 let finally_pc = if has_finally {
-                    Some(self.instructions.len())
+                    let pc = self.instructions.len();
+                    // Patch chain entries registered by break/continue sites in
+                    // the body/catch of this try (ISSUES §59d).
+                    let ctx = self.try_contexts.last_mut().unwrap();
+                    for c in ctx.finally_target_consts.drain(..) {
+                        self.constants[c] = Constant::Number(pc as f64);
+                    }
+                    for j in ctx.finally_entry_jumps.drain(..) {
+                        self.instructions[j] = Opcode::Jump(pc);
+                    }
+                    Some(pc)
                 } else {
                     None
                 };
 
                 if has_finally {
+                    // From here until FinallyEnd, break/continue sites see a
+                    // live marker on the stack and an already-popped handler.
+                    self.try_contexts.last_mut().unwrap().in_finally = true;
                     self.push_scope();
                     for stmt in finally_body.as_ref().unwrap() {
                         self.compile_statement(stmt)?;
@@ -1147,10 +1380,20 @@ impl Compiler {
                     }
                 }
 
+                // Continuation markers resume after the whole try statement.
+                if let Some(c) = success_marker {
+                    self.constants[c] = Constant::Number(after as f64);
+                }
+                if let Some(c) = catch_marker {
+                    self.constants[c] = Constant::Number(after as f64);
+                }
+
                 self.instructions[push_idx] = Opcode::TryPush {
                     catch: catch_pc,
                     finally: finally_pc,
                 };
+
+                self.try_contexts.pop();
 
                 Ok(())
             }
@@ -1540,6 +1783,8 @@ impl Compiler {
                 let saved_function_base = self.function_base;
                 let saved_bodies_count = self.function_bodies.len();
                 let saved_loop_contexts = std::mem::take(&mut self.loop_contexts);
+                let saved_try_contexts = std::mem::take(&mut self.try_contexts);
+                let saved_patchable = std::mem::take(&mut self.patchable_constants);
                 let saved_in_async = self.in_async;
                 // Nested function/arrow expressions are never async (§49: no
                 // async function expressions), so `await` inside them is an error.
@@ -1579,6 +1824,8 @@ impl Compiler {
                 self.scope_depth = saved_scope_depth;
                 self.function_base = saved_function_base;
                 self.loop_contexts = saved_loop_contexts;
+                self.try_contexts = saved_try_contexts;
+                self.patchable_constants = saved_patchable;
                 self.in_async = saved_in_async;
 
                 // Merge function constants into main pool and remap indices
@@ -1657,6 +1904,8 @@ impl Compiler {
                 let saved_function_base = self.function_base;
                 let saved_bodies_count = self.function_bodies.len();
                 let saved_loop_contexts = std::mem::take(&mut self.loop_contexts);
+                let saved_try_contexts = std::mem::take(&mut self.try_contexts);
+                let saved_patchable = std::mem::take(&mut self.patchable_constants);
                 let saved_in_async = self.in_async;
                 // Nested function/arrow expressions are never async (§49: no
                 // async function expressions), so `await` inside them is an error.
@@ -1700,6 +1949,8 @@ impl Compiler {
                 self.scope_depth = saved_scope_depth;
                 self.function_base = saved_function_base;
                 self.loop_contexts = saved_loop_contexts;
+                self.try_contexts = saved_try_contexts;
+                self.patchable_constants = saved_patchable;
                 self.in_async = saved_in_async;
 
                 // Merge function constants into main pool and remap indices

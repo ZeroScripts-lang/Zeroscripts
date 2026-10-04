@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::compiler::{BytecodeProgram, Constant, FunctionInfo, Opcode};
+use crate::compiler::{BytecodeProgram, Constant, FunctionInfo, Opcode, FINALLY_MARKER};
 use crate::gc::Gc;
 use crate::heap::{EnvBinding, Heap, HeapObject, HeapRef as HeapRefHandle};
 use crate::native;
@@ -70,6 +70,32 @@ impl Value {
             // §101: task is a distinct runtime value (not a promise type exposed
             // as language type per §49, but observable via task.state).
             Value::Task(_) => "task",
+        }
+    }
+
+    /// `Some(message)` when this value is a caught error object (ISSUES §59a),
+    /// identified by the heap's internal error flag — a plain object carrying
+    /// `type`/`message`/`location` is an ordinary object, not an error.
+    pub fn error_message(&self, heap: &Heap) -> Option<String> {
+        let Value::Object(reference) = self else {
+            return None;
+        };
+        let Ok(object) = heap.get(reference) else {
+            return None;
+        };
+        if !object.is_error_object() {
+            return None;
+        }
+        let HeapObject::Object { props, .. } = object else {
+            return None;
+        };
+        let message_ref = &props
+            .iter()
+            .find(|(key, _)| key.as_str() == "message")?
+            .1;
+        match heap.get(message_ref) {
+            Ok(HeapObject::Str(text)) => Some(text.clone()),
+            _ => None,
         }
     }
 
@@ -149,15 +175,12 @@ impl Value {
                 });
                 RuntimeValue::HeapRef(r)
             }
+            // Job 021 (§130/§31): a stored/converted closure keeps its
+            // original environment — no Environment clone.
             Value::Closure { function_index, env, param_defaults } => {
-                let env_bindings = match heap.get(env) {
-                    Ok(HeapObject::Environment(bindings)) => bindings.clone(),
-                    _ => Vec::new(),
-                };
-                let env_ref = heap.allocate(HeapObject::Environment(env_bindings));
                 let r = heap.allocate(HeapObject::Closure {
                     function_index: *function_index,
-                    env: env_ref,
+                    env: env.clone(),
                     param_defaults: param_defaults.clone(),
                 });
                 RuntimeValue::HeapRef(r)
@@ -186,15 +209,14 @@ impl Value {
                 params: vec![],
                 entry_point: 0,
             }),
+            // Job 021 (§130/§31/§35): storing a closure into a list/
+            // object/environment binding must preserve the original
+            // environment identity — sibling closures and direct calls
+            // keep observing each other's captured-variable mutations.
             Value::Closure { function_index, env, param_defaults } => {
-                let env_bindings = match heap.get(env) {
-                    Ok(HeapObject::Environment(bindings)) => bindings.clone(),
-                    _ => Vec::new(),
-                };
-                let env_ref = heap.allocate(HeapObject::Environment(env_bindings));
                 heap.allocate(HeapObject::Closure {
                     function_index: *function_index,
-                    env: env_ref,
+                    env: env.clone(),
                     param_defaults: param_defaults.clone(),
                 })
             }
@@ -296,6 +318,43 @@ struct Binding {
     /// When set, loads read through the heap Environment so mutations
     /// by the source module are visible; stores are rejected via is_const.
     live: Option<(HeapRefHandle, String)>,
+}
+
+/// Collect the heap references carried by a single value (§121: Value
+/// Stack entries; the Closure variant's env counts as closure environment,
+/// §131).
+fn collect_value_refs(value: &Value, roots: &mut Vec<HeapRefHandle>) {
+    match value {
+        Value::List(r) | Value::Object(r) => roots.push(r.clone()),
+        Value::Closure { env, .. } => roots.push(env.clone()),
+        _ => {}
+    }
+}
+
+/// A binding contributes both its value and its live-binding environment
+/// (module bindings, §121).
+fn collect_binding_refs(binding: &Binding, roots: &mut Vec<HeapRefHandle>) {
+    collect_value_refs(&binding.value, roots);
+    if let Some((env, _)) = &binding.live {
+        roots.push(env.clone());
+    }
+}
+
+/// Local variables and parameters live in frame scopes; closure
+/// environments hang off the frame (§121 "local variables pada Execution
+/// Frame yang aktif", "parameter fungsi"; §131 "closure environment").
+fn collect_frame_refs(frame: &Frame, roots: &mut Vec<HeapRefHandle>) {
+    for scope in &frame.scopes {
+        for binding in scope.values() {
+            collect_binding_refs(binding, roots);
+        }
+    }
+    if let Some(env) = &frame.captured_env {
+        roots.push(env.clone());
+    }
+    if let Some(env) = &frame.scope_env {
+        roots.push(env.clone());
+    }
 }
 
 impl Binding {
@@ -418,8 +477,8 @@ struct TaskContext {
 }
 
 /// A single asynchronous task (§101). Stored in `ZeroVM.tasks` (outside the
-/// heap); heap-backed values are rooted via `live_refs` so GC keeps them
-/// alive while the task exists.
+/// heap); heap-backed values (kind args/callee/env, stored result, saved
+/// context) are roots via gc_roots (§121) while the task exists.
 #[derive(Debug, Clone)]
 struct Task {
     state: TaskState,
@@ -434,6 +493,15 @@ struct Task {
     /// Id of the task this task is suspended on (`await ...`). Combinators
     /// are themselves tasks, so every suspension is a wait on one task id.
     wait: Option<usize>,
+    /// §108 "Un-awaited Task Failure": set when `await` targets this task.
+    /// A failed task with `awaited == false` (and no awaited combinator
+    /// downstream) yields one stderr warning when the program finishes.
+    awaited: bool,
+    /// Id of the source member whose error made this combinator fail
+    /// (§103/§104/§109/§110 propagation). Part of the §108 warning-
+    /// suppression chain: source members count as awaited when the
+    /// combinator that consumed their failure was itself observed.
+    failed_from: Option<usize>,
     /// Order in which this task reached a terminal state — `task.race`
     /// compares it to find the genuine first finisher (§104).
     terminal_seq: Option<u64>,
@@ -455,6 +523,15 @@ struct TryHandler {
     phase: TryPhase,
 }
 
+/// A continuation marker popped by `FinallyEnd` (ISSUES §59d): four value-
+/// stack slots `[scope-pops, target pc, handler-pops, sentinel]`, one pushed
+/// on every entry into a finally body (§43 "finally selalu dijalankan").
+struct FinallyMarker {
+    scope_pops: usize,
+    target: usize,
+    handler_pops: usize,
+}
+
 pub struct ZeroVM {
     program: BytecodeProgram,
     pc: usize,
@@ -465,6 +542,9 @@ pub struct ZeroVM {
     err_output: Vec<String>,
     heap: Heap,
     gc: Gc,
+    /// §121 "reference yang sedang digunakan oleh runtime": pins for heap
+    /// refs held only on the Rust side (currently the run_modules export
+    /// cache). Everything else is scanned structurally by gc_roots.
     live_refs: Vec<HeapRefHandle>,
     handlers: Vec<TryHandler>,
     pending_error: Option<String>,
@@ -561,24 +641,80 @@ impl ZeroVM {
     }
 
     pub fn run_gc(&mut self) {
-        let roots: Vec<HeapRefHandle> = self.live_refs.clone();
+        let roots = self.gc_roots();
         self.gc.collect(&mut self.heap, &roots);
 
         self.live_refs.retain(|r| self.heap.is_valid(r));
     }
 
+    /// Root set for the mark phase — §121 "Root Reference" and §131
+    /// "Reference Sources": the value stack (local variables, parameters as
+    /// pushed/stored values), active execution frames (scope bindings,
+    /// captured/scope environments, live bindings), global bindings,
+    /// module bindings (via live bindings + the pinned export cache),
+    /// pending return values, running/suspended tasks (kind args/callee/
+    /// env, stored results, saved contexts) and `live_refs` — references
+    /// held only on the Rust side (§121 "reference yang sedang digunakan
+    /// oleh runtime"), e.g. the `run_modules` export cache.
+    ///
+    /// Roots are scanned only at instruction boundaries (the execution
+    /// loops call `maybe_gc` between instructions): during one instruction
+    /// no collection can fire, so values temporarily held in Rust locals
+    /// (popped operands, recursion inside natives) are safe without pins —
+    /// §120/§121 leave GC timing to the implementation.
+    fn gc_roots(&self) -> Vec<HeapRefHandle> {
+        let mut roots = Vec::new();
+        for value in &self.stack {
+            collect_value_refs(value, &mut roots);
+        }
+        for frame in &self.call_stack {
+            collect_frame_refs(frame, &mut roots);
+        }
+        for binding in self.global_scope.values() {
+            collect_binding_refs(binding, &mut roots);
+        }
+        if let Some(value) = &self.pending_return {
+            collect_value_refs(value, &mut roots);
+        }
+        for task in &self.tasks {
+            if let TaskKind::Normal {
+                args,
+                callee,
+                env,
+                ..
+            } = &task.kind
+            {
+                for value in args {
+                    collect_value_refs(value, &mut roots);
+                }
+                collect_value_refs(callee, &mut roots);
+                if let Some(e) = env {
+                    roots.push(e.clone());
+                }
+            }
+            if let Some(value) = &task.result {
+                collect_value_refs(value, &mut roots);
+            }
+            if let Some(ctx) = &task.context {
+                for value in &ctx.stack {
+                    collect_value_refs(value, &mut roots);
+                }
+                for frame in &ctx.call_stack {
+                    collect_frame_refs(frame, &mut roots);
+                }
+                if let Some(value) = &ctx.pending_return {
+                    collect_value_refs(value, &mut roots);
+                }
+            }
+        }
+        roots.extend(self.live_refs.iter().cloned());
+        roots
+    }
+
     pub fn heap_alloc(&mut self, object: HeapObject) -> HeapRefHandle {
         let reference = self.heap.allocate(object);
         self.gc.on_allocation();
-        self.add_live_ref(reference.clone());
-        self.maybe_gc();
         reference
-    }
-
-    fn track_stack_top(&mut self) {
-        if let Some(value) = self.stack.last().cloned() {
-            self.track_value_heap_refs(&value);
-        }
     }
 
     fn track_value_heap_refs(&mut self, value: &Value) {
@@ -788,6 +924,9 @@ impl ZeroVM {
         });
 
         while self.state == ExecutionState::Running {
+            // GC boundary (§121): all live values sit in scanned roots
+            // (stack/frames/globals/tasks) between instructions.
+            self.maybe_gc();
             if self.pc >= self.program.instructions.len() {
                 self.state = ExecutionState::Completed;
                 break;
@@ -949,6 +1088,10 @@ impl ZeroVM {
 
                 match module_scope.get(name) {
                     Some(b) => {
+                        // Module bindings stay active until run_modules
+                        // returns — pin the exported value for the cache
+                        // (§121 "module bindings yang masih aktif").
+                        self.track_value_heap_refs(&b.value);
                         exports_map.insert(name.clone(), ExportBinding::Value(b.value.clone()));
                     }
                     None => {
@@ -972,6 +1115,8 @@ impl ZeroVM {
     fn run_module_range(&mut self, start: usize, end: usize) -> Result<(), VmError> {
         self.pc = start;
         while self.pc < end {
+            // GC boundary (§121) — same safe point as the main loop.
+            self.maybe_gc();
             if self.pc >= self.program.instructions.len() {
                 break;
             }
@@ -1084,7 +1229,6 @@ impl ZeroVM {
         }
         let value = self.constant_to_value(&self.program.constants[idx]);
         self.stack.push(value);
-        self.track_stack_top();
         Ok(())
     }
 
@@ -1095,18 +1239,6 @@ impl ZeroVM {
             Constant::Boolean(b) => Value::Boolean(*b),
             Constant::Null => Value::Null,
             Constant::Function(idx) => Value::Function(*idx),
-        }
-    }
-
-    /// Mark a heap-backed collection as const when stored into a const binding.
-    fn mark_const_if_collection(&mut self, value: &Value) {
-        match value {
-            Value::List(r) | Value::Object(r) => {
-                if let Ok(obj) = self.heap.get_mut(r) {
-                    obj.mark_const_collection();
-                }
-            }
-            _ => {}
         }
     }
 
@@ -1140,7 +1272,6 @@ impl ZeroVM {
 
         // Find binding in current frame's scopes (innermost first)
         let mut found = false;
-        let mut was_const = false;
         let mut write_env: Option<HeapRefHandle> = None;
         if let Some(frame) = self.call_stack.last_mut() {
             for scope in frame.scopes.iter_mut().rev() {
@@ -1151,7 +1282,6 @@ impl ZeroVM {
                             name
                         )));
                     }
-                    was_const = binding.is_const;
                     binding.value = value.clone();
                     binding.initialized = true;
                     found = true;
@@ -1185,9 +1315,6 @@ impl ZeroVM {
             }
         }
 
-        if found && was_const {
-            self.mark_const_if_collection(&value);
-        }
         Ok(())
     }
 
@@ -1205,13 +1332,11 @@ impl ZeroVM {
                                 ))
                             })?;
                             self.stack.push(value);
-                            self.track_stack_top();
                             return Ok(());
                         }
                     }
                     let value = binding.value.clone();
                     self.stack.push(value);
-                    self.track_stack_top();
                     return Ok(());
                 }
             }
@@ -1252,7 +1377,6 @@ impl ZeroVM {
         if let Some(binding) = self.global_scope.get(name) {
             let value = binding.value.clone();
             self.stack.push(value);
-            self.track_stack_top();
             return Ok(());
         }
         Err(VmError::RuntimeError(format!(
@@ -1264,8 +1388,6 @@ impl ZeroVM {
     fn execute_store_global(&mut self, name: &str) -> Result<(), VmError> {
         let value = self.pop_stack("store global")?;
 
-        let mut was_const = false;
-        let mut found = false;
         {
             let scope = &mut self.global_scope;
             {
@@ -1276,10 +1398,8 @@ impl ZeroVM {
                             name
                         )));
                     }
-                    was_const = binding.is_const;
                     binding.value = value.clone();
                     binding.initialized = true;
-                    found = true;
                 } else {
                     // Bare assignment creates a mutable global
                     scope.insert(
@@ -1295,9 +1415,6 @@ impl ZeroVM {
             }
         }
 
-        if found && was_const {
-            self.mark_const_if_collection(&value);
-        }
         Ok(())
     }
 
@@ -1333,7 +1450,6 @@ impl ZeroVM {
         let left = self.pop_stack("binary op")?;
         let result = op(&left, &right)?;
         self.stack.push(result);
-        self.track_stack_top();
         Ok(())
     }
 
@@ -1558,7 +1674,6 @@ impl ZeroVM {
     fn execute_dup(&mut self) -> Result<(), VmError> {
         let value = self.peek_stack("dup")?;
         self.stack.push(value);
-        self.track_stack_top();
         Ok(())
     }
 
@@ -1634,7 +1749,6 @@ impl ZeroVM {
             Value::BuiltIn(name) => {
                 let result = self.execute_builtin(name, argc)?;
                 self.stack.push(result);
-                self.track_stack_top();
                 Ok(())
             }
             Value::Function(idx) => {
@@ -1785,7 +1899,6 @@ impl ZeroVM {
             )));
         }
         self.stack.push(Value::Function(index));
-        self.track_stack_top();
         Ok(())
     }
 
@@ -1795,7 +1908,6 @@ impl ZeroVM {
         let args = self.pop_native_args(argc, operation)?;
         let result = self.call_native(operation, &args)?;
         self.stack.push(result);
-        self.track_stack_top();
         Ok(())
     }
 
@@ -1804,7 +1916,6 @@ impl ZeroVM {
         let args = self.pop_native_args(argc, "list.add")?;
         let result = self.native_list_add(&args)?;
         self.stack.push(result);
-        self.track_stack_top();
         Ok(())
     }
 
@@ -1813,7 +1924,6 @@ impl ZeroVM {
         let args = self.pop_native_args(argc, "list.remove")?;
         let result = self.native_list_remove(&args)?;
         self.stack.push(result);
-        self.track_stack_top();
         Ok(())
     }
 
@@ -1822,7 +1932,6 @@ impl ZeroVM {
         let args = self.pop_native_args(argc, "object.remove")?;
         let result = self.native_object_remove(&args)?;
         self.stack.push(result);
-        self.track_stack_top();
         Ok(())
     }
 
@@ -1881,14 +1990,8 @@ impl ZeroVM {
         env: Option<HeapRefHandle>,
     ) -> Result<(), VmError> {
         let id = self.tasks.len();
-        // Root heap-backed args/callee so GC keeps them alive while pending.
-        for arg in &args {
-            self.track_value_heap_refs(arg);
-        }
-        self.track_value_heap_refs(&callee);
-        if let Some(e) = &env {
-            self.add_live_ref(e.clone());
-        }
+        // args/callee/env live in the task table — scanned by gc_roots
+        // (§121 "task yang masih berjalan").
         self.tasks.push(Task {
             state: TaskState::Pending,
             kind: TaskKind::Normal {
@@ -1901,11 +2004,12 @@ impl ZeroVM {
             error: None,
             context: None,
             wait: None,
+            awaited: false,
+            failed_from: None,
             terminal_seq: None,
         });
         self.ready_queue.push_back(id);
         self.stack.push(Value::Task(id));
-        self.track_stack_top();
         Ok(())
     }
 
@@ -1923,6 +2027,8 @@ impl ZeroVM {
             error: None,
             context: None,
             wait: None,
+            awaited: false,
+            failed_from: None,
             terminal_seq: None,
         });
         if !is_sleep {
@@ -2031,7 +2137,6 @@ impl ZeroVM {
             self.tasks[task_id].state = TaskState::Completed;
             self.tasks[task_id].result = Some(result.clone());
             self.tasks[task_id].context = None;
-            self.track_value_heap_refs(result);
             self.stamp_terminal(task_id);
             self.notify_dependents(task_id)?;
         }
@@ -2147,6 +2252,8 @@ impl ZeroVM {
                                 .error
                                 .clone()
                                 .unwrap_or_else(|| "Task failed".to_string());
+                            // §108: record which member's error entered this combinator.
+                            self.tasks[id].failed_from = Some(x);
                             return self.fail_task(id, msg);
                         }
                         TaskState::Cancelled => {
@@ -2192,6 +2299,8 @@ impl ZeroVM {
                             .error
                             .clone()
                             .unwrap_or_else(|| "Task failed".to_string());
+                        // §108: record which member's error entered this combinator.
+                        self.tasks[id].failed_from = Some(w);
                         self.fail_task(id, m)
                     }
                     TaskState::Cancelled => self.fail_task(id, "Task was cancelled".to_string()),
@@ -2205,6 +2314,8 @@ impl ZeroVM {
                         .error
                         .clone()
                         .unwrap_or_else(|| "Task failed".to_string());
+                    // §108: record which member's error entered this combinator.
+                    self.tasks[id].failed_from = Some(target);
                     self.fail_task(id, m)
                 }
                 TaskState::Cancelled => self.fail_task(id, "Task was cancelled".to_string()),
@@ -2227,6 +2338,8 @@ impl ZeroVM {
                         .error
                         .clone()
                         .unwrap_or_else(|| "Task failed".to_string());
+                    // §108: record which member's error entered this combinator.
+                    self.tasks[id].failed_from = Some(target);
                     self.fail_task(id, m)
                 }
                 TaskState::Cancelled => self.fail_task(id, "Task was cancelled".to_string()),
@@ -2301,6 +2414,61 @@ impl ZeroVM {
     /// task reaches a terminal state. Awaiting/sleeping tasks never block
     /// other ready tasks; when nothing is runnable the virtual clock jumps
     /// straight to the next timer deadline (§110, §111).
+    /// §108 "Un-awaited Task Failure": did this failed task's error reach an
+    /// observation point? A task counts as observed when `await` targeted it
+    /// directly, or when the failure entered a combinator (`task.all`,
+    /// `task.race`, `task.wait`, `task.timeout`) that is itself observed —
+    /// the chain follows `failed_from` (member ids are always smaller than
+    /// their combinator's, so recursion terminates).
+    fn failure_was_observed(&self, tid: usize) -> bool {
+        if self.tasks[tid].awaited {
+            return true;
+        }
+        for (i, t) in self.tasks.iter().enumerate() {
+            if t.failed_from == Some(tid) && self.failure_was_observed(i) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// §108 "Un-awaited Task Failure": when the program finishes, push one
+    /// stderr warning per failed task that was never observed. Warnings go
+    /// through `err_output` (the stderr channel `print.err` uses); wording is
+    /// an implementation choice — the spec requires one warning per task but
+    /// does not prescribe its text.
+    fn emit_unawaited_failure_warnings(&mut self) {
+        let mut lines = Vec::new();
+        for (tid, task) in self.tasks.iter().enumerate() {
+            if task.state != TaskState::Failed || self.failure_was_observed(tid) {
+                continue;
+            }
+            let err = task
+                .error
+                .clone()
+                .unwrap_or_else(|| "Task failed".to_string());
+            let subject = match &task.kind {
+                TaskKind::Normal { func_idx, .. } => self
+                    .program
+                    .functions
+                    .get(*func_idx)
+                    .map(|f| format!("task \"{}\"", f.name))
+                    .unwrap_or_else(|| "task".to_string()),
+                TaskKind::All(_) => "task.all()".to_string(),
+                TaskKind::Race(_) => "task.race()".to_string(),
+                TaskKind::Wait(_) => "task.wait()".to_string(),
+                TaskKind::Sleep { .. } => "task.sleep()".to_string(),
+                TaskKind::Timeout { .. } => "task.timeout()".to_string(),
+                TaskKind::Http { .. } => "http request".to_string(),
+            };
+            lines.push(format!(
+                "ZeroScript warning: {} failed but was never awaited: {}",
+                subject, err
+            ));
+        }
+        self.err_output.extend(lines);
+    }
+
     fn run_scheduler(&mut self) -> Result<(), VmError> {
         loop {
             // Ready queue must hold every pending normal task (heal in case
@@ -2356,6 +2524,8 @@ impl ZeroVM {
                     "Task deadlock: remaining tasks are waiting on each other".to_string(),
                 ));
             }
+            // Program finished normally → §108 un-awaited failure warnings.
+            self.emit_unawaited_failure_warnings();
             return Ok(());
         }
     }
@@ -2387,7 +2557,6 @@ impl ZeroVM {
                                 self.tasks[target].result.clone().unwrap_or(Value::Null);
                             self.tasks[tid].wait = None;
                             self.stack.push(result);
-                            self.track_stack_top();
                         }
                         TaskState::Failed => {
                             let msg = self.tasks[target]
@@ -2416,6 +2585,10 @@ impl ZeroVM {
         }
 
         while !self.call_stack.is_empty() {
+            // GC boundary (§121): the active task's context is in the
+            // instruction-loop fields; suspended tasks stay in the table —
+            // all covered by gc_roots.
+            self.maybe_gc();
             if self.tasks[tid].wait.is_some() {
                 // Suspended on await: save the context, hand control back.
                 self.save_active_context(tid);
@@ -2470,11 +2643,14 @@ impl ZeroVM {
             )));
         }
 
+        // §108 "Un-awaited Task Failure": reaching await counts as observation —
+        // this task's failure will not produce a warning.
+        self.tasks[target].awaited = true;
+
         match self.tasks[target].state {
             TaskState::Completed => {
                 let result = self.tasks[target].result.clone().unwrap_or(Value::Null);
                 self.stack.push(result);
-                self.track_stack_top();
                 Ok(())
             }
             TaskState::Failed => Err(VmError::RuntimeError(
@@ -2536,12 +2712,15 @@ impl ZeroVM {
                 Ok(Value::Null)
             }
             "print.err" => {
-                if args.is_empty() {
-                    self.err_output.push(String::new());
-                } else {
-                    let output = args[0].format_value(&self.heap);
-                    self.err_output.push(output);
-                }
+                // ISSUES §59a: a caught error object prints its message so the
+                // output stays a human-readable error line.
+                let output = match args.first() {
+                    Some(value) => value
+                        .error_message(&self.heap)
+                        .unwrap_or_else(|| value.format_value(&self.heap)),
+                    None => String::new(),
+                };
+                self.err_output.push(output);
                 Ok(Value::Null)
             }
             "type" => {
@@ -2592,10 +2771,17 @@ impl ZeroVM {
                     }
                     Value::Boolean(b) => Ok(Value::Str(b.to_string())),
                     Value::Null => Ok(Value::Str("null".to_string())),
-                    other => Err(VmError::RuntimeError(format!(
-                        "Invalid conversion to string from {:?}",
-                        other
-                    ))),
+                    value => {
+                        // ISSUES §59a: string(caught error) is its message;
+                        // other objects stay a conversion error (§54/§59c).
+                        match value.error_message(&self.heap) {
+                            Some(text) => Ok(Value::Str(text)),
+                            None => Err(VmError::RuntimeError(format!(
+                                "Invalid conversion to string from {:?}",
+                                value
+                            ))),
+                        }
+                    }
                 }
             }
             "boolean" => {
@@ -2974,12 +3160,7 @@ impl ZeroVM {
         }
         let elem = args[1].heap_object_for_element(&mut self.heap);
         match self.heap.get_mut(&r) {
-            Ok(HeapObject::List { items, is_const }) => {
-                if *is_const {
-                    return Err(VmError::RuntimeError(
-                        "Cannot modify const list".to_string(),
-                    ));
-                }
+            Ok(HeapObject::List { items, .. }) => {
                 items.push(elem);
             }
             _ => {
@@ -3018,12 +3199,7 @@ impl ZeroVM {
             }
         };
         match self.heap.get_mut(&r) {
-            Ok(HeapObject::List { items, is_const }) => {
-                if *is_const {
-                    return Err(VmError::RuntimeError(
-                        "Cannot modify const list".to_string(),
-                    ));
-                }
+            Ok(HeapObject::List { items, .. }) => {
                 if idx >= items.len() {
                     return Err(VmError::RuntimeError(format!(
                         "List index {} out of bounds (length {})",
@@ -3060,12 +3236,7 @@ impl ZeroVM {
             }
         };
         match self.heap.get_mut(&r) {
-            Ok(HeapObject::Object { props, is_const }) => {
-                if *is_const {
-                    return Err(VmError::RuntimeError(
-                        "Cannot modify const object".to_string(),
-                    ));
-                }
+            Ok(HeapObject::Object { props, .. }) => {
                 let before = props.len();
                 props.retain(|(k, _)| k != &key);
                 if props.len() == before {
@@ -3298,7 +3469,6 @@ impl ZeroVM {
             hprops.push((k.clone(), hr));
         }
         let headers_ref = self.heap.allocate(HeapObject::object(hprops));
-        self.add_live_ref(headers_ref.clone());
 
         let fields = [
             ("status", Value::Number(out.status as f64)),
@@ -3311,7 +3481,6 @@ impl ZeroVM {
             props.push((name.to_string(), r));
         }
         let obj = self.heap.allocate(HeapObject::object(props));
-        self.add_live_ref(obj.clone());
         self.gc.on_allocation();
         Ok(Value::Object(obj))
     }
@@ -3380,7 +3549,6 @@ impl ZeroVM {
                 }
                 let obj_ref = self.heap.allocate(HeapObject::object(props));
                 self.gc.on_allocation();
-                self.add_live_ref(obj_ref.clone());
                 Ok(Value::Object(obj_ref))
             }
         }
@@ -3447,7 +3615,6 @@ impl ZeroVM {
         }
         let list_ref = self.heap.allocate(HeapObject::list(items));
         self.gc.on_allocation();
-        self.add_live_ref(list_ref.clone());
         Ok(Value::List(list_ref))
     }
 
@@ -3475,13 +3642,102 @@ impl ZeroVM {
     }
 
     fn execute_finally_end(&mut self) -> Result<(), VmError> {
+        // Every entry into a finally body pushes exactly one continuation
+        // marker (ISSUES §59d); FinallyEnd consumes the top marker on every
+        // path before deciding where control goes.
+        let marker = self.pop_finally_marker()?;
         if let Some(msg) = self.pending_error.take() {
+            // Marker discarded: the error continues outward unchanged.
             return self.raise_runtime_error(msg);
         }
         if let Some(val) = self.pending_return.take() {
+            // Marker discarded: return completes as if no marker existed.
             return self.complete_pending_return(val);
         }
+        // Marker continuation: pop the crossed handlers the compiler recorded,
+        // unwind scopes to the destination depth, jump to the destination.
+        for _ in 0..marker.handler_pops {
+            if self.handlers.pop().is_none() {
+                return Err(VmError::InvalidExecutionState(
+                    "finally continuation marker: handler pops exceeded handler stack"
+                        .to_string(),
+                ));
+            }
+        }
+        if let Some(frame) = self.call_stack.last_mut() {
+            let mut remaining = marker.scope_pops;
+            while remaining > 0 && frame.scopes.len() > 1 {
+                frame.scopes.pop();
+                remaining -= 1;
+            }
+        }
+        self.pc = marker.target;
         Ok(())
+    }
+
+    /// Marker for a finally entered with `pending_error`/`pending_return`:
+    /// the four slots exist so FinallyEnd consumes exactly one marker on every
+    /// path; the pending branch discards it without reading the fields.
+    fn push_pending_finally_marker(&mut self) {
+        self.stack.push(Value::Number(0.0));
+        self.stack.push(Value::Number(0.0));
+        self.stack.push(Value::Number(0.0));
+        self.stack.push(Value::Str(FINALLY_MARKER.to_string()));
+    }
+
+    fn pop_finally_marker(&mut self) -> Result<FinallyMarker, VmError> {
+        let invalid = |reason: &str| {
+            VmError::InvalidExecutionState(format!("finally continuation marker: {}", reason))
+        };
+        if self.stack.len() < 4 {
+            return Err(invalid("stack underflow"));
+        }
+        let sentinel = self.stack.pop().unwrap();
+        let handler_pops = self.stack.pop().unwrap();
+        let target = self.stack.pop().unwrap();
+        let scope_pops = self.stack.pop().unwrap();
+        match sentinel {
+            Value::Str(ref s) if s == FINALLY_MARKER => {}
+            _ => return Err(invalid("sentinel missing at stack top")),
+        }
+        let as_count = |v: &Value| match v {
+            Value::Number(n)
+                if n.is_finite() && *n >= 0.0 && n.fract() == 0.0 && *n <= usize::MAX as f64 =>
+            {
+                Some(*n as usize)
+            }
+            _ => None,
+        };
+        let scope_pops = as_count(&scope_pops).ok_or_else(|| invalid("scope-pops field"))?;
+        let target = as_count(&target).ok_or_else(|| invalid("target field"))?;
+        let handler_pops = as_count(&handler_pops).ok_or_else(|| invalid("handler-pops field"))?;
+        if target >= self.program.instructions.len() {
+            return Err(VmError::InvalidJumpTarget(target));
+        }
+        Ok(FinallyMarker {
+            scope_pops,
+            target,
+            handler_pops,
+        })
+    }
+
+    /// Build the object bound to `catch e` (ISSUES §59a, §43, §154).
+    /// Fields: `type` (error category), `message` (the runtime error text),
+    /// `location` (`{file, line, column}` or `null` — `null` here because the
+    /// VM carries no source position for runtime errors, §154 "jika informasi
+    /// tersebut tersedia").
+    fn make_error_object(&mut self, msg: &str) -> Value {
+        let type_ref = self
+            .heap
+            .allocate(HeapObject::Str(classify_runtime_error(msg).to_string()));
+        let message_ref = self.heap.allocate(HeapObject::Str(msg.to_string()));
+        let location_ref = self.heap.allocate(HeapObject::Null);
+        let object_ref = self.heap.allocate(HeapObject::error_object(vec![
+            ("type".to_string(), type_ref),
+            ("message".to_string(), message_ref),
+            ("location".to_string(), location_ref),
+        ]));
+        Value::Object(object_ref)
     }
 
     fn raise_runtime_error(&mut self, msg: String) -> Result<(), VmError> {
@@ -3524,14 +3780,17 @@ impl ZeroVM {
                         if let Some(frame) = self.handlers.last_mut() {
                             frame.phase = TryPhase::Catch;
                         }
-                        self.stack.push(Value::Str(msg));
-                        self.track_stack_top();
+                        let error_value = self.make_error_object(&msg);
+                        self.stack.push(error_value);
                         self.pc = catch_pc;
                         return Ok(());
                     } else if let Some(finally_pc) = handler.finally_pc {
                         self.handlers.pop();
                         self.unwind_to_handler(&handler);
                         self.pending_error = Some(msg);
+                        // Marker after truncation: FinallyEnd consumes it, then
+                        // re-raises pending_error (ISSUES §59d).
+                        self.push_pending_finally_marker();
                         self.pc = finally_pc;
                         return Ok(());
                     } else {
@@ -3545,6 +3804,7 @@ impl ZeroVM {
                     if let Some(finally_pc) = handler.finally_pc {
                         self.unwind_to_handler(&handler);
                         self.pending_error = Some(msg);
+                        self.push_pending_finally_marker();
                         self.pc = finally_pc;
                         return Ok(());
                     }
@@ -3586,7 +3846,6 @@ impl ZeroVM {
 
         if self.call_stack.is_empty() {
             self.stack.push(return_value);
-            self.track_stack_top();
             self.state = ExecutionState::Completed;
             return Ok(());
         }
@@ -3609,7 +3868,6 @@ impl ZeroVM {
             self.finish_task(tid, &return_value)?;
         } else {
             self.stack.push(return_value);
-            self.track_stack_top();
         }
         Ok(())
     }
@@ -3640,6 +3898,9 @@ impl ZeroVM {
                 self.stack.truncate(handler.stack_depth);
             }
             self.pending_return = Some(return_value);
+            // Marker after truncation: FinallyEnd consumes it, then completes
+            // pending_return (ISSUES §59d).
+            self.push_pending_finally_marker();
             self.pc = handler.finally_pc.unwrap();
             return Ok(());
         }
@@ -3649,7 +3910,6 @@ impl ZeroVM {
 
         if self.call_stack.is_empty() {
             self.stack.push(return_value);
-            self.track_stack_top();
             self.state = ExecutionState::Completed;
             return Ok(());
         }
@@ -3668,7 +3928,6 @@ impl ZeroVM {
             self.finish_task(tid, &return_value)?;
         } else {
             self.stack.push(return_value);
-            self.track_stack_top();
         }
 
         Ok(())
@@ -3698,7 +3957,6 @@ impl ZeroVM {
                 if !already_has {
                     let value = self.execute_load_variable_deep(name)?;
                     let heap_val = value.heap_object_for_element(&mut self.heap);
-                    self.add_live_ref(heap_val.clone());
                     self.heap
                         .set_env_binding(&shared, name.clone(), heap_val, *is_const)
                         .map_err(|_| {
@@ -3713,7 +3971,6 @@ impl ZeroVM {
             for (name, is_const) in captured {
                 let value = self.execute_load_variable_deep(name)?;
                 let heap_val = value.heap_object_for_element(&mut self.heap);
-                self.add_live_ref(heap_val.clone());
                 env_bindings.push(EnvBinding {
                     name: name.clone(),
                     value: heap_val,
@@ -3722,7 +3979,6 @@ impl ZeroVM {
             }
             let new_env = self.heap.allocate(HeapObject::Environment(env_bindings));
             self.gc.on_allocation();
-            self.add_live_ref(new_env.clone());
             // Store in current frame's scope_env for reuse by other closures
             if let Some(frame) = self.call_stack.last_mut() {
                 frame.scope_env = Some(new_env.clone());
@@ -3744,7 +4000,6 @@ impl ZeroVM {
         };
 
         self.stack.push(closure);
-        self.track_stack_top();
 
         Ok(())
     }
@@ -3845,7 +4100,6 @@ impl ZeroVM {
 
         if let Some(value) = found {
             self.stack.push(value);
-            self.track_stack_top();
             return Ok(());
         }
 
@@ -3900,7 +4154,6 @@ impl ZeroVM {
         value: Value,
     ) -> Result<(), VmError> {
         let heap_val = value.heap_object_for_element(&mut self.heap);
-        self.add_live_ref(heap_val.clone());
 
         // If storing into a const binding and value is a collection, mark const
         let is_const_binding = matches!(
@@ -3955,10 +4208,8 @@ impl ZeroVM {
 
         let list_ref = self.heap.allocate(HeapObject::list(items));
         self.gc.on_allocation();
-        self.add_live_ref(list_ref.clone());
 
         self.stack.push(Value::List(list_ref));
-        self.maybe_gc();
         Ok(())
     }
 
@@ -3987,10 +4238,8 @@ impl ZeroVM {
 
         let obj_ref = self.heap.allocate(HeapObject::object(props));
         self.gc.on_allocation();
-        self.add_live_ref(obj_ref.clone());
 
         self.stack.push(Value::Object(obj_ref));
-        self.maybe_gc();
         Ok(())
     }
 
@@ -4020,7 +4269,6 @@ impl ZeroVM {
                         let value = Value::from_heap_ref(&elem, &self.heap)
                             .map_err(|_| VmError::RuntimeError("Failed to convert element".to_string()))?;
                         self.stack.push(value);
-                        self.track_stack_top();
                         Ok(())
                     }
                     _ => Err(VmError::RuntimeError(
@@ -4039,7 +4287,6 @@ impl ZeroVM {
                 }
                 let ch = s.chars().nth(idx).unwrap();
                 self.stack.push(Value::Str(ch.to_string()));
-                self.track_stack_top();
                 Ok(())
             }
             (Value::Object(obj_ref), Value::Str(key)) => match self.heap.get(obj_ref) {
@@ -4050,7 +4297,6 @@ impl ZeroVM {
                                 VmError::RuntimeError("Failed to convert property".to_string())
                             })?;
                             self.stack.push(value);
-                            self.track_stack_top();
                             return Ok(());
                         }
                     }
@@ -4083,12 +4329,7 @@ impl ZeroVM {
                 }
                 let heap_val = value.heap_object_for_element(&mut self.heap);
                 match self.heap.get_mut(list_ref) {
-                    Ok(HeapObject::List { items, is_const }) => {
-                        if *is_const {
-                            return Err(VmError::RuntimeError(
-                                "Cannot modify const list".to_string(),
-                            ));
-                        }
+                    Ok(HeapObject::List { items, .. }) => {
                         if idx >= items.len() {
                             return Err(VmError::RuntimeError(format!(
                                 "List index {} out of bounds (length {})",
@@ -4110,12 +4351,7 @@ impl ZeroVM {
             (Value::Object(obj_ref), Value::Str(key)) => {
                 let heap_val = value.heap_object_for_element(&mut self.heap);
                 match self.heap.get_mut(obj_ref) {
-                    Ok(HeapObject::Object { props, is_const }) => {
-                        if *is_const {
-                            return Err(VmError::RuntimeError(
-                                "Cannot modify const object".to_string(),
-                            ));
-                        }
+                    Ok(HeapObject::Object { props, .. }) => {
                         let mut found = false;
                         for (k, v) in props.iter_mut() {
                             if k == key {
@@ -4159,7 +4395,6 @@ impl ZeroVM {
                                 VmError::RuntimeError("Failed to convert property".to_string())
                             })?;
                             self.stack.push(value);
-                            self.track_stack_top();
                             return Ok(());
                         }
                     }
@@ -4204,12 +4439,7 @@ impl ZeroVM {
             Value::Object(obj_ref) => {
                 let heap_val = value.heap_object_for_element(&mut self.heap);
                 match self.heap.get_mut(obj_ref) {
-                    Ok(HeapObject::Object { props, is_const }) => {
-                        if *is_const {
-                            return Err(VmError::RuntimeError(
-                                "Cannot modify const object".to_string(),
-                            ));
-                        }
+                    Ok(HeapObject::Object { props, .. }) => {
                         let mut found = false;
                         for (k, v) in props.iter_mut() {
                             if k == name {
@@ -4268,6 +4498,71 @@ pub fn run_bytecode(program: BytecodeProgram) -> Result<Vec<String>, VmError> {
     let mut vm = ZeroVM::new(program);
     vm.run()?;
     Ok(vm.get_output().to_vec())
+}
+
+/// Message prefixes that identify an operand/operator type mismatch.
+const TYPE_ERROR_PREFIXES: &[&str] = &[
+    "Cannot access property",
+    "Cannot add",
+    "Cannot apply",
+    "Cannot call",
+    "Cannot compare",
+    "Cannot divide",
+    "Cannot index",
+    "Cannot modulo",
+    "Cannot multiply",
+    "Cannot negate",
+    "Cannot power",
+    "Cannot set index",
+    "Cannot set property",
+    "Cannot stringify",
+    "Cannot subtract",
+];
+
+/// ISSUES §59a: category reported in `e.type` of a caught error object.
+/// Categories follow the examples in Runtime.md §154 ("jenis kegagalan dapat
+/// dibedakan secara konsisten"); a message with no unambiguous category falls
+/// back to "RuntimeError".
+fn classify_runtime_error(msg: &str) -> &'static str {
+    if msg.starts_with("Invalid JSON:") {
+        return "SyntaxError";
+    }
+    if msg.contains("out of bounds") || msg.starts_with("Index error") {
+        return "IndexError";
+    }
+    if msg.starts_with("Key error")
+        || (msg.starts_with("Key '") && msg.contains("not found"))
+        || (msg.starts_with("Property '") && msg.contains("not found"))
+    {
+        return "KeyError";
+    }
+    if msg.contains("Division by zero") || msg.contains("Modulo by zero") {
+        return "DivisionError";
+    }
+    if msg.contains("Undefined variable") {
+        return "ReferenceError";
+    }
+    if msg.contains("cancelled") {
+        return "CancellationError";
+    }
+    if msg.contains("expects at least")
+        || msg.contains("expects exactly")
+        || (msg.starts_with("Expected ") && msg.contains("arguments"))
+    {
+        return "ArgumentError";
+    }
+    if msg.starts_with("Type error")
+        || msg.starts_with("bad type")
+        || msg.starts_with("Expected ")
+        || msg.contains("Invalid conversion")
+        || msg.contains("Conditional jump requires")
+        || msg.contains("expects a ")
+        || msg.contains(" must be ")
+        || TYPE_ERROR_PREFIXES.iter().any(|prefix| msg.starts_with(prefix))
+    {
+        return "TypeError";
+    }
+    "RuntimeError"
 }
 
 fn type_name(value: &Value, _heap: &Heap) -> &'static str {
@@ -4598,6 +4893,24 @@ mod tests {
     fn run_source(source: &str) -> Result<Vec<String>, VmError> {
         let bc = compile_source(source);
         run_bytecode(bc)
+    }
+
+    /// Job 020 helper: run `source` with a GC threshold so collection
+    /// actually fires at instruction boundaries. Returns
+    /// (output, collections run, objects left on the heap).
+    fn run_source_with_gc_pressure(
+        source: &str,
+        threshold: usize,
+    ) -> Result<(Vec<String>, usize, usize), VmError> {
+        let bc = compile_source(source);
+        let mut vm = ZeroVM::new(bc);
+        vm.gc = Gc::new(threshold);
+        vm.run()?;
+        Ok((
+            vm.get_output().to_vec(),
+            vm.gc.stats().collections,
+            vm.heap.count(),
+        ))
     }
 
     #[test]
@@ -6614,6 +6927,352 @@ mod tests {
         assert_eq!(output, vec!["30"]);
     }
 
+    // ===== Job 020: GC root coverage per §121/§131 =====
+    //
+    // Threshold 0 = collect at every instruction boundary, so every test
+    // below is a survival check for one root source of §121.
+
+    /// §121 roots "local variables pada Execution Frame yang aktif" and
+    /// "parameter fungsi": frame locals and parameters survive collection.
+    #[test]
+    fn test_job020_params_and_frame_locals_survive_gc() {
+        let (out, collections, _) = run_source_with_gc_pressure(
+            "function compute(a, b) {\n    let locals = [a, b]\n    let scratch = [1, 2, 3]\n    let more = [4, 5, 6]\n    return locals[0] + locals[1]\n}\nprint(compute(7, 8))",
+            0,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["15"]);
+        assert!(collections > 0, "GC must actually run during execution");
+    }
+
+    /// §121 root "nilai pada Value Stack": the callee waits on the stack
+    /// while the argument expression allocates under collection pressure.
+    #[test]
+    fn test_job020_value_stack_survives_gc() {
+        let (out, _, _) = run_source_with_gc_pressure(
+            "function id(x) { return x }\nfunction make() { let t = [5, 6]\nreturn t }\nprint(id(make())[0])",
+            0,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["5"]);
+    }
+
+    /// §121 root "global bindings".
+    #[test]
+    fn test_job020_global_bindings_survive_gc() {
+        let (out, _, _) = run_source_with_gc_pressure(
+            "let config = [1, 2, 3]\nlet junk1 = [9, 9]\nlet junk2 = [8, 8]\nprint(config[2])",
+            0,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["3"]);
+    }
+
+    /// §121 roots: an outer scope binding stays alive while a nested
+    /// block allocates, and again after the block scope is popped.
+    #[test]
+    fn test_job020_scope_stack_survives_gc() {
+        let (out, _, _) = run_source_with_gc_pressure(
+            "let outer = [7]\nif true {\n    let inner = [1, 2]\n    let other = [3, 4]\n    print(inner[1])\n}\nprint(outer[0])",
+            0,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["2", "7"]);
+    }
+
+    /// §131 "closure environment": the captured env outlives the frame
+    /// that created it, under collection pressure.
+    #[test]
+    fn test_job020_closure_env_survives_gc() {
+        let (out, _, _) = run_source_with_gc_pressure(
+            "function make() {\n    let n = 41\n    return function() { return n + 1 }\n}\nlet c = make()\nlet junk = [1, 2, 3]\nprint(c())",
+            0,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["42"]);
+    }
+
+    /// §121 root "task yang masih berjalan": a suspended task's saved
+    /// context (frame locals) survives while other code allocates.
+    #[test]
+    fn test_job020_suspended_task_context_survives_gc() {
+        let (out, _, _) = run_source_with_gc_pressure(
+            "async function worker() {\n    let mine = [42]\n    await task.sleep(1)\n    print(mine[0])\n}\nasync function main() {\n    let t = worker()\n    let junk = [1, 2]\n    await t\n}\nmain()",
+            0,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["42"]);
+    }
+
+    /// §107/§121: a completed task's stored heap result stays valid until
+    /// awaited, across a collection storm in between.
+    #[test]
+    fn test_job020_completed_task_result_survives_gc() {
+        let (out, _, _) = run_source_with_gc_pressure(
+            "async function quick() {\n    let v = [77, 88]\n    return v\n}\nasync function main() {\n    let t = quick()\n    await task.sleep(1)\n    let junk = [1, 2, 3]\n    print((await t)[1])\n}\nmain()",
+            0,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["88"]);
+    }
+
+    /// §131 root updates: a binding stops being a root the moment its
+    /// scope is popped — "runtime harus memperbarui reference ... ketika
+    /// binding ... dihentikan".
+    #[test]
+    fn test_job020_popped_scope_binding_is_reclaimable() {
+        let mut vm = ZeroVM::new(BytecodeProgram {
+            header: BytecodeHeader::current(),
+            entry_point: 0,
+            constants: vec![],
+            instructions: vec![],
+            functions: vec![],
+            function_bodies: vec![],
+        });
+        let r = vm.heap.allocate(HeapObject::list(vec![]));
+        let mut scope = HashMap::new();
+        scope.insert(
+            "x".to_string(),
+            Binding::new(Value::List(r.clone()), false, true),
+        );
+        vm.call_stack.push(Frame {
+            function_index: 0,
+            scopes: vec![scope],
+            return_pc: 0,
+            captured_env: None,
+            scope_env: None,
+            return_instructions: None,
+            task_id: None,
+        });
+
+        vm.run_gc();
+        assert!(vm.heap.is_valid(&r), "binding in scope must stay rooted");
+
+        vm.call_stack.last_mut().unwrap().scopes.pop();
+        vm.run_gc();
+        assert!(!vm.heap.is_valid(&r), "popped scope must release its root");
+    }
+
+    /// §121: unreachable temporaries created during real execution are
+    /// actually reclaimed while the program keeps running.
+    #[test]
+    fn test_job020_unreachable_temps_reclaimed_during_execution() {
+        let (out, collections, heap_count) = run_source_with_gc_pressure(
+            "let keep = [1, 2, 3]\nlet i = 0\nwhile i < 50 {\n    let t = [i, i]\n    i = i + 1\n}\nprint(keep[0])",
+            8,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["1"]);
+        assert!(
+            collections >= 5,
+            "expected repeated collections, got {}",
+            collections
+        );
+        // keep list + its 3 elements + at most one threshold-window of
+        // uncollected temporaries. Without reclamation this would be 150+.
+        assert!(
+            heap_count <= 16,
+            "heap must not retain loop temporaries, count={}",
+            heap_count
+        );
+    }
+
+    /// The catchable-error path builds its error object mid-instruction;
+    /// it must survive the boundary collections before the handler reads
+    /// e.message.
+    #[test]
+    fn test_job020_error_object_survives_gc_pressure() {
+        let (out, _, _) = run_source_with_gc_pressure(
+            "try {\n    let l = [1, 2]\n    let x = l[9]\n    print(\"no error\")\n} catch e {\n    print(\"caught\")\n    print(e.message)\n}",
+            0,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2, "{:?}", out);
+        assert_eq!(out[0], "caught");
+        assert!(out[1].contains("out of bounds"), "{}", out[1]);
+    }
+
+    /// Native string operations allocate heap strings between boundaries
+    /// (§145 native-call boundary under GC pressure).
+    #[test]
+    fn test_job020_native_string_path_survives_gc_pressure() {
+        let (out, collections, _) = run_source_with_gc_pressure(
+            "let a = \"hello \"\nlet b = a + \"world\"\nlet c = b + \"!\"\nprint(c)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["hello world!"]);
+        assert!(collections > 0);
+    }
+
+    /// §121 "module bindings yang masih aktif": an exported list held in
+    /// run_modules' Rust-side export cache (a genuine runtime pin) and in
+    /// the importing module's scope survives collection during module
+    /// evaluation.
+    #[test]
+    fn test_job020_module_bindings_survive_gc_pressure() {
+        fn parse_program(source: &str) -> crate::ast::Program {
+            let mut lexer = Lexer::new(source);
+            let tokens = lexer.tokenize().unwrap();
+            let mut parser = Parser::new(tokens);
+            parser.parse().unwrap()
+        }
+
+        let a = crate::compiler::compile_module(
+            "./a.zs",
+            &parse_program("let shared = [1, 2, 3]\nexport { shared }"),
+        )
+        .unwrap();
+        let a_len = a.instructions.len();
+        let b = crate::compiler::compile_module(
+            "./b.zs",
+            &parse_program(
+                "import { shared } from \"./a\"\nlet junk = [9, 9]\nlet junk2 = [8, 8]\nprint(shared[1])",
+            ),
+        )
+        .unwrap();
+        let b_len = b.instructions.len();
+
+        let merged = crate::compiler::merge_modules(&[a, b]);
+        let modules = vec![
+            crate::module::ModuleMeta {
+                path: "./a.zs".to_string(),
+                start: 0,
+                end: a_len,
+                exports: vec!["shared".to_string()],
+                imports: vec![],
+                re_exports: vec![],
+            },
+            crate::module::ModuleMeta {
+                path: "./b.zs".to_string(),
+                start: a_len,
+                end: a_len + b_len,
+                exports: vec![],
+                imports: vec![(
+                    "shared".to_string(),
+                    "./a.zs".to_string(),
+                    "shared".to_string(),
+                )],
+                re_exports: vec![],
+            },
+        ];
+
+        let mut vm = ZeroVM::new(merged);
+        vm.gc = Gc::new(0);
+        vm.run_modules(&modules).unwrap();
+        assert_eq!(vm.get_output(), &["2"]);
+    }
+
+    // ===== Job 021: closure in data structures shares its environment
+    // (ZeroVM.md §130, Language.md §31/§35) =====
+
+    /// Storage into a list keeps env identity: a mutation through the
+    /// boxed copy is visible to the original closure, and a mutation
+    /// through the original is visible to the boxed copy.
+    #[test]
+    fn test_job021_closure_in_list_shares_env() {
+        let source = "function make() {\n    let n = 0\n    function bump() { n += 1\n    return n }\n    let holder = [bump]\n    print(holder[0]())\n    print(bump())\n    print(holder[0]())\n}\nmake()";
+        let output = run_source(source).unwrap();
+        assert_eq!(output, vec!["1", "2", "3"]);
+    }
+
+    /// Object-literal storage path (execute_make_object).
+    #[test]
+    fn test_job021_closure_in_object_literal_shares_env() {
+        let source = "function make() {\n    let n = 0\n    function bump() { n += 1\n    return n }\n    let obj = { f: bump }\n    print(obj.f())\n    print(bump())\n}\nmake()";
+        let output = run_source(source).unwrap();
+        assert_eq!(output, vec!["1", "2"]);
+    }
+
+    /// set_property storage path (obj.f = bump).
+    #[test]
+    fn test_job021_closure_set_property_shares_env() {
+        let source = "function make() {\n    let n = 0\n    function bump() { n += 1\n    return n }\n    let obj = {}\n    obj.f = bump\n    print(obj.f())\n    print(bump())\n}\nmake()";
+        let output = run_source(source).unwrap();
+        assert_eq!(output, vec!["1", "2"]);
+    }
+
+    /// list.add storage path.
+    #[test]
+    fn test_job021_closure_list_add_shares_env() {
+        let source = "function make() {\n    let n = 0\n    function bump() { n += 1\n    return n }\n    let items = []\n    list.add(items, bump)\n    print(items[0]())\n    print(bump())\n}\nmake()";
+        let output = run_source(source).unwrap();
+        assert_eq!(output, vec!["1", "2"]);
+    }
+
+    /// store_in_env path: a closure assigned to a captured variable is
+    /// read back through the heap environment by a sibling closure, and
+    /// its mutations reach the original closure (§130 shared environment).
+    #[test]
+    fn test_job021_closure_stored_into_env_shares() {
+        let source = "function make() {\n    let n = 0\n    function bump() { n += 1\n    return n }\n    let pick = null\n    function setPick() { pick = bump }\n    function getP() { return pick() }\n    setPick()\n    print(getP())\n    print(bump())\n}\nmake()";
+        let output = run_source(source).unwrap();
+        assert_eq!(output, vec!["1", "2"]);
+    }
+
+    /// execute_make_closure populate/new-env path: a captured variable
+    /// holding a closure is boxed into the new environment — the boxed
+    /// copy must keep the original env (closure captures closure).
+    #[test]
+    fn test_job021_closure_captured_in_new_env_shares() {
+        let source = "function make() {\n    let n = 0\n    function bump() { n += 1\n    return n }\n    function wrapper() {\n        function twice() { bump()\n            bump() }\n        return twice\n    }\n    let w = wrapper()\n    w()\n    print(bump())\n}\nmake()";
+        let output = run_source(source).unwrap();
+        assert_eq!(output, vec!["3"]);
+    }
+
+    /// Job 020 Scope D verification: a closure boxed inside a list
+    /// survives threshold-0 collections (child_refs through List →
+    /// Closure → env) and still shares its environment afterwards.
+    #[test]
+    fn test_job021_closure_in_list_survives_gc_pressure() {
+        let (out, collections, _) = run_source_with_gc_pressure(
+            "function make() {\n    let n = 0\n    function bump() { n += 1\n    return n }\n    let holder = [bump]\n    let i = 0\n    while i < 5 {\n        let junk = [i, i + 1]\n        i = i + 1\n    }\n    print(holder[0]())\n    print(bump())\n    print(holder[0]())\n}\nmake()",
+            0,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["1", "2", "3"]);
+        assert!(collections > 0, "expected collections under threshold 0");
+    }
+
+    /// Scope E3 (§130): sibling closures from the same scope keep
+    /// observing each other after one of them is stored in a list.
+    #[test]
+    fn test_job021_siblings_share_via_stored_closure() {
+        let source = "function make() {\n    let n = 0\n    function bump() { n += 1\n    return n }\n    function read() { return n }\n    let holder = [bump]\n    holder[0]()\n    print(read())\n    bump()\n    print(holder[0]())\n}\nmake()";
+        let output = run_source(source).unwrap();
+        assert_eq!(output, vec!["1", "3"]);
+    }
+
+    /// Scope C round-trip: Value → RuntimeValue → Value preserves env
+    /// identity and allocates only the Closure (no cloned Environment).
+    #[test]
+    fn test_job021_to_runtime_value_roundtrip_preserves_env() {
+        let bc = compile_source("function noop() { return 1 }\nnoop()");
+        let mut vm = ZeroVM::new(bc);
+        let num = vm.heap.allocate(HeapObject::Number(7.0));
+        let env = vm.heap.allocate(HeapObject::Environment(vec![EnvBinding {
+            name: "n".to_string(),
+            value: num,
+            is_const: false,
+        }]));
+        let closure = Value::Closure {
+            function_index: 0,
+            env: env.clone(),
+            param_defaults: vec![],
+        };
+        let before = vm.heap.count();
+        let rv = closure.to_runtime_value(&mut vm.heap);
+        assert_eq!(
+            vm.heap.count(),
+            before + 1,
+            "boxing must allocate only the Closure, not a cloned Environment"
+        );
+        match Value::from_runtime_value(&rv, &vm.heap).unwrap() {
+            Value::Closure { env: env_back, .. } => assert_eq!(env_back, env),
+            other => panic!("expected closure round-trip, got {:?}", other),
+        }
+    }
+
     // ===== Closure tests =====
 
     #[test]
@@ -7078,33 +7737,45 @@ mod tests {
     }
 
     #[test]
-    fn test_job008_const_list_element_mutation_error() {
-        let err = run_source("const A = [10, 20]\nA[0] = 30").unwrap_err();
-        assert!(
-            err.to_string().contains("Cannot modify const list"),
-            "{}",
-            err
-        );
+    fn test_job008_const_list_element_mutation_allowed() {
+        // ISSUES §58b: const is a binding rule, not a heap-object rule.
+        let output = run_source("const A = [10, 20]\nA[0] = 30\nprint(A)").unwrap();
+        assert_eq!(output, vec!["[30, 20]"]);
     }
 
     #[test]
-    fn test_job008_const_object_property_mutation_existing_key_error() {
-        let err = run_source("const user = { name: \"Kael\" }\nuser.name = \"Budi\"").unwrap_err();
-        assert!(
-            err.to_string().contains("Cannot modify const object"),
-            "{}",
-            err
-        );
+    fn test_job008_const_alias_does_not_freeze_object() {
+        // ISSUES §58b: `const C = A` does not freeze A's object.
+        let output =
+            run_source("let A = [1, 2]\nconst C = A\nA[0] = 9\nC[1] = 8\nprint(A)").unwrap();
+        assert_eq!(output, vec!["[9, 8]"]);
     }
 
     #[test]
-    fn test_job008_const_object_property_mutation_new_key_error() {
-        let err = run_source("const user = { name: \"Kael\" }\nuser.age = 18").unwrap_err();
-        assert!(
-            err.to_string().contains("Cannot modify const object"),
-            "{}",
-            err
-        );
+    fn test_job008_const_returned_collection_stored_in_let_mutable() {
+        // ISSUES §58b: a collection returned from a const binding stays mutable
+        // once the result is stored in `let`.
+        let output = run_source(
+            "function make() {\n    const A = [1, 2]\n    return A\n}\nlet B = make()\nB[0] = 9\nprint(B)",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["[9, 2]"]);
+    }
+
+    #[test]
+    fn test_job008_const_object_property_mutation_existing_key_allowed() {
+        // ISSUES §58b: const does not freeze the object.
+        let output =
+            run_source("const user = { name: \"Kael\" }\nuser.name = \"Budi\"\nprint(user.name)")
+                .unwrap();
+        assert_eq!(output, vec!["Budi"]);
+    }
+
+    #[test]
+    fn test_job008_const_object_property_mutation_new_key_allowed() {
+        let output =
+            run_source("const user = { name: \"Kael\" }\nuser.age = 18\nprint(user.age)").unwrap();
+        assert_eq!(output, vec!["18"]);
     }
 
     #[test]
@@ -7263,6 +7934,260 @@ mod tests {
     fn test_job008_shared_reference_via_raw_eq() {
         let output = run_source("let A = [1]\nlet B = A\nprint(A === B)").unwrap();
         assert_eq!(output, vec!["true"]);
+    }
+
+    // ---- ISSUES §59a: caught error `e` is an object ----
+
+    #[test]
+    fn test_job059a_catch_e_is_object() {
+        let output = run_source(
+            "try {\n    let A = [10]\n    print(A[99])\n} catch e {\n    print(type(e))\n}",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["object"]);
+    }
+
+    #[test]
+    fn test_job059a_e_fields_type_message_location() {
+        let output = run_source(
+            "try {\n    let A = [10]\n    print(A[99])\n} catch e {\n    print(e.type)\n    print(e.message)\n    print(e.location)\n}",
+        )
+        .unwrap();
+        assert_eq!(output.len(), 3, "{:?}", output);
+        assert_eq!(output[0], "IndexError");
+        assert!(output[1].contains("out of bounds"), "{}", output[1]);
+        // No source position is tracked for runtime errors (§154) → null.
+        assert_eq!(output[2], "null");
+    }
+
+    #[test]
+    fn test_job059a_string_e_returns_message() {
+        let output = run_source(
+            "try {\n    let A = [10]\n    print(A[99])\n} catch e {\n    print(string(e))\n    print(e.message)\n}",
+        )
+        .unwrap();
+        assert_eq!(output.len(), 2, "{:?}", output);
+        assert_eq!(output[0], output[1]);
+        assert!(output[0].contains("out of bounds"), "{}", output[0]);
+    }
+
+    #[test]
+    fn test_job059a_print_err_e_stays_human_readable() {
+        let vm = run_vm(
+            "try {\n    let A = [10]\n    print(A[99])\n} catch e {\n    print.err(e)\n}",
+        )
+        .unwrap();
+        let err = vm.get_error_output();
+        assert_eq!(err.len(), 1);
+        assert!(err[0].contains("out of bounds"), "{}", err[0]);
+        assert!(
+            !err[0].contains('{'),
+            "print.err prints the message, not the object dump: {}",
+            err[0]
+        );
+    }
+
+    #[test]
+    fn test_job059a_print_e_shows_object() {
+        let output = run_source(
+            "try {\n    let A = [10]\n    print(A[99])\n} catch e {\n    print(e)\n}",
+        )
+        .unwrap();
+        assert_eq!(output.len(), 1);
+        assert!(output[0].starts_with("{type: IndexError"), "{}", output[0]);
+        assert!(output[0].contains("location: null"), "{}", output[0]);
+    }
+
+    #[test]
+    fn test_job059a_json_parse_failure_is_syntax_error() {
+        let output = run_source(
+            "try {\n    json.parse(\"{invalid json\")\n} catch e {\n    print(e.type)\n    print(e.message)\n}",
+        )
+        .unwrap();
+        assert_eq!(output[0], "SyntaxError", "{:?}", output);
+        assert!(output[1].contains("Invalid JSON"), "{}", output[1]);
+    }
+
+    #[test]
+    fn test_job059a_type_error_category() {
+        let output = run_source("try {\n    print(1 + \"x\")\n} catch e {\n    print(e.type)\n}")
+            .unwrap();
+        assert_eq!(output, vec!["TypeError"]);
+        let output =
+            run_source("try {\n    print(number(\"hello\"))\n} catch e {\n    print(e.type)\n}")
+                .unwrap();
+        assert_eq!(output, vec!["TypeError"]);
+    }
+
+    #[test]
+    fn test_job059a_division_by_zero_category() {
+        let output = run_source("try {\n    print(10 / 0)\n} catch e {\n    print(e.type)\n}")
+            .unwrap();
+        assert_eq!(output, vec!["DivisionError"]);
+    }
+
+    #[test]
+    fn test_job059a_key_error_category() {
+        let output =
+            run_source("try {\n    let O = { a: 1 }\n    print(O.b)\n} catch e {\n    print(e.type)\n}")
+                .unwrap();
+        assert_eq!(output, vec!["KeyError"]);
+    }
+
+    #[test]
+    fn test_job059a_syntax_error_not_catchable() {
+        // Parse/syntax errors happen before execution → uncatchable (§43).
+        let err = parse_try("try {\n    let = 1\n} catch e {\n    print(\"caught\")\n}").unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn test_job059a_string_plain_object_still_errors() {
+        // §54/§59c: string() on a non-error object stays a conversion error.
+        let err = run_source("print(string({ a: 1 }))").unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid conversion to string"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_job059a_plain_object_with_error_fields_is_not_error() {
+        // Regression: identity of an error object is internal (ISSUES §59a) —
+        // a plain object that happens to carry type/message/location stays an
+        // ordinary object for string() and print.err().
+        let err = run_source(
+            "print(string({ type: \"CustomError\", message: \"boom\", location: null }))",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid conversion to string"),
+            "{}",
+            err
+        );
+
+        let vm = run_vm("print.err({ type: \"CustomError\", message: \"boom\", location: null })")
+            .unwrap();
+        let out = vm.get_error_output();
+        assert_eq!(out.len(), 1, "{:?}", out);
+        assert!(out[0].starts_with("{type: CustomError"), "{}", out[0]);
+        assert!(out[0].contains("message: boom"), "{}", out[0]);
+    }
+
+    // ---- ISSUES §59d: finally on break/continue early exit ----
+
+    #[test]
+    fn test_job059d_break_runs_finally() {
+        let output = run_source(
+            "while true {\n    try {\n        print(\"body\")\n        break\n    } finally {\n        print(\"fin\")\n    }\n}\nprint(\"after\")",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["body", "fin", "after"]);
+    }
+
+    #[test]
+    fn test_job059d_continue_runs_finally() {
+        let output = run_source(
+            "let i = 0\nwhile i < 3 {\n    i += 1\n    try {\n        if i == 2 { continue }\n    } finally {\n        print(\"fin\")\n    }\n    print(string(i))\n}\nprint(\"done\")",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["fin", "1", "fin", "fin", "3", "done"]);
+    }
+
+    #[test]
+    fn test_job059d_break_nested_finally_innermost_first() {
+        let output = run_source(
+            "while true {\n    try {\n        try {\n            print(\"body\")\n            break\n        } finally {\n            print(\"inner\")\n        }\n    } finally {\n        print(\"outer\")\n    }\n}\nprint(\"after\")",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["body", "inner", "outer", "after"]);
+    }
+
+    #[test]
+    fn test_job059d_continue_nested_finally_innermost_first() {
+        let output = run_source(
+            "let i = 0\nwhile i < 2 {\n    i += 1\n    try {\n        try {\n            continue\n        } finally {\n            print(\"in\")\n        }\n    } finally {\n        print(\"out\")\n    }\n}\nprint(\"done\")",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["in", "out", "in", "out", "done"]);
+    }
+
+    #[test]
+    fn test_job059d_break_inside_finally_body() {
+        // Break inside a finally body discards that finally's own marker and
+        // leaves the loop; no other finally is crossed.
+        let output = run_source(
+            "while true {\n    try {\n        print(\"body\")\n    } finally {\n        print(\"fin\")\n        break\n    }\n}\nprint(\"after\")",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["body", "fin", "after"]);
+    }
+
+    #[test]
+    fn test_job059d_break_runs_finally_in_infinite_loop_stmt() {
+        let output = run_source(
+            "loop {\n    try {\n        break\n    } finally {\n        print(\"fin\")\n    }\n}\nprint(\"after\")",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["fin", "after"]);
+    }
+
+    #[test]
+    fn test_job059d_break_pops_catch_only_handler() {
+        // Crossing a try with catch but no finally must pop its handler —
+        // a stale handler would route the later index error into the loop's
+        // own catch instead of the outer one.
+        let output = run_source(
+            "try {\n    while true {\n        try {\n            break\n        } catch e {\n            print(\"stale\")\n        }\n    }\n    let A = [10]\n    print(A[99])\n} catch e {\n    print(\"outer\")\n}",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["outer"]);
+    }
+
+    #[test]
+    fn test_job059d_error_in_finally_during_break_chain_catches_outer() {
+        // An error inside a chain finally abandons the remaining chain
+        // markers (stack truncation) and propagates to the enclosing handler.
+        let output = run_source(
+            "try {\n    while true {\n        try {\n            break\n        } finally {\n            let A = [10]\n            print(A[99])\n        }\n    }\n} catch e {\n    print(\"caught\")\n}\nprint(\"after\")",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["caught", "after"]);
+    }
+
+    #[test]
+    fn test_job059d_break_in_try_inside_function() {
+        // Function bodies run on their own instruction stream; chain targets
+        // must stay body-relative.
+        let output = run_source(
+            "function f() {\n    while true {\n        try {\n            print(\"b\")\n            break\n        } finally {\n            print(\"f\")\n        }\n    }\n    return 7\n}\nprint(f())",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["b", "f", "7"]);
+    }
+
+    #[test]
+    fn test_job059d_return_from_finally_supersedes_break_chain() {
+        // return inside the first chain finally replaces the chain: the outer
+        // finally still runs (§43 return-through-finally), then the function
+        // returns.
+        let output = run_source(
+            "function f() {\n    while true {\n        try {\n            try {\n                break\n            } finally {\n                print(\"inner\")\n                return 1\n            }\n        } finally {\n            print(\"outer\")\n        }\n    }\n    return 2\n}\nprint(f())",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["inner", "outer", "1"]);
+    }
+
+    #[test]
+    fn test_job059d_break_unwinds_try_scope_before_finally() {
+        // The try body's scope is unwound before the finally runs, so the
+        // finally sees the shadowing outer binding — same as the normal path.
+        let output = run_source(
+            "let x = \"outer\"\nwhile true {\n    try {\n        let x = \"inner\"\n        break\n    } finally {\n        print(x)\n    }\n}\nprint(x)",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["outer", "outer"]);
     }
 
     // ---- Job 010: string.* ----
@@ -7478,9 +8403,9 @@ print(A)"#,
     }
 
     #[test]
-    fn test_job010_list_add_const_error() {
-        let err = run_source("const A = [10]\nlist.add(A, 20)").unwrap_err();
-        assert!(err.to_string().contains("const"), "{}", err);
+    fn test_job010_list_add_const_allowed() {
+        let output = run_source("const A = [10]\nlist.add(A, 20)\nprint(A)").unwrap();
+        assert_eq!(output, vec!["[10, 20]"]);
     }
 
     #[test]
@@ -7501,9 +8426,9 @@ print(A)"#,
     }
 
     #[test]
-    fn test_job010_list_remove_const_error() {
-        let err = run_source("const A = [10, 20]\nlist.remove(A, 0)").unwrap_err();
-        assert!(err.to_string().contains("const"), "{}", err);
+    fn test_job010_list_remove_const_allowed() {
+        let output = run_source("const A = [10, 20]\nlist.remove(A, 0)\nprint(A)").unwrap();
+        assert_eq!(output, vec!["[20]"]);
     }
 
     #[test]
@@ -7546,25 +8471,26 @@ print(X)"#,
     }
 
     #[test]
-    fn test_job010_list_const_mutation_via_function_error() {
-        // §35: if source is const, mutation through function also errors
-        let err = run_source(
+    fn test_job010_list_const_mutation_via_function_allowed() {
+        // §35 (revised by ISSUES §58b): const is a binding rule, so mutation
+        // through a function is allowed even when the source is a const binding.
+        let output = run_source(
             r#"function tambah(A) {
     list.add(A, 40)
 }
 const X = [10]
-tambah(X)"#,
+tambah(X)
+print(X)"#,
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("const"), "{}", err);
+        .unwrap();
+        assert_eq!(output, vec!["[10, 40]"]);
     }
 
     #[test]
     fn test_job010_list_add_catchable() {
         let output = run_source(
             r#"try {
-    const A = [10]
-    list.add(A, 20)
+    list.add("not a list", 20)
 } catch e {
     print("caught")
 }
@@ -7603,11 +8529,12 @@ object.remove(o, "missing")"#)
     }
 
     #[test]
-    fn test_job010_object_remove_const_error() {
-        let err = run_source(r#"const o = { a: 1 }
-object.remove(o, "a")"#)
-            .unwrap_err();
-        assert!(err.to_string().contains("const"), "{}", err);
+    fn test_job010_object_remove_const_allowed() {
+        let output = run_source(r#"const o = { a: 1, b: 2 }
+object.remove(o, "a")
+print(o)"#)
+            .unwrap();
+        assert_eq!(output, vec!["{b: 2}"]);
     }
 
     #[test]
@@ -7620,8 +8547,7 @@ object.remove(o, "a")"#)
     fn test_job010_object_remove_catchable() {
         let output = run_source(
             r#"try {
-    const o = { a: 1 }
-    object.remove(o, "a")
+    object.remove({ a: 1 }, "missing")
 } catch e {
     print("caught")
 }
@@ -7865,6 +8791,20 @@ print.err("Something went wrong")"#,
         assert_eq!(output, vec!["caught"]);
     }
 
+    /// ISSUES §61i: color accepts any single argument, rendered like print.
+    #[test]
+    fn test_issue61i_color_accepts_non_string_argument() {
+        let output = run_source(
+            r#"print(color.red(10))
+print(color.blue(true))
+print(color.green([1, 2]))"#,
+        )
+        .unwrap();
+        assert_eq!(output[0], "\x1b[31m10\x1b[39m");
+        assert_eq!(output[1], "\x1b[34mtrue\x1b[39m");
+        assert_eq!(output[2], "\x1b[32m[1, 2]\x1b[39m");
+    }
+
     // ---- Job 011: file.* (§48) ----
 
     fn temp_path(name: &str) -> String {
@@ -7945,6 +8885,45 @@ print(file.exists("{path}"))"#,
         let output = run_source(&src).unwrap();
         assert_eq!(output, vec!["true"]);
         cleanup(&path);
+    }
+
+    /// ISSUES §61b: side-effecting file mutators return null.
+    #[test]
+    fn test_issue61b_file_mutators_return_null() {
+        let dir = temp_path("ret61b");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = format!(
+            r#"let w = file.write("{dir}/a.txt", "x")
+let r = file.remove("{dir}/a.txt")
+let m = file.mkdir("{dir}/sub")
+print(w == null)
+print(r == null)
+print(m == null)"#,
+            dir = dir.replace('\\', "\\\\")
+        );
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["true", "true", "true"]);
+        cleanup(&dir);
+    }
+
+    /// ISSUES §61c: file.mkdir is single-level — missing parent → catchable error.
+    #[test]
+    fn test_issue61c_file_mkdir_missing_parent_is_error() {
+        let base = temp_path("mkdir61c");
+        let _ = std::fs::remove_dir_all(&base);
+        let src = format!(
+            r#"try {{
+    file.mkdir("{base}/child")
+    print("no-error")
+}} catch e {{
+    print("caught")
+}}"#,
+            base = base.replace('\\', "\\\\")
+        );
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["caught"]);
+        cleanup(&base);
     }
 
     #[test]
@@ -8141,6 +9120,54 @@ print(json.stringify(data))"#,
     fn test_job011_json_parse_returns_null_for_json_null() {
         let output = run_source(r#"print(json.parse("null") === null)"#).unwrap();
         assert_eq!(output, vec!["true"]);
+    }
+
+    /// ISSUES §61g: json.stringify accepts top-level scalars (roundtrip with json.parse).
+    #[test]
+    fn test_issue61g_json_stringify_top_level_scalars() {
+        let output = run_source(
+            r#"print(json.stringify(42))
+print(json.stringify("hi"))
+print(json.stringify(true))
+print(json.stringify(null))"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["42", "\"hi\"", "true", "null"]);
+    }
+
+    /// ISSUES §61g: function values and non-finite numbers are rejected with catchable errors.
+    #[test]
+    fn test_issue61g_json_stringify_rejects_function_and_non_finite() {
+        let output = run_source(
+            r#"function f() { return 1 }
+try {
+    json.stringify(f)
+    print("no-error")
+} catch e {
+    print("caught")
+}
+try {
+    json.stringify(number("1e400"))
+    print("no-error")
+} catch e {
+    print("caught")
+}"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["caught", "caught"]);
+    }
+
+    /// ISSUES §61h: duplicate keys — last value wins, first-seen key order preserved.
+    #[test]
+    fn test_issue61h_json_duplicate_keys_last_wins() {
+        let output = run_source(
+            r#"let v = json.parse("{\"a\": 1, \"b\": 9, \"a\": 2}")
+print(v.a)
+print(v.b)
+print(json.stringify(v))"#,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["2", "9", r#"{"a":2,"b":9}"#]);
     }
 
     // ---- Job 011: namespace integration ----
@@ -8432,6 +9459,114 @@ print("done")"#,
         assert_eq!(vm.get_output(), &["done".to_string(), "good".to_string()]);
         assert_eq!(vm.tasks[0].state, TaskState::Failed);
         assert_eq!(vm.tasks[1].state, TaskState::Completed);
+    }
+
+    /// §108 "Un-awaited Task Failure": one stderr warning naming the failed
+    /// task and its error, without touching stdout.
+    #[test]
+    fn test_job014_unawaited_failure_emits_warning() {
+        let vm = run_vm_source(
+            r#"async function bad() { return nosuchvar }
+let b = bad()
+print("done")"#,
+        );
+        assert_eq!(vm.get_output(), &["done".to_string()]);
+        let err = vm.get_error_output();
+        assert_eq!(err.len(), 1, "{:?}", err);
+        assert!(
+            err[0].starts_with("ZeroScript warning:"),
+            "unexpected warning: {}",
+            err[0]
+        );
+        assert!(err[0].contains("task \"bad\""), "{}", err[0]);
+        assert!(
+            err[0].contains("Undefined variable 'nosuchvar'"),
+            "{}",
+            err[0]
+        );
+    }
+
+    /// §108: exactly one warning per un-awaited failed task.
+    #[test]
+    fn test_job014_unawaited_failure_one_warning_per_task() {
+        let vm = run_vm_source(
+            r#"async function bad() { return nosuchvar }
+let a = bad()
+let b = bad()
+print("done")"#,
+        );
+        assert_eq!(vm.get_output(), &["done".to_string()]);
+        let err = vm.get_error_output();
+        assert_eq!(err.len(), 2, "{:?}", err);
+        assert!(err[0].contains("task \"bad\"") && err[1].contains("task \"bad\""));
+    }
+
+    /// §108: an awaited failure — even one caught by try/catch — produces no
+    /// warning; a failed task whose error was observed counts as handled.
+    #[test]
+    fn test_job014_awaited_failure_emits_no_warning() {
+        let vm = run_vm_source(
+            r#"async function bad() { return nosuchvar }
+async function main() {
+    try {
+        let r = await bad()
+        print(r)
+    } catch e {
+        print("caught")
+    }
+}
+main()"#,
+        );
+        assert_eq!(vm.get_output(), &["caught".to_string()]);
+        assert!(
+            vm.get_error_output().is_empty(),
+            "{:?}",
+            vm.get_error_output()
+        );
+    }
+
+    /// §108 + user option B (2026-10-02): a failure delivered through an
+    /// awaited task.all counts as observed — §108's own example emits no
+    /// warning even though the member task was never awaited directly.
+    #[test]
+    fn test_job014_task_all_observed_failure_emits_no_warning() {
+        let vm = run_vm_source(
+            r#"async function gagal() { return 10 / 0 }
+async function main() {
+    try {
+        let r = await task.all([gagal()])
+        print(r)
+    } catch e {
+        print("caught")
+    }
+}
+main()"#,
+        );
+        assert_eq!(vm.get_output(), &["caught".to_string()]);
+        assert!(
+            vm.get_error_output().is_empty(),
+            "{:?}",
+            vm.get_error_output()
+        );
+    }
+
+    /// §108: a program with no failed tasks emits no warnings.
+    #[test]
+    fn test_job014_no_failures_emits_no_warning() {
+        let vm = run_vm_source(
+            r#"async function ok() { return 1 }
+async function main() {
+    let r = await ok()
+    print(r)
+}
+main()"#,
+        );
+        assert_eq!(vm.get_output(), &["1".to_string()]);
+        assert!(
+            vm.get_error_output().is_empty(),
+            "{:?}",
+            vm.get_error_output()
+        );
     }
 
     /// §49: an error inside a task body can be handled by try/catch INSIDE the
@@ -9388,6 +10523,59 @@ main()"#
         let output = run_source(&src).unwrap();
         assert_eq!(output, vec!["caught"]);
         assert!(recs.lock().unwrap().is_empty());
+    }
+
+    /// ISSUES §65c: mutating a response's headers object is local-only —
+    /// it cannot affect the response data (status/body untouched) nor leak
+    /// into later responses (next request sees fresh server headers).
+    #[test]
+    fn test_issue65c_headers_mutation_is_local() {
+        let (base, _recs) = spawn_mock_server(|_| plain_reply("hello"));
+        let src = r#"async function main() {
+    let res = await http.get("__URL__/data")
+    let h = res.headers
+    h["X-Mutated"] = "yes"
+    print(h["X-Mutated"])
+    print(res.status)
+    print(res.body)
+    let res2 = await http.get("__URL__/data")
+    try {
+        print(res2.headers["X-Mutated"])
+        print("leaked")
+    } catch e {
+        print("fresh")
+    }
+}
+main()"#
+            .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(output, vec!["yes", "200", "hello", "fresh"]);
+    }
+
+    /// §50 Redirect rules (ISSUES.md §65d follow-up, spec added 2026-10-02):
+    /// redirects are followed automatically and capped at 10 — an endless
+    /// redirect loop ends in a catchable error.
+    #[test]
+    fn test_job016_http_redirect_limit_is_error() {
+        let (base, _recs) = spawn_mock_server(|_| MockReply {
+            status: 302,
+            headers: vec![("Location".to_string(), "/loop".to_string())],
+            body: String::new(),
+            hang: false,
+        });
+        let src = r#"async function main() {
+    try {
+        let r = await http.get("__URL__/loop")
+        print("no-error")
+    } catch e {
+        print(e.message)
+    }
+}
+main()"#
+            .replace("__URL__", &base);
+        let output = run_source(&src).unwrap();
+        assert_eq!(output.len(), 1, "{:?}", output);
+        assert!(output[0].contains("redirect"), "{}", output[0]);
     }
 
     // ---- Job 019: validation pass before execution, CALL_NATIVE, LOAD_FUNCTION ----

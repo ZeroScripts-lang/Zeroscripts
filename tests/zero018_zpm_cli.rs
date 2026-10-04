@@ -351,6 +351,53 @@ fn cli_install_named_missing_package_is_error() {
     let _ = std::fs::remove_dir_all(&reg);
 }
 
+// ISSUES.md §67k: a failed `zpm install <name>` leaves project.zson
+// byte-identical — the declaration is staged in memory and only committed
+// after the whole install succeeds (prepare-then-commit).
+#[test]
+fn cli_install_named_failure_leaves_manifest_untouched() {
+    let reg = temp_dir("manifest_untouched_reg");
+    let proj = temp_dir("manifest_untouched");
+    write(
+        &proj.join("project.zson"),
+        r#"{ name: "app", version: "1.0.0", dependencies: {} }"#,
+    );
+    let before = read(&proj.join("project.zson"));
+    let out = zpm(&proj)
+        .arg("--registry")
+        .arg(&reg)
+        .args(["install", "ghost-pkg"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    // §100 "Nama Binary dan Kode Keluar": a failed command exits with 1.
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("not found in any registry"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(before, read(&proj.join("project.zson")));
+    let _ = std::fs::remove_dir_all(&proj);
+    let _ = std::fs::remove_dir_all(&reg);
+}
+
+// §86 + §100 (ISSUES.md §66l): `zpm run` forwards the script process's exit
+// code as zpm's own exit code; a successful script exits 0.
+#[test]
+fn cli_run_forwards_child_exit_code() {
+    let proj = temp_dir("run_exit_code");
+    write(
+        &proj.join("project.zson"),
+        r#"{ name: "app", version: "1.0.0", scripts: { boom: "exit 3", ok: "true" }, dependencies: {} }"#,
+    );
+    let out = zpm(&proj).args(["run", "boom"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    let out = zpm(&proj).args(["run", "ok"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let _ = std::fs::remove_dir_all(&proj);
+}
+
 // §93: `zpm install git:<url>#<ref>` fetches the repository, declares the
 // dependency (§100) and records source + commit in the lockfile.
 #[test]

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use zeroscript::git::GitSource;
 use zeroscript::package::{
-    add_dependency, install, probe_git, publish, remove_dependency, run_script, update,
+    install, install_with_declared, probe_git, publish, remove_dependency, run_script, update,
     InstallReport, Project, Registry, Sources, MANIFEST_FILE,
 };
 
@@ -101,11 +101,15 @@ fn print_report(report: &InstallReport) {
 
 fn cmd_install(registry_flags: &[String], extra: &[String]) -> ! {
     let project = find_project();
-    match extra {
-        [] => {}
+    // §67k (prepare-then-commit): the declaration is staged in memory by
+    // install_with_declared and only written to project.zson after the
+    // install fully succeeds — a failure at any stage leaves the manifest
+    // byte-identical. probe_git runs before staging (it needs no manifest).
+    let declared: Option<(String, String)> = match extra {
+        [] => None,
         [spec] => {
             // §100: "Dependency harus dideklarasikan secara eksplisit" —
-            // an argument to `install` declares the dependency first.
+            // an argument to `install` declares the dependency.
             if spec.starts_with("git:") {
                 let source = match GitSource::parse(spec) {
                     Ok(s) => s,
@@ -115,17 +119,19 @@ fn cmd_install(registry_flags: &[String], extra: &[String]) -> ! {
                     Ok(id) => id,
                     Err(e) => fail(&e.to_string()),
                 };
-                if let Err(e) = add_dependency(&project.root, &name, spec) {
-                    fail(&e.to_string());
-                }
-            } else if let Err(e) = add_dependency(&project.root, spec, "x") {
-                fail(&e.to_string());
+                Some((name, spec.clone()))
+            } else {
+                Some((spec.clone(), "x".to_string()))
             }
         }
         _ => fail("ERROR: usage: zpm install [package|git:<url>[#ref]]"),
-    }
+    };
     let sources = sources_for(&project.root, registry_flags);
-    match install(&project.root, &sources) {
+    let result = match &declared {
+        Some((name, req)) => install_with_declared(&project.root, &sources, name, req),
+        None => install(&project.root, &sources),
+    };
+    match result {
         Ok(report) => {
             print_report(&report);
             std::process::exit(0);

@@ -549,6 +549,15 @@ Task C ───────────────→ completed
 
 Kegagalan task merupakan bagian dari lifecycle task dan tidak mengubah aturan error handling ZeroScript yang sudah berlaku untuk operasi synchronous.
 
+Un-awaited Task Failure
+
+Jika sebuah asynchronous task gagal dan tidak pernah di-"await", runtime mencetak satu warning ke stderr ketika program selesai.
+
+- Warning tidak melempar error ke scope lain dan tidak secara otomatis menghentikan program.
+- Setiap "failed" task yang tidak pernah di-"await" menghasilkan satu warning.
+- Task yang telah di-"await" tidak menghasilkan warning tambahan untuk failure yang sama.
+- Error yang diteruskan ke "task.all()", "task.race()", "task.wait()", atau "task.timeout()" mengikuti aturan pada combinator tersebut: bila error tersebut (atau error lanjutannya) pada akhirnya sampai ke suatu "await", task sumbernya dianggap sudah di-"await" dan tidak menghasilkan warning.
+
 109. Task Waiting
 
 ZeroScript menyediakan operasi "task.wait()" untuk menunggu asynchronous task sampai mencapai terminal state tanpa mengambil result task tersebut.
@@ -744,10 +753,13 @@ async function B() {
     print("B")
 }
 
-let taskA = A()
-let taskB = B()
+async function main() {
+    let taskA = A()
+    let taskB = B()
 
-await task.all([taskA, taskB])
+    await task.all([taskA, taskB])
+}
+main()
 
 Urutan pembuatan task tidak menentukan urutan output. "taskB" dapat selesai lebih dahulu karena durasi tunggunya lebih pendek.
 

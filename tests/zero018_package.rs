@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use zeroscript::hash;
 use zeroscript::package::{
-    install, parse_lockfile, publish, remove_dependency, update, Cache, Lockfile, Registry,
-    Sources, CACHE_DIR, DEPS_DIR, LOCK_FILE, MANIFEST_FILE, PACKAGE_FILE,
+    install, install_with_declared, parse_lockfile, publish, remove_dependency, update, Cache,
+    Lockfile, Registry, Sources, CACHE_DIR, DEPS_DIR, LOCK_FILE, MANIFEST_FILE, PACKAGE_FILE,
 };
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -825,6 +825,61 @@ fn job018_clearing_cache_leaves_project_untouched() {
     assert_eq!(lock_before, read(&root.join(LOCK_FILE)));
     assert_eq!(manifest_before, read(&root.join(MANIFEST_FILE)));
     assert!(root.join(DEPS_DIR).join("pkg").join("p.zs").is_file());
+}
+
+// ---------------------------------------------------------------------------
+// K. Manifest prepare-then-commit (ISSUES.md §67k)
+// ---------------------------------------------------------------------------
+
+// Resolve-stage failure: the staged declaration never reaches disk.
+#[test]
+fn job018_install_declared_resolve_failure_keeps_manifest() {
+    let reg = temp_dir("k_stage_reg");
+    add_pkg(&reg, "kpkg", "1.0.0", &[], &[("p.zs", "x")]);
+    let root = new_project(
+        "k_resolve",
+        r#"{ name: "app", version: "1.0.0", dependencies: {} }"#,
+    );
+    let before = read(&root.join(MANIFEST_FILE));
+    let err = install_with_declared(&root, &sources(&root, &reg), "ghost-pkg", "x")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not found"), "{}", err);
+    assert_eq!(before, read(&root.join(MANIFEST_FILE)));
+}
+
+// Materialize-stage failure: resolution succeeds, but `.zsc_m` is a regular
+// file so the copy cannot be created — failure lands between staging and
+// commit, and the manifest still must not change.
+#[test]
+fn job018_install_declared_materialize_failure_keeps_manifest() {
+    let reg = temp_dir("k_stage_reg2");
+    add_pkg(&reg, "kpkg", "1.0.0", &[], &[("p.zs", "x")]);
+    let root = new_project(
+        "k_material",
+        r#"{ name: "app", version: "1.0.0", dependencies: {} }"#,
+    );
+    write(&root.join(DEPS_DIR), "not a directory");
+    let before = read(&root.join(MANIFEST_FILE));
+    install_with_declared(&root, &sources(&root, &reg), "kpkg", "x").unwrap_err();
+    assert_eq!(before, read(&root.join(MANIFEST_FILE)));
+}
+
+// Full success is what commits the declaration (§67k: commit only after the
+// install completed).
+#[test]
+fn job018_install_declared_success_commits_manifest() {
+    let reg = temp_dir("k_stage_reg3");
+    add_pkg(&reg, "kpkg", "1.0.0", &[], &[("p.zs", "x")]);
+    let root = new_project(
+        "k_ok",
+        r#"{ name: "app", version: "1.0.0", dependencies: {} }"#,
+    );
+    install_with_declared(&root, &sources(&root, &reg), "kpkg", "x").unwrap();
+    let after = read(&root.join(MANIFEST_FILE));
+    assert!(after.contains("kpkg"), "{}", after);
+    assert!(after.contains("\"x\""), "{}", after);
+    assert!(root.join(DEPS_DIR).join("kpkg").join("p.zs").is_file());
 }
 
 // ---------------------------------------------------------------------------
