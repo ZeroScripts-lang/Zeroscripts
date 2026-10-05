@@ -778,8 +778,11 @@ impl ZeroVM {
                 )));
             }
             for default in function.param_defaults.iter().flatten() {
-                if *default >= self.program.constants.len() {
-                    return Err(VmError::InvalidConstantIndex(*default));
+                if *default >= self.program.default_bodies.len() {
+                    return Err(VmError::InvalidOperand(format!(
+                        "Function '{}' default body index {} out of range",
+                        function.name, *default
+                    )));
                 }
             }
 
@@ -788,6 +791,12 @@ impl ZeroVM {
                 return Err(VmError::InvalidJumpTarget(function.entry_point));
             }
 
+            Self::validate_stream(&self.program, body)?;
+        }
+
+        // Job 022 (§30): default-parameter bodies are standalone streams
+        // (they run with pc = 0), validated like function bodies.
+        for body in &self.program.default_bodies {
             Self::validate_stream(&self.program, body)?;
         }
 
@@ -1787,7 +1796,14 @@ impl ZeroVM {
                     return self.create_task(func_idx, args, func_value.clone(), None);
                 }
 
-                let root_scope = self.build_function_scope(&func_info, &args, &func_value);
+                // Job 022 (§30): defaults are evaluated at call time.
+                let Some(root_scope) =
+                    self.build_function_scope(&func_info, &args, &func_value, None)?
+                else {
+                    // Default evaluation unwound to an outer handler or failed
+                    // a task: the call never happens.
+                    return Ok(());
+                };
 
                 let return_pc = self.pc;
                 let return_instructions = self.program.instructions.clone();
@@ -1842,7 +1858,17 @@ impl ZeroVM {
                     return self.create_task(func_idx, args, func_value.clone(), Some(env.clone()));
                 }
 
-                let root_scope = self.build_function_scope(&func_info, &args, &func_value);
+                // Job 022 (§30): defaults are evaluated at call time, with
+                // captured names resolvable through the closure environment.
+                let Some(root_scope) = self.build_function_scope(
+                    &func_info,
+                    &args,
+                    &func_value,
+                    Some(env.clone()),
+                )?
+                else {
+                    return Ok(());
+                };
 
                 let return_pc = self.pc;
                 let return_instructions = self.program.instructions.clone();
@@ -1935,23 +1961,57 @@ impl ZeroVM {
         Ok(())
     }
 
-    /// Build a function frame's root scope: parameters (with defaults applied),
-    /// then the function's own name bound to `callee` for self-reference.
+    /// Build a function frame's root scope: parameters (with defaults
+    /// evaluated at call time, §30), then the function's own name bound to
+    /// `callee` for self-reference. `captured_env` is the closure/task
+    /// environment a default expression may read captured names through
+    /// (§130).
+    ///
+    /// Returns `None` when default evaluation unwound to an outer handler or
+    /// failed a task instead of completing — the call never happens and
+    /// control already continues at that handler.
     fn build_function_scope(
-        &self,
+        &mut self,
         func_info: &FunctionInfo,
         args: &[Value],
         callee: &Value,
-    ) -> HashMap<String, Binding> {
+        captured_env: Option<HeapRefHandle>,
+    ) -> Result<Option<HashMap<String, Binding>>, VmError> {
         let mut root_scope = HashMap::new();
 
+        // Bind every explicit argument first: a default then sees earlier
+        // parameters regardless of which of them were passed explicitly, and
+        // all argument values are reachable from each default's evaluation
+        // scope (GC roots, §121 — only instruction boundaries collect).
         for (i, param_name) in func_info.params.iter().enumerate() {
-            let value = if i < args.len() {
-                args[i].clone()
-            } else if let Some(Some(default_idx)) = func_info.param_defaults.get(i) {
-                self.constant_to_value(&self.program.constants[*default_idx])
-            } else {
-                Value::Null
+            if i < args.len() {
+                root_scope.insert(
+                    param_name.clone(),
+                    Binding {
+                        value: args[i].clone(),
+                        is_const: false,
+                        initialized: true,
+                        live: None,
+                    },
+                );
+            }
+        }
+
+        // Left-to-right defaults (§30): each default sees the parameters
+        // bound before it; a missing argument without a default is null.
+        for (i, param_name) in func_info.params.iter().enumerate() {
+            if i < args.len() {
+                continue;
+            }
+            let value = match func_info.param_defaults.get(i).copied().flatten() {
+                Some(default_idx) => {
+                    match self.evaluate_default_body(default_idx, &root_scope, func_info, callee, captured_env.clone())? {
+                        Some(value) => value,
+                        // Unwound to a handler / failed task: abort the call.
+                        None => return Ok(None),
+                    }
+                }
+                None => Value::Null,
             };
             root_scope.insert(
                 param_name.clone(),
@@ -1977,7 +2037,112 @@ impl ZeroVM {
             );
         }
 
-        root_scope
+        Ok(Some(root_scope))
+    }
+
+    /// Job 022 (§30): evaluate one default-parameter expression at call time.
+    ///
+    /// The body runs in a dedicated frame on the current call stack, driven
+    /// exactly like the outer execution loops (GC at instruction boundaries,
+    /// `RuntimeError` → `raise_runtime_error`), so `Return` restores the
+    /// caller's instruction stream and program counter through the ordinary
+    /// frame machinery and an inner `try`/`catch` inside the default's
+    /// callees is handled without leaving the evaluation.
+    ///
+    /// The frame's single scope is a snapshot of the parameters bound so far
+    /// (cloned onto the stack, so §121 roots cover it); `captured_env` gives
+    /// §130 closure access and `global_scope` stays visible for globals.
+    ///
+    /// Returns `Ok(None)` when evaluation did not complete normally — the
+    /// error unwound to an outer handler or failed a task, so the call must
+    /// be aborted (control is already positioned there).
+    fn evaluate_default_body(
+        &mut self,
+        default_idx: usize,
+        bound_params: &HashMap<String, Binding>,
+        func_info: &FunctionInfo,
+        callee: &Value,
+        captured_env: Option<HeapRefHandle>,
+    ) -> Result<Option<Value>, VmError> {
+        if default_idx >= self.program.default_bodies.len() {
+            return Err(VmError::InvalidOperand(format!(
+                "Default body index {} out of range",
+                default_idx
+            )));
+        }
+
+        // Evaluation scope: parameters bound so far, plus the function's own
+        // name so a default may recurse like the body can.
+        let mut scope = bound_params.clone();
+        if !func_info.name.is_empty() {
+            scope.insert(
+                func_info.name.clone(),
+                Binding {
+                    value: callee.clone(),
+                    is_const: false,
+                    initialized: true,
+                    live: None,
+                },
+            );
+        }
+
+        let saved_pc = self.pc;
+        let stack_at_start = self.stack.len();
+        let default_body = self.program.default_bodies[default_idx].clone();
+        let saved_instructions = std::mem::replace(&mut self.program.instructions, default_body);
+        self.call_stack.push(Frame {
+            // Default bodies are not functions; nothing reads this index.
+            function_index: usize::MAX,
+            scopes: vec![scope],
+            return_pc: saved_pc,
+            captured_env,
+            scope_env: None,
+            return_instructions: Some(saved_instructions),
+            task_id: None,
+        });
+        self.pc = 0;
+        let depth = self.call_stack.len();
+
+        loop {
+            self.maybe_gc();
+            if self.pc >= self.program.instructions.len() {
+                return Err(VmError::InvalidExecutionState(
+                    "Default parameter expression ran past its body end".to_string(),
+                ));
+            }
+
+            let instruction = self.program.instructions[self.pc].clone();
+            self.pc += 1;
+
+            if let Err(err) = self.execute_instruction(&instruction) {
+                // Mirror the outer loops: only ZeroScript runtime errors are
+                // catchable (§43, §154); anything else aborts evaluation.
+                if let VmError::RuntimeError(msg) = err {
+                    self.raise_runtime_error(msg)?;
+                } else {
+                    return Err(err);
+                }
+            }
+
+            // The frame's own Return (or an unwind past it) ends evaluation;
+            // nested calls made from the body push frames above it.
+            if self.call_stack.len() < depth {
+                break;
+            }
+        }
+
+        // Normal completion: the frame was popped by Return, the caller's
+        // pc/instructions were restored, and exactly the result was pushed.
+        // Anything else (unwind to an outer handler, task failure) is an
+        // aborted evaluation — the call must not proceed.
+        if self.call_stack.len() == depth - 1
+            && self.pc == saved_pc
+            && self.stack.len() == stack_at_start + 1
+        {
+            Ok(Some(self.stack.pop().unwrap_or(Value::Null)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Create a pending task for an async function call (§101). The body runs
@@ -2078,7 +2243,16 @@ impl ZeroVM {
             )));
         }
         let func_info = self.program.functions[func_idx].clone();
-        let root_scope = self.build_function_scope(&func_info, &args, &callee);
+        // Job 022 (§30/§101): defaults are evaluated when the task starts
+        // (prepare), before the body runs — with the task's closure env.
+        let Some(root_scope) =
+            self.build_function_scope(&func_info, &args, &callee, env.clone())?
+        else {
+            return Err(VmError::InvalidExecutionState(format!(
+                "Task {} default parameter evaluation was interrupted",
+                task_id
+            )));
+        };
         let instructions = if func_idx < self.program.function_bodies.len() {
             self.program.function_bodies[func_idx].clone()
         } else {
@@ -4920,6 +5094,7 @@ mod tests {
             instructions: vec![Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -4933,6 +5108,7 @@ mod tests {
             instructions: vec![],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let vm = ZeroVM::new(bc);
         assert!(vm.validate().is_ok());
@@ -4945,6 +5121,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(5)],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let vm = ZeroVM::new(bc);
         assert!(vm.validate().is_err());
@@ -4957,6 +5134,7 @@ mod tests {
             instructions: vec![Opcode::Jump(10)],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let vm = ZeroVM::new(bc);
         assert!(vm.validate().is_err());
@@ -4977,6 +5155,7 @@ mod tests {
                 is_async: false,
             }],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let vm = ZeroVM::new(bc);
         assert!(vm.validate().is_err());
@@ -4989,6 +5168,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::Pop, Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let vm = ZeroVM::new(bc);
         assert!(vm.validate().is_ok());
@@ -5001,6 +5181,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5015,6 +5196,7 @@ mod tests {
             instructions: vec![Opcode::Pop],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         let result = vm.run();
@@ -5028,6 +5210,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::Dup, Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5048,6 +5231,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5062,6 +5246,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::Swap],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -5085,6 +5270,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5101,6 +5287,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(5)],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -5118,6 +5305,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5136,6 +5324,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5154,6 +5343,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5172,6 +5362,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5190,6 +5381,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -5207,6 +5399,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5225,6 +5418,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -5242,6 +5436,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5255,6 +5450,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::Neg, Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5268,6 +5464,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::Pos, Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5281,6 +5478,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::Not, Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5294,6 +5492,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::Not],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -5311,6 +5510,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5329,6 +5529,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5347,6 +5548,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5365,6 +5567,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5383,6 +5586,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5401,6 +5605,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5419,6 +5624,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5437,6 +5643,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5455,6 +5662,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5473,6 +5681,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5491,6 +5700,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5509,6 +5719,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5522,6 +5733,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::LoadConst(1), Opcode::And],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -5539,6 +5751,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5563,6 +5776,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5587,6 +5801,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5600,6 +5815,7 @@ mod tests {
             instructions: vec![Opcode::Jump(10)],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -5612,6 +5828,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::JumpIfFalse(0)],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -5630,6 +5847,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5643,6 +5861,7 @@ mod tests {
             instructions: vec![Opcode::LoadLocal("X".to_string())],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -5655,6 +5874,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::Print, Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5668,6 +5888,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::Print, Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5689,6 +5910,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5713,6 +5935,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5747,6 +5970,7 @@ mod tests {
             instructions: vec![Opcode::MakeList(0), Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5774,6 +5998,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5816,6 +6041,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5837,6 +6063,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -5854,6 +6081,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5871,6 +6099,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -5891,6 +6120,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5909,6 +6139,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5927,6 +6158,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5945,6 +6177,7 @@ mod tests {
             ],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5958,6 +6191,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::Neg, Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -5971,6 +6205,7 @@ mod tests {
             instructions: vec![Opcode::Jump(100)],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -5983,6 +6218,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0), Opcode::Call(0)],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -6007,6 +6243,7 @@ mod tests {
                 is_async: false,
             }],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(vm.run().is_err());
@@ -6019,6 +6256,7 @@ mod tests {
             instructions: vec![Opcode::LoadConst(0)],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let vm = ZeroVM::new(bc);
         assert_eq!(*vm.get_state(), ExecutionState::Running);
@@ -6031,6 +6269,7 @@ mod tests {
             instructions: vec![Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
@@ -6381,7 +6620,7 @@ mod tests {
 
     #[test]
     fn test_runtime_value_round_trip_number() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let rv = Value::Number(42.5).to_runtime_value(&mut vm.heap);
         let back = Value::from_runtime_value(&rv, &vm.heap).unwrap();
         assert_eq!(back, Value::Number(42.5));
@@ -6389,7 +6628,7 @@ mod tests {
 
     #[test]
     fn test_runtime_value_round_trip_boolean() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let rv = Value::Boolean(true).to_runtime_value(&mut vm.heap);
         let back = Value::from_runtime_value(&rv, &vm.heap).unwrap();
         assert_eq!(back, Value::Boolean(true));
@@ -6397,7 +6636,7 @@ mod tests {
 
     #[test]
     fn test_runtime_value_round_trip_null() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let rv = Value::Null.to_runtime_value(&mut vm.heap);
         let back = Value::from_runtime_value(&rv, &vm.heap).unwrap();
         assert_eq!(back, Value::Null);
@@ -6405,7 +6644,7 @@ mod tests {
 
     #[test]
     fn test_runtime_value_round_trip_string() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let rv = Value::Str("hello heap".to_string()).to_runtime_value(&mut vm.heap);
         let back = Value::from_runtime_value(&rv, &vm.heap).unwrap();
         assert_eq!(back, Value::Str("hello heap".to_string()));
@@ -6413,7 +6652,7 @@ mod tests {
 
     #[test]
     fn test_runtime_value_round_trip_list() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         // Build a heap list
         let n = vm.heap.allocate(HeapObject::Number(1.0));
         let s = vm.heap.allocate(HeapObject::Str("two".to_string()));
@@ -6433,7 +6672,7 @@ mod tests {
 
     #[test]
     fn test_runtime_value_round_trip_object() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let x = vm.heap.allocate(HeapObject::Number(10.0));
         let y = vm.heap.allocate(HeapObject::Str("hello".to_string()));
         let obj_ref = vm.heap.allocate(HeapObject::object(vec![
@@ -6593,7 +6832,7 @@ mod tests {
 
     #[test]
     fn test_gc_manual_collect() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let r1 = vm.heap.allocate(HeapObject::Str("keep".to_string()));
         let r2 = vm.heap.allocate(HeapObject::Str("drop".to_string()));
         vm.add_live_ref(r1.clone());
@@ -6606,7 +6845,7 @@ mod tests {
 
     #[test]
     fn test_gc_collect_reachable_list_elements() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let elem = vm.heap.allocate(HeapObject::Str("elem".to_string()));
         let list = vm.heap.allocate(HeapObject::list(vec![elem.clone()]));
         let orphan = vm.heap.allocate(HeapObject::Str("orphan".to_string()));
@@ -6621,7 +6860,7 @@ mod tests {
 
     #[test]
     fn test_gc_collect_reachable_object_values() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let val = vm.heap.allocate(HeapObject::Str("val".to_string()));
         let obj = vm.heap.allocate(HeapObject::object(vec![("key".to_string(), val.clone())]));
         let orphan = vm.heap.allocate(HeapObject::Str("orphan".to_string()));
@@ -6636,7 +6875,7 @@ mod tests {
 
     #[test]
     fn test_gc_collect_unreachable_cycle() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let a = vm.heap.allocate(HeapObject::Str("a".to_string()));
         let b = vm.heap.allocate(HeapObject::Str("b".to_string()));
 
@@ -6651,7 +6890,7 @@ mod tests {
 
     #[test]
     fn test_gc_reachable_cycle_survives() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let a = vm.heap.allocate(HeapObject::Str("a".to_string()));
         let b = vm.heap.allocate(HeapObject::Str("b".to_string()));
 
@@ -6667,7 +6906,7 @@ mod tests {
 
     #[test]
     fn test_gc_stale_refs_cleaned_after_collect() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let r1 = vm.heap.allocate(HeapObject::Str("temp".to_string()));
         vm.add_live_ref(r1.clone());
 
@@ -6678,7 +6917,7 @@ mod tests {
 
     #[test]
     fn test_gc_trigger_on_threshold() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         vm.gc = Gc::new(3);
 
         let r1 = vm.heap.allocate(HeapObject::Str("a".to_string()));
@@ -6705,7 +6944,7 @@ mod tests {
 
     #[test]
     fn test_gc_diamond_graph_via_vm() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let shared = vm.heap.allocate(HeapObject::Str("shared".to_string()));
         let left = vm.heap.allocate(HeapObject::list(vec![shared.clone()]));
         let right = vm.heap.allocate(HeapObject::list(vec![shared.clone()]));
@@ -6724,7 +6963,7 @@ mod tests {
 
     #[test]
     fn test_gc_multiple_live_refs() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let r1 = vm.heap.allocate(HeapObject::Str("a".to_string()));
         let r2 = vm.heap.allocate(HeapObject::Str("b".to_string()));
         let orphan = vm.heap.allocate(HeapObject::Str("orphan".to_string()));
@@ -6740,7 +6979,7 @@ mod tests {
 
     #[test]
     fn test_gc_stats_tracking() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         let _r1 = vm.heap.allocate(HeapObject::Str("a".to_string()));
         let _r2 = vm.heap.allocate(HeapObject::Str("b".to_string()));
 
@@ -6784,7 +7023,7 @@ mod tests {
 
     #[test]
     fn test_gc_automatic_trigger_during_execution() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         vm.gc = Gc::new(5);
 
         for i in 0..20 {
@@ -6807,7 +7046,7 @@ mod tests {
 
     #[test]
     fn test_gc_reachable_objects_survive() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let r1 = vm.heap.allocate(HeapObject::Str("keep1".to_string()));
@@ -6822,7 +7061,7 @@ mod tests {
 
     #[test]
     fn test_gc_unreachable_objects_collected() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let _r1 = vm.heap.allocate(HeapObject::Str("orphan1".to_string()));
@@ -6835,7 +7074,7 @@ mod tests {
 
     #[test]
     fn test_gc_unreachable_cycle_collected() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let a = vm.heap.allocate(HeapObject::Str("a".to_string()));
@@ -6851,7 +7090,7 @@ mod tests {
 
     #[test]
     fn test_gc_reachable_cycle_survives_auto() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let a = vm.heap.allocate(HeapObject::Str("a".to_string()));
@@ -6868,7 +7107,7 @@ mod tests {
 
     #[test]
     fn test_gc_multiple_roots_safe() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let r1 = vm.heap.allocate(HeapObject::Str("root1".to_string()));
@@ -6897,7 +7136,7 @@ mod tests {
 
     #[test]
     fn test_gc_invalid_ref_after_collect() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let r1 = vm.heap.allocate(HeapObject::Str("temp".to_string()));
@@ -6909,7 +7148,7 @@ mod tests {
 
     #[test]
     fn test_gc_manual_debug_available() {
-        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![] });
+        let mut vm = ZeroVM::new(BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0, constants: vec![], instructions: vec![], functions: vec![], function_bodies: vec![], default_bodies: vec![] });
         vm.gc = Gc::new(0);
 
         let _r1 = vm.heap.allocate(HeapObject::Str("a".to_string()));
@@ -7028,6 +7267,7 @@ mod tests {
             instructions: vec![],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         });
         let r = vm.heap.allocate(HeapObject::list(vec![]));
         let mut scope = HashMap::new();
@@ -7271,6 +7511,137 @@ mod tests {
             Value::Closure { env: env_back, .. } => assert_eq!(env_back, env),
             other => panic!("expected closure round-trip, got {:?}", other),
         }
+    }
+
+    // ===== Job 022: default parameters evaluated at call time (§30) =====
+
+    /// §30 "Default dievaluasi saat function dipanggil": the default reads
+    /// the outer variable's value at the call, not at compile time.
+    #[test]
+    fn test_job022_default_evaluated_at_call_time() {
+        let output =
+            run_source("let x = 1\nfunction f(a = x) { return a }\nx = 2\nprint(f())").unwrap();
+        assert_eq!(output, vec!["2"]);
+    }
+
+    /// §30: each call re-evaluates the default — a mutation made through the
+    /// default itself is visible on the next call.
+    #[test]
+    fn test_job022_default_sees_outer_mutation_each_call() {
+        // The counter lives in outer's scope and is captured by both inc
+        // and g — a shared env (§66/§130) so the default's own mutation is
+        // visible to the next call's evaluation.
+        let output = run_source(
+            "function outer() {\n    let counter = 0\n    function inc() { counter += 1\n        return counter }\n    function g(n = inc()) { return n }\n    print(g())\n    print(g())\n}\nouter()",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["1", "2"]);
+    }
+
+    /// §30: a default may reference the previous parameter.
+    #[test]
+    fn test_job022_default_uses_previous_parameter() {
+        let output = run_source("function h(a, b = a + 1) { return b }\nprint(h(5))").unwrap();
+        assert_eq!(output, vec!["6"]);
+    }
+
+    /// §30: explicit value overrides the default (the default body does not
+    /// run when the argument is present).
+    #[test]
+    fn test_job022_explicit_argument_overrides_default() {
+        let output = run_source("function f(a = 99) { return a }\nprint(f(1))\nprint(f())").unwrap();
+        assert_eq!(output, vec!["1", "99"]);
+    }
+
+    /// §30: a missing argument without a default becomes null.
+    #[test]
+    fn test_job022_missing_argument_without_default_is_null() {
+        let output = run_source("function f(a) { return a }\nprint(f())").unwrap();
+        assert_eq!(output, vec!["null"]);
+    }
+
+    /// §30/§31: a closure's default reads its captured environment at call
+    /// time (the live value), and a default resolving a global sees the
+    /// global's current value. The job file's literal sample (top-level
+    /// `x = 30` against a shadowed local `x`) yields 20/20 under §31
+    /// lexical scoping — recorded in ISSUES.md §70a.
+    #[test]
+    fn test_job022_closure_call_default_uses_captured_env() {
+        // Captured local: mutated inside outer before the return, the call
+        // must observe the live value from the shared environment (§130).
+        let output = run_source(
+            "function outer() {\n    let x = 20\n    let f = function(a = x) { return a }\n    x = 99\n    return f\n}\nprint(outer()())",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["99"]);
+        // A real closure (y forces the capture) whose default also reads a
+        // global: the call-time value of the global flows in.
+        let output = run_source(
+            "let x = 10\nfunction make() {\n    let y = 5\n    return function(a = x + y) { return a }\n}\nlet f = make()\nprint(f())\nx = 30\nprint(f())",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["15", "35"]);
+    }
+
+    /// §101 + Job 022 AC: calling an async function only creates the task —
+    /// the default runs when the scheduler starts it (prepare_task_start),
+    /// before the body; the async closure path passes the task env.
+    #[test]
+    fn test_job022_async_default_evaluated_at_task_start() {
+        let output = run_source(
+            "let counts = {calls: 0}\nfunction tick() { counts.calls += 1\n    return 42 }\nasync function af(a = tick()) { return a }\nfunction mk() {\n    let y = 41\n    async function inner(a = y + 1) { return a }\n    return inner\n}\nasync function main() {\n    let t = af()\n    print(counts.calls)\n    print(await t)\n    print(await mk()())\n    print(counts.calls)\n}\nmain()",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["0", "42", "42", "1"]);
+    }
+
+    /// §E/§121: default evaluation under threshold-0 GC — the list allocated
+    /// by a default body and the captured list/string a default reads stay
+    /// rooted through the evaluation frame.
+    #[test]
+    fn test_job022_default_heap_alloc_survives_gc() {
+        let (out, collections, _) = run_source_with_gc_pressure(
+            "function make() {\n    let base = [\"kept\", 2]\n    return function(tag = base[0] + \"!\") { return tag }\n}\nfunction g(a = [7, 8, 9]) { return a[0] }\nprint(g())\nlet f = make()\nprint(f())",
+            0,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["7", "kept!"]);
+        assert!(collections > 0, "GC must actually run during execution");
+    }
+
+    /// §30: chained defaults evaluate left to right; explicit arguments feed
+    /// the chain.
+    #[test]
+    fn test_job022_nested_defaults_chain() {
+        let output = run_source(
+            "function f(a = 1, b = a + 2, c = b + 3) { return c }\nprint(f())\nprint(f(10))\nprint(f(10, 20))",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["6", "15", "23"]);
+    }
+
+    /// §30 across declaration forms: arrow function defaults (site 3), and
+    /// arrow parameters bound as locals — they were never declared before
+    /// Job 022, which defaults cannot work without.
+    #[test]
+    fn test_job022_arrow_function_default_params() {
+        let output =
+            run_source("let f = (d = 7) => d\nprint(f())\nprint(f(9))\nlet g = (a) => a + 1\nprint(g(5))")
+                .unwrap();
+        assert_eq!(output, vec!["7", "9", "6"]);
+    }
+
+    /// Job 022 AC: the default representation survives every hop —
+    /// FunctionInfo → execute_make_closure → Value::Closure → list storage
+    /// (heap_object_for_element) → from_heap_ref → call, so the retrieved
+    /// closure still evaluates its default.
+    #[test]
+    fn test_job022_closure_param_defaults_roundtrip_through_heap() {
+        let output = run_source(
+            "function outer() {\n    let tag = \"heap\"\n    let f = function(a = tag + \"!\") { return a }\n    let box = [f]\n    let g = box[0]\n    return g()\n}\nprint(outer())",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["heap!"]);
     }
 
     // ===== Closure tests =====
@@ -10588,6 +10959,7 @@ main()"#
             instructions,
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         }
     }
 
@@ -10612,6 +10984,7 @@ main()"#
                 is_async: false,
             }],
             function_bodies: vec![body],
+            default_bodies: vec![],
         }
     }
 
@@ -10707,6 +11080,7 @@ main()"#
             instructions: vec![Opcode::Halt],
             functions: vec![],
             function_bodies: vec![],
+            default_bodies: vec![],
         };
         let mut vm = ZeroVM::new(bc);
         assert!(matches!(vm.run().unwrap_err(), VmError::InvalidBytecode(_)));
@@ -10747,7 +11121,11 @@ main()"#
         }];
         bc.function_bodies = vec![vec![Opcode::Halt]];
         let mut vm = ZeroVM::new(bc);
-        assert_eq!(vm.run().unwrap_err(), VmError::InvalidConstantIndex(9));
+        // Job 022: param_defaults index default_bodies, not constants.
+        match vm.run().unwrap_err() {
+            VmError::InvalidOperand(msg) => assert!(msg.contains("default body index 9")),
+            other => panic!("expected InvalidOperand, got {:?}", other),
+        }
     }
 
     #[test]

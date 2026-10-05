@@ -1297,6 +1297,126 @@ print(get())"#,
         assert_eq!(out, vec!["0", "1"]);
     }
 
+    // §70d regression tests — module pipeline must keep all three behaviors
+
+    /// §4's normative example on the module pipeline: a plain function's
+    /// assignment does not change the outer (non-exported) module binding.
+    #[test]
+    fn test_job70d_module_plain_function_assignment_keeps_outer() {
+        let out = run_project(
+            &[(
+                "main.zs",
+                "let A = 10\nfunction test() {\n    A = 20\n    print(A)\n}\ntest()\nprint(A)",
+            )],
+            "main.zs",
+        )
+        .unwrap();
+        assert_eq!(out, vec!["20", "10"]);
+    }
+
+    /// §31/§130: a genuine closure (declared inside its creating function)
+    /// still shares mutation of captured function-scope bindings.
+    #[test]
+    fn test_job70d_genuine_closure_shared_mutation() {
+        let out = run_project(
+            &[(
+                "main.zs",
+                "function makeCounter() {\n    let A = 0\n    return function() {\n        A++\n        return A\n    }\n}\nlet c = makeCounter()\nprint(c())\nprint(c())\nprint(c())",
+            )],
+            "main.zs",
+        )
+        .unwrap();
+        assert_eq!(out, vec!["1", "2", "3"]);
+    }
+
+    /// §66: mutation of an exported module binding stays shared and visible
+    /// to importers (binding-based rule: export status, not function kind).
+    #[test]
+    fn test_job70d_live_export_binding_still_shared() {
+        let out = run_project(
+            &[
+                (
+                    "counter.zs",
+                    "export let count = 0\nexport function increment() {\n    count++\n}",
+                ),
+                (
+                    "main.zs",
+                    "import { count, increment } from \"./counter\"\nprint(count)\nincrement()\nprint(count)",
+                ),
+            ],
+            "main.zs",
+        )
+        .unwrap();
+        assert_eq!(out, vec!["0", "1"]);
+    }
+
+    /// §130 sibling rule on the MODULE pipeline (Job 021 only covered the
+    /// `compile()` path): two closures created in the same frame share the
+    /// environment, so a captured function-scope `let` mutated through one
+    /// closure is visible through the other.
+    #[test]
+    fn test_job70d_sibling_closures_share_function_scope_env() {
+        let out = run_project(
+            &[(
+                "main.zs",
+                "function buatPair() {\n    let A = 0\n    return [function() { A = A + 1 return A }, function() { return A }]\n}\nlet p = buatPair()\nprint(p[0]())\nprint(p[0]())\nprint(p[1]())",
+            )],
+            "main.zs",
+        )
+        .unwrap();
+        assert_eq!(out, vec!["1", "2", "2"]);
+    }
+
+    /// §4 + §3: reads follow the lexical chain even before the §4 local
+    /// exists — `print(A)` inside the function sees the outer `10`, the
+    /// store creates the function-local `20`, the outer binding stays `10`.
+    #[test]
+    fn test_job70d_function_reads_outer_then_writes_local() {
+        let out = run_project(
+            &[(
+                "main.zs",
+                "let A = 10\nfunction test() {\n    print(A)\n    A = 20\n    print(A)\n}\ntest()\nprint(A)",
+            )],
+            "main.zs",
+        )
+        .unwrap();
+        assert_eq!(out, vec!["10", "20", "10"]);
+    }
+
+    /// §66/§74: `export let` stays mutable from within the source module —
+    /// shared store applies to the EXPORTED binding itself, no matter which
+    /// (even plain, non-exported) function performs the mutation.
+    #[test]
+    fn test_job70d_plain_function_mutates_exported_binding_shared() {
+        let out = run_project(
+            &[(
+                "main.zs",
+                "export let count = 0\nfunction bump() {\n    count = count + 1\n}\nbump()\nprint(count)",
+            )],
+            "main.zs",
+        )
+        .unwrap();
+        assert_eq!(out, vec!["1"]);
+    }
+
+    /// §4/§58a reading 2 applied to a genuine closure over a NON-exported
+    /// module-scope binding: assignment creates a function-local, the
+    /// outer module binding is untouched — identical to what the
+    /// `compile()` reference pipeline does with a global (cross-pipeline
+    /// equality verified by audit probes 2026-10-05: both `1,1,0`).
+    #[test]
+    fn test_job70d_closure_module_scope_store_stays_local() {
+        let out = run_project(
+            &[(
+                "main.zs",
+                "let A = 0\nfunction makeCounter() {\n    return function() { A = A + 1 return A }\n}\nlet c = makeCounter()\nprint(c())\nprint(c())\nprint(A)",
+            )],
+            "main.zs",
+        )
+        .unwrap();
+        assert_eq!(out, vec!["1", "1", "0"]);
+    }
+
     // 2. assignment to imported binding → ERROR (export let and export const)
     #[test]
     fn test_job013_assign_to_imported_let_error() {

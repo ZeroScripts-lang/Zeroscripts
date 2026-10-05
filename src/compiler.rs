@@ -168,6 +168,9 @@ pub struct BytecodeProgram {
     pub instructions: Vec<Opcode>,
     pub functions: Vec<FunctionInfo>,
     pub function_bodies: Vec<Vec<Opcode>>,
+    /// Job 022 (§30): one body per default parameter expression, evaluated
+    /// at call time. `FunctionInfo.param_defaults` indexes this table.
+    pub default_bodies: Vec<Vec<Opcode>>,
 }
 
 /// One module's compiled unit before merge into a combined program.
@@ -179,6 +182,8 @@ pub struct ModuleUnit {
     pub constants: Vec<Constant>,
     pub functions: Vec<FunctionInfo>,
     pub function_bodies: Vec<Vec<Opcode>>,
+    /// Job 022 (§30): default-parameter expression bodies (§30).
+    pub default_bodies: Vec<Vec<Opcode>>,
     pub exports: Vec<String>,
     pub imports: Vec<ModuleImport>,
     /// Re-export edges: (export_name, raw_path). §67.
@@ -198,6 +203,8 @@ pub struct ModuleImport {
 pub struct FunctionInfo {
     pub name: String,
     pub params: Vec<String>,
+    /// Job 022 (§30): index into `BytecodeProgram.default_bodies` for each
+    /// parameter that has a default expression; `None` when it has none.
     pub param_defaults: Vec<Option<usize>>,
     pub entry_point: usize,
     pub local_count: usize,
@@ -257,9 +264,15 @@ struct ScopeVar {
 enum VarRes {
     Local,
     Captured,
+    /// Module-scope binding in module mode that is NOT exported (§70d):
+    /// loads read it through the module environment (§130 "binding yang
+    /// diperlukan"), but stores stay §4-local — only exported bindings keep
+    /// the shared store required by §66 live bindings.
+    ModuleScope,
     Global,
     ConstLocal,
     ConstCaptured,
+    ConstModuleScope,
     ConstGlobal,
 }
 
@@ -268,6 +281,9 @@ struct Compiler {
     instructions: Vec<Opcode>,
     functions: Vec<FunctionInfo>,
     function_bodies: Vec<Vec<Opcode>>,
+    /// Job 022 (§30): default-parameter expression bodies, one per defaulted
+    /// parameter, indexed by `FunctionInfo.param_defaults`.
+    default_bodies: Vec<Vec<Opcode>>,
     scopes: Vec<Vec<ScopeVar>>,
     loop_contexts: Vec<LoopContext>,
     try_contexts: Vec<TryContext>,
@@ -288,6 +304,19 @@ struct Compiler {
     /// True while compiling the body of an `async function` (§49).
     /// `await` outside an async function is a compile-time ERROR (§101).
     in_async: bool,
+    /// §70d: true only in module mode (`new_module`). Gates the module-scope
+    /// store classification for non-exported bindings.
+    module_mode: bool,
+    /// §70d/§66: export names seeded before statements compile, so a function
+    /// that textually precedes its `export let` still classifies that binding
+    /// as exported (exports are static declarations like imports, §78).
+    exported_names: HashSet<String>,
+    /// §70d: true while compiling the body of an exported function (inherited
+    /// by nested functions inside it). Private module bindings stay shared
+    /// for export contexts (Job 012 `private_captured_by_export`; §74 "export
+    /// let tetap mutable di dalam module asal") and follow §4 (store → local)
+    /// only inside plain, non-exported functions.
+    fn_is_exported: bool,
 }
 
 impl Compiler {
@@ -297,6 +326,7 @@ impl Compiler {
             instructions: Vec::new(),
             functions: Vec::new(),
             function_bodies: Vec::new(),
+            default_bodies: Vec::new(),
             scopes: vec![Vec::new()],
             loop_contexts: Vec::new(),
             try_contexts: Vec::new(),
@@ -308,6 +338,9 @@ impl Compiler {
             imports: Vec::new(),
             re_exports: Vec::new(),
             in_async: false,
+            module_mode: false,
+            fn_is_exported: false,
+            exported_names: HashSet::new(),
         }
     }
 
@@ -321,6 +354,7 @@ impl Compiler {
             instructions: Vec::new(),
             functions: Vec::new(),
             function_bodies: Vec::new(),
+            default_bodies: Vec::new(),
             scopes: vec![Vec::new(), Vec::new()],
             loop_contexts: Vec::new(),
             try_contexts: Vec::new(),
@@ -332,6 +366,38 @@ impl Compiler {
             imports: Vec::new(),
             re_exports: Vec::new(),
             in_async: false,
+            module_mode: true,
+            fn_is_exported: false,
+            exported_names: HashSet::new(),
+        }
+    }
+
+    /// §70d: seed export names up front (top-level declarations only). The
+    /// per-statement `record_export` still validates and fills `exports`.
+    fn seed_export_names(&mut self, program: &Program) {
+        for stmt in &program.statements {
+            match stmt {
+                Stmt::VariableDecl {
+                    name, exported: true, ..
+                } => {
+                    self.exported_names.insert(name.clone());
+                }
+                Stmt::FunctionDecl {
+                    name, exported: true, ..
+                } => {
+                    self.exported_names.insert(name.clone());
+                }
+                Stmt::ExportList {
+                    names,
+                    from: None,
+                    ..
+                } => {
+                    for n in names {
+                        self.exported_names.insert(n.clone());
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -466,8 +532,25 @@ impl Compiler {
             }
             // Enclosing function scopes (excluding global root at index 0) are captured.
             if self.function_base > 1 {
-                for scope in self.scopes[1..self.function_base].iter().rev() {
+                for (offset, scope) in
+                    self.scopes[1..self.function_base].iter().enumerate().rev()
+                {
                     if let Some(v) = scope.iter().find(|v| v.name == name) {
+                        // §70d: scope at index 1 is the module scope. A plain
+                        // function must not share-store through it merely
+                        // because lexical visibility makes it capturable
+                        // (§4); exported bindings keep the §66 shared store.
+                        if self.module_mode
+                            && offset == 0
+                            && !self.exported_names.contains(name)
+                            && !self.fn_is_exported
+                        {
+                            return if v.is_const {
+                                VarRes::ConstModuleScope
+                            } else {
+                                VarRes::ModuleScope
+                            };
+                        }
                         return if v.is_const {
                             VarRes::ConstCaptured
                         } else {
@@ -495,6 +578,11 @@ impl Compiler {
         match load_res {
             VarRes::Local | VarRes::ConstLocal => (load_res, false),
             VarRes::Captured | VarRes::ConstCaptured => (load_res, false),
+            // §70d/§4: store to a non-exported module binding inside a
+            // function creates a local — never a shared write. Const is
+            // rejected by `check_assign_const` before any store is emitted.
+            VarRes::ModuleScope => (VarRes::Local, true),
+            VarRes::ConstModuleScope => (VarRes::ConstModuleScope, false),
             VarRes::Global | VarRes::ConstGlobal => {
                 if self.function_base == 0 {
                     (load_res, false) // top-level: store to global
@@ -511,10 +599,9 @@ impl Compiler {
         // Const reassignment is an error when the resolved binding is const.
         // For function-local shadow creation of a const global, the new local is mutable.
         match res {
-            VarRes::ConstLocal | VarRes::ConstCaptured => Err(CompilerError::new(&format!(
-                "Cannot assign to const '{}'",
-                name
-            ))),
+            VarRes::ConstLocal | VarRes::ConstCaptured | VarRes::ConstModuleScope => Err(
+                CompilerError::new(&format!("Cannot assign to const '{}'", name)),
+            ),
             VarRes::ConstGlobal if self.function_base == 0 => Err(CompilerError::new(&format!(
                 "Cannot assign to const '{}'",
                 name
@@ -524,7 +611,7 @@ impl Compiler {
     }
 
     fn track_captured(&mut self, name: &str, res: VarRes) {
-        let is_const = matches!(res, VarRes::ConstCaptured);
+        let is_const = matches!(res, VarRes::ConstCaptured | VarRes::ConstModuleScope);
         if !self.captured_vars.iter().any(|(n, _)| name == n) {
             self.captured_vars.push((name.to_string(), is_const));
         }
@@ -540,6 +627,46 @@ impl Compiler {
                 is_const: false,
             });
         }
+    }
+
+    /// Job 022 (§30): a default expression must not reference a parameter
+    /// declared after it. Checked on the AST: name resolution cannot tell a
+    /// later parameter from a global (unknown names fall back to globals), so
+    /// the explicit walk is what turns `function bad(a = b, b)` into a
+    /// compile error. Nested functions create their own scope and are not
+    /// walked (a name there does not bind this function's parameters).
+    fn validate_default_param_refs(
+        &self,
+        default_expr: &Expr,
+        params: &[FunctionParam],
+        current: usize,
+    ) -> Result<(), CompilerError> {
+        let mut refs = Vec::new();
+        collect_ident_refs(default_expr, &mut refs);
+        for later in &params[current + 1..] {
+            if refs.iter().any(|r| r == &later.name) {
+                return Err(CompilerError::new(&format!(
+                    "Parameter '{}' cannot be used in the default of parameter '{}' (declared later)",
+                    later.name, params[current].name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Job 022 (§30): compile one default-parameter expression into its own
+    /// body in `self.default_bodies` and return that body's index. Compiled
+    /// against the current function-local constant pool and capture set, so
+    /// outer references become captured variables exactly like body code.
+    fn compile_default_body(&mut self, default_expr: &Expr) -> Result<usize, CompilerError> {
+        let saved_instructions = std::mem::take(&mut self.instructions);
+        self.compile_expression(default_expr)?;
+        self.emit(Opcode::Return);
+        let body = std::mem::take(&mut self.instructions);
+        self.instructions = saved_instructions;
+        let idx = self.default_bodies.len();
+        self.default_bodies.push(body);
+        Ok(idx)
     }
 
     fn push_scope(&mut self) {
@@ -887,25 +1014,14 @@ impl Compiler {
             } => {
                 let func_idx = self.functions.len();
 
-                // Compile default parameter values into main constants
-                let mut param_defaults = Vec::new();
-                for param in params {
-                    if let Some(ref default_expr) = param.default_value {
-                        self.compile_expression(default_expr)?;
-                        // The last constant added is the default value
-                        let default_idx = self.constants.len() - 1;
-                        param_defaults.push(Some(default_idx));
-                        // Pop the compiled expression from the stack
-                        self.emit(Opcode::Pop);
-                    } else {
-                        param_defaults.push(None);
-                    }
-                }
-
+                // FunctionInfo is pushed before default/body compilation so a
+                // function expression nested in a default keeps the
+                // functions/function_bodies index pairing (§143). Defaults
+                // are compiled into default_bodies below (§30).
                 self.functions.push(FunctionInfo {
                     name: name.clone(),
                     params: params.iter().map(|p| p.name.clone()).collect(),
-                    param_defaults,
+                    param_defaults: Vec::new(),
                     entry_point: 0,
                     local_count: 0,
                     captured_vars: Vec::new(),
@@ -928,6 +1044,10 @@ impl Compiler {
                 let saved_patchable = std::mem::take(&mut self.patchable_constants);
                 let saved_in_async = self.in_async;
                 self.in_async = *is_async;
+                // §70d: export context is inherited by anything compiled
+                // inside this body (defaults, nested functions) until restored.
+                let saved_fn_exported = self.fn_is_exported;
+                self.fn_is_exported = saved_fn_exported || *exported;
 
                 // Fresh scope chain for the function: scopes[0] empty (not used for captures),
                 // function base at index 0 of the new chain (function_base tracks position in
@@ -945,11 +1065,24 @@ impl Compiler {
                 self.instructions = Vec::new();
                 self.constants = Vec::new();
                 self.captured_vars = Vec::new();
+                let saved_defaults_count = self.default_bodies.len();
 
-                // Add parameters
-                for param in params.iter() {
+                // Job 022 (§30): compile each default inside the function
+                // scope, left to right. Earlier parameters are already
+                // declared (visible as locals); the parameter being defined
+                // and later ones are not, so a default cannot see them.
+                let mut param_defaults = Vec::new();
+                for (i, param) in params.iter().enumerate() {
+                    if let Some(ref default_expr) = param.default_value {
+                        self.validate_default_param_refs(default_expr, params, i)?;
+                        let default_idx = self.compile_default_body(default_expr)?;
+                        param_defaults.push(Some(default_idx));
+                    } else {
+                        param_defaults.push(None);
+                    }
                     self.declare_variable(&param.name, false)?;
                 }
+                self.functions[func_idx].param_defaults = param_defaults;
 
                 // Compile body
                 for stmt in body {
@@ -981,6 +1114,7 @@ impl Compiler {
                 self.try_contexts = saved_try_contexts;
                 self.patchable_constants = saved_patchable;
                 self.in_async = saved_in_async;
+                self.fn_is_exported = saved_fn_exported;
 
                 // Merge function constants into main pool
                 let constant_offset = self.constants.len();
@@ -1003,15 +1137,25 @@ impl Compiler {
                     }
                 }
 
+                // Job 022 (§30): remap this function's default bodies — plus
+                // any nested function's, which stay in the table — by the
+                // same constant offset (mirrors inner_bodies above).
+                for body in &mut self.default_bodies[saved_defaults_count..] {
+                    for instr in body {
+                        if let Opcode::LoadConst(idx) = instr {
+                            *idx += constant_offset;
+                        }
+                    }
+                }
+
                 // entry_point is 0 because we compiled into a fresh buffer
                 self.functions[func_idx].entry_point = 0;
                 self.functions[func_idx].local_count = local_count;
                 self.functions[func_idx].captured_vars = captured.iter().map(|(n, _)| n.clone()).collect();
 
                 // Store function reference
-                // Function metadata stays in the constant pool (§126) — index
-                // based consumers such as param defaults keep their indices —
-                // but the value itself is pushed by LOAD_FUNCTION (§141).
+                // Function metadata stays in the constant pool (§126) but the
+                // value itself is pushed by LOAD_FUNCTION (§141).
                 self.add_constant(Constant::Function(func_idx));
                 self.emit(Opcode::LoadFunction(func_idx));
 
@@ -1435,6 +1579,13 @@ impl Compiler {
                         self.track_captured(name, res);
                         self.emit(Opcode::LoadCaptured(name.clone()));
                     }
+                    VarRes::ModuleScope | VarRes::ConstModuleScope => {
+                        // §70d: read through the module environment; the
+                        // binding stays in the closure's captured list so the
+                        // module env outlives init (§65/§130).
+                        self.track_captured(name, res);
+                        self.emit(Opcode::LoadCaptured(name.clone()));
+                    }
                     VarRes::Local | VarRes::ConstLocal => {
                         self.emit(Opcode::LoadLocal(name.clone()));
                     }
@@ -1505,11 +1656,11 @@ impl Compiler {
                         self.compile_expression(value)?;
                         self.emit(Opcode::Dup);
                         match res {
-                            VarRes::Captured | VarRes::ConstCaptured => {
+                            VarRes::Captured | VarRes::ConstCaptured | VarRes::ConstModuleScope => {
                                 self.track_captured(name, res);
                                 self.emit(Opcode::StoreCaptured(name.clone()));
                             }
-                            VarRes::Local | VarRes::ConstLocal => {
+                            VarRes::Local | VarRes::ConstLocal | VarRes::ModuleScope => {
                                 self.emit(Opcode::StoreLocal(name.clone()));
                             }
                             VarRes::Global | VarRes::ConstGlobal => {
@@ -1555,6 +1706,12 @@ impl Compiler {
                                 self.track_captured(name, load_res);
                                 self.emit(Opcode::LoadCaptured(name.clone()));
                             }
+                            VarRes::ModuleScope | VarRes::ConstModuleScope => {
+                                // §70d: read current value from module env
+                                // before a §4-local store (compound/postfix).
+                                self.track_captured(name, load_res);
+                                self.emit(Opcode::LoadCaptured(name.clone()));
+                            }
                             VarRes::Local | VarRes::ConstLocal => {
                                 self.emit(Opcode::LoadLocal(name.clone()));
                             }
@@ -1575,10 +1732,10 @@ impl Compiler {
                         // Store result (keep on stack as expression value)
                         self.emit(Opcode::Dup);
                         match store_res {
-                            VarRes::Captured | VarRes::ConstCaptured => {
+                            VarRes::Captured | VarRes::ConstCaptured | VarRes::ConstModuleScope => {
                                 self.emit(Opcode::StoreCaptured(name.clone()));
                             }
-                            VarRes::Local | VarRes::ConstLocal => {
+                            VarRes::Local | VarRes::ConstLocal | VarRes::ModuleScope => {
                                 self.emit(Opcode::StoreLocal(name.clone()));
                             }
                             VarRes::Global | VarRes::ConstGlobal => {
@@ -1640,6 +1797,12 @@ impl Compiler {
                                 self.track_captured(name, load_res);
                                 self.emit(Opcode::LoadCaptured(name.clone()));
                             }
+                            VarRes::ModuleScope | VarRes::ConstModuleScope => {
+                                // §70d: read current value from module env
+                                // before a §4-local store (compound/postfix).
+                                self.track_captured(name, load_res);
+                                self.emit(Opcode::LoadCaptured(name.clone()));
+                            }
                             VarRes::Local | VarRes::ConstLocal => {
                                 self.emit(Opcode::LoadLocal(name.clone()));
                             }
@@ -1663,10 +1826,10 @@ impl Compiler {
 
                         // Store back (consumes the new value; leaves original on stack)
                         match store_res {
-                            VarRes::Captured | VarRes::ConstCaptured => {
+                            VarRes::Captured | VarRes::ConstCaptured | VarRes::ConstModuleScope => {
                                 self.emit(Opcode::StoreCaptured(name.clone()));
                             }
-                            VarRes::Local | VarRes::ConstLocal => {
+                            VarRes::Local | VarRes::ConstLocal | VarRes::ModuleScope => {
                                 self.emit(Opcode::StoreLocal(name.clone()));
                             }
                             VarRes::Global | VarRes::ConstGlobal => {
@@ -1751,23 +1914,14 @@ impl Compiler {
                 // Create anonymous function
                 let func_idx = self.functions.len();
 
-                // Compile default parameter values into current constants
-                let mut param_defaults = Vec::new();
-                for param in params {
-                    if let Some(ref default_expr) = param.default_value {
-                        self.compile_expression(default_expr)?;
-                        let default_idx = self.constants.len() - 1;
-                        param_defaults.push(Some(default_idx));
-                        self.emit(Opcode::Pop);
-                    } else {
-                        param_defaults.push(None);
-                    }
-                }
-
+                // Defaults are compiled into default_bodies inside the
+                // function scope below (Job 022, §30). The FunctionInfo is
+                // pushed first so nested function expressions keep the
+                // functions/function_bodies index pairing (§143).
                 self.functions.push(FunctionInfo {
                     name: String::new(),
                     params: params.iter().map(|p| p.name.clone()).collect(),
-                    param_defaults,
+                    param_defaults: Vec::new(),
                     entry_point: 0,
                     local_count: 0,
                     captured_vars: Vec::new(),
@@ -1794,9 +1948,21 @@ impl Compiler {
                 self.scopes.push(Vec::new());
                 self.scope_depth += 1;
                 self.function_base = self.scopes.len() - 1;
-                for param in params {
+                let saved_defaults_count = self.default_bodies.len();
+                // Job 022 (§30): compile defaults left to right; each
+                // parameter is declared after its default.
+                let mut param_defaults = Vec::new();
+                for (i, param) in params.iter().enumerate() {
+                    if let Some(ref default_expr) = param.default_value {
+                        self.validate_default_param_refs(default_expr, params, i)?;
+                        let default_idx = self.compile_default_body(default_expr)?;
+                        param_defaults.push(Some(default_idx));
+                    } else {
+                        param_defaults.push(None);
+                    }
                     self.declare_variable(&param.name, false)?;
                 }
+                self.functions[func_idx].param_defaults = param_defaults;
 
                 let entry_point = self.instructions.len();
 
@@ -1845,15 +2011,22 @@ impl Compiler {
                         }
                     }
                 }
+                // Job 022 (§30): remap default bodies by the same offset.
+                for body in &mut self.default_bodies[saved_defaults_count..] {
+                    for instr in body {
+                        if let Opcode::LoadConst(idx) = instr {
+                            *idx += constant_offset;
+                        }
+                    }
+                }
 
                 self.functions[func_idx].entry_point = entry_point;
                 self.functions[func_idx].local_count = local_count;
                 self.functions[func_idx].captured_vars = captured.iter().map(|(n, _)| n.clone()).collect();
 
                 // Store function reference
-                // Function metadata stays in the constant pool (§126) — index
-                // based consumers such as param defaults keep their indices —
-                // but the value itself is pushed by LOAD_FUNCTION (§141).
+                // Function metadata stays in the constant pool (§126) but the
+                // value itself is pushed by LOAD_FUNCTION (§141).
                 self.add_constant(Constant::Function(func_idx));
                 self.emit(Opcode::LoadFunction(func_idx));
 
@@ -1873,23 +2046,14 @@ impl Compiler {
                 // Similar to function expression
                 let func_idx = self.functions.len();
 
-                // Compile default parameter values into current constants
-                let mut param_defaults = Vec::new();
-                for param in params {
-                    if let Some(ref default_expr) = param.default_value {
-                        self.compile_expression(default_expr)?;
-                        let default_idx = self.constants.len() - 1;
-                        param_defaults.push(Some(default_idx));
-                        self.emit(Opcode::Pop);
-                    } else {
-                        param_defaults.push(None);
-                    }
-                }
-
+                // Defaults are compiled into default_bodies inside the
+                // function scope below (Job 022, §30). FunctionInfo is
+                // pushed first to keep the functions/function_bodies index
+                // pairing (§143).
                 self.functions.push(FunctionInfo {
                     name: String::new(),
                     params: params.iter().map(|p| p.name.clone()).collect(),
-                    param_defaults,
+                    param_defaults: Vec::new(),
                     entry_point: 0,
                     local_count: 0,
                     captured_vars: Vec::new(),
@@ -1915,6 +2079,23 @@ impl Compiler {
                 self.scopes.push(Vec::new());
                 self.scope_depth += 1;
                 self.function_base = self.scopes.len() - 1;
+                let saved_defaults_count = self.default_bodies.len();
+                // Job 022 (§30): compile defaults left to right; each
+                // parameter is declared after its default. Declaring the
+                // parameters here is also what binds them as locals for the
+                // body (arrow parameters previously never declared).
+                let mut param_defaults = Vec::new();
+                for (i, param) in params.iter().enumerate() {
+                    if let Some(ref default_expr) = param.default_value {
+                        self.validate_default_param_refs(default_expr, params, i)?;
+                        let default_idx = self.compile_default_body(default_expr)?;
+                        param_defaults.push(Some(default_idx));
+                    } else {
+                        param_defaults.push(None);
+                    }
+                    self.declare_variable(&param.name, false)?;
+                }
+                self.functions[func_idx].param_defaults = param_defaults;
 
                 let entry_point = self.instructions.len();
 
@@ -1970,14 +2151,21 @@ impl Compiler {
                         }
                     }
                 }
+                // Job 022 (§30): remap default bodies by the same offset.
+                for body in &mut self.default_bodies[saved_defaults_count..] {
+                    for instr in body {
+                        if let Opcode::LoadConst(idx) = instr {
+                            *idx += constant_offset;
+                        }
+                    }
+                }
 
                 self.functions[func_idx].entry_point = entry_point;
                 self.functions[func_idx].local_count = local_count;
                 self.functions[func_idx].captured_vars = captured.iter().map(|(n, _)| n.clone()).collect();
 
-                // Function metadata stays in the constant pool (§126) — index
-                // based consumers such as param defaults keep their indices —
-                // but the value itself is pushed by LOAD_FUNCTION (§141).
+                // Function metadata stays in the constant pool (§126) but the
+                // value itself is pushed by LOAD_FUNCTION (§141).
                 self.add_constant(Constant::Function(func_idx));
                 self.emit(Opcode::LoadFunction(func_idx));
 
@@ -2025,6 +2213,66 @@ impl Compiler {
     }
 }
 
+/// Job 022 (§30): collect every identifier read (or assigned) by an
+/// expression, skipping nested function/arrow subtrees — those declare their
+/// own scope, so names inside them do not bind this function's parameters.
+fn collect_ident_refs(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::NumberLiteral(..)
+        | Expr::StringLiteral(..)
+        | Expr::BooleanLiteral(..)
+        | Expr::NullLiteral(..) => {}
+        Expr::Identifier(name, _) => out.push(name.clone()),
+        Expr::Unary { operand, .. } | Expr::Postfix { operand, .. } => {
+            collect_ident_refs(operand, out);
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_ident_refs(left, out);
+            collect_ident_refs(right, out);
+        }
+        Expr::Assignment { target, value, .. }
+        | Expr::CompoundAssignment { target, value, .. } => {
+            collect_ident_refs(target, out);
+            collect_ident_refs(value, out);
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_ident_refs(callee, out);
+            for arg in args {
+                collect_ident_refs(arg, out);
+            }
+        }
+        Expr::Member { object, .. } => collect_ident_refs(object, out),
+        Expr::Index { object, index, .. } => {
+            collect_ident_refs(object, out);
+            collect_ident_refs(index, out);
+        }
+        Expr::List { elements, .. } => {
+            for element in elements {
+                collect_ident_refs(element, out);
+            }
+        }
+        Expr::Object { properties, .. } => {
+            for prop in properties {
+                collect_ident_refs(&prop.value, out);
+            }
+        }
+        // New scope: names inside resolve against the nested function's own
+        // parameters/locals, not this function's later parameters.
+        Expr::Function { .. } | Expr::ArrowFunction { .. } => {}
+        Expr::Ternary {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_ident_refs(condition, out);
+            collect_ident_refs(then_branch, out);
+            collect_ident_refs(else_branch, out);
+        }
+        Expr::Await { expr, .. } => collect_ident_refs(expr, out),
+    }
+}
+
 pub fn compile(program: &Program) -> Result<BytecodeProgram, CompilerError> {
     let mut compiler = Compiler::new();
     compiler.compile_program(program)?;
@@ -2034,6 +2282,7 @@ pub fn compile(program: &Program) -> Result<BytecodeProgram, CompilerError> {
         instructions: compiler.instructions,
         functions: compiler.functions,
         function_bodies: compiler.function_bodies,
+        default_bodies: compiler.default_bodies,
     })
 }
 
@@ -2041,6 +2290,7 @@ pub fn compile(program: &Program) -> Result<BytecodeProgram, CompilerError> {
 /// Function bodies stay in `function_bodies` for the loader to merge across modules.
 pub fn compile_module(path: &str, program: &Program) -> Result<ModuleUnit, CompilerError> {
     let mut compiler = Compiler::new_module();
+    compiler.seed_export_names(program);
     for stmt in &program.statements {
         compiler.compile_statement(stmt)?;
     }
@@ -2052,6 +2302,7 @@ pub fn compile_module(path: &str, program: &Program) -> Result<ModuleUnit, Compi
         constants: compiler.constants,
         functions: compiler.functions,
         function_bodies: compiler.function_bodies,
+        default_bodies: compiler.default_bodies,
         exports: compiler.exports,
         imports: compiler.imports,
         re_exports: compiler.re_exports,
@@ -2066,6 +2317,7 @@ pub fn merge_modules(units: &[ModuleUnit]) -> BytecodeProgram {
         instructions: Vec::new(),
         functions: Vec::new(),
         function_bodies: Vec::new(),
+        default_bodies: Vec::new(),
     };
 
     for unit in units {
@@ -2095,9 +2347,8 @@ pub fn merge_modules(units: &[ModuleUnit]) -> BytecodeProgram {
             let mut f = func.clone();
             // entry_point is fixed after all bodies are appended below.
             f.entry_point = 0;
-            for d in f.param_defaults.iter_mut().flatten() {
-                *d += const_offset;
-            }
+            // param_defaults index default_bodies (Job 022, §30), which are
+            // appended for this unit in the same pass — indices stay stable.
             combined.functions.push(f);
         }
 
@@ -2107,6 +2358,16 @@ pub fn merge_modules(units: &[ModuleUnit]) -> BytecodeProgram {
                 .map(|instr| remap_body_instr(instr, const_offset, func_offset))
                 .collect();
             combined.function_bodies.push(std::mem::take(&mut remapped));
+        }
+
+        // Job 022 (§30): default-expression bodies merge like function
+        // bodies — constants and function indices offset by the same pass.
+        for body in &unit.default_bodies {
+            let remapped: Vec<Opcode> = body
+                .iter()
+                .map(|instr| remap_body_instr(instr, const_offset, func_offset))
+                .collect();
+            combined.default_bodies.push(remapped);
         }
     }
 
@@ -2714,5 +2975,54 @@ mod tests {
             assert!(function.entry_point + body.len() <= bc.instructions.len());
             assert!(bc.instructions[function.entry_point..function.entry_point + body.len()] == *body);
         }
+    }
+
+    // ===== Job 022: default parameters encoded as call-time bodies (§30) =====
+
+    /// §30 "Default tidak dapat menggunakan parameter yang dideklarasikan
+    /// setelahnya" is a compile error (test req 4); the previous-parameter
+    /// form of the same shape must still compile.
+    #[test]
+    fn test_job022_later_parameter_reference_is_compile_error() {
+        let compile_str = |src: &str| {
+            let mut lexer = Lexer::new(src);
+            let tokens = lexer.tokenize().unwrap();
+            let mut parser = Parser::new(tokens);
+            let program = parser.parse().unwrap();
+            compile(&program)
+        };
+        let err = compile_str("function bad(a = b, b) { }").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'b'") && msg.contains("declared later"),
+            "unexpected error message: {}",
+            msg
+        );
+        assert!(compile_str("function ok(a, b = a + 1) { return b }").is_ok());
+        // The rule holds for any parameter position, not just the first.
+        assert!(compile_str("function bad2(x, y = z, z) { }").is_err());
+    }
+
+    /// Job 022 Scope A: defaults are their own bodies in `default_bodies`,
+    /// indexed by `FunctionInfo.param_defaults`, not constants spliced into
+    /// the caller's instruction stream.
+    #[test]
+    fn test_job022_default_bodies_encoded_not_in_caller_stream() {
+        let bc = compile_source("function f(a = 1, b, c = a + 2) { return b }");
+        let function = &bc.functions[0];
+        assert_eq!(
+            function.param_defaults,
+            vec![Some(0), None, Some(1)],
+            "param_defaults must index default_bodies"
+        );
+        assert_eq!(bc.default_bodies.len(), 2);
+        // Each default body is a standalone stream ending in Return.
+        for body in &bc.default_bodies {
+            assert!(!body.is_empty());
+            assert!(matches!(body.last(), Some(Opcode::Return)));
+        }
+        // `a = 1` compiles to exactly the literal load and the return.
+        assert_eq!(bc.default_bodies[0].len(), 2);
+        assert!(matches!(bc.default_bodies[0][0], Opcode::LoadConst(0)));
     }
 }
