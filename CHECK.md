@@ -5,6 +5,8 @@ Tests: 727 passed, 0 failed (Job 017 baseline 623; +93 unit tests = 716 lib test
 Source files audited: src/*.rs (16 files — lib.rs, package.rs, version.rs added Job 017) + src/bin/zpm.rs + tests/zero017_zpm_cli.rs
 Spec files audited: Language.md, Bytecode.md, ZeroVM.md, Runtime.md, Modules.md, Async.md, StandardLibrary.md, Dependencies.md, INDEX.md
 
+> **Note (2026-10-05, vm modularization):** citations of the form `vm.rs:NNN` in the rows below refer to the pre-split single-file layout (last committed as `src/vm.rs` at commit 5858ce9); the file is now `src/vm/mod.rs` + sibling modules (`vm/` directory split, pure code motion, suite unchanged). Historical rows are left unmodified per AGENTS §11 — resolve against commit 5858ce9 when auditing a historical claim.
+
 ---
 
 ## Status Legend
