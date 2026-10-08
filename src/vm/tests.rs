@@ -6326,3 +6326,307 @@ main()"#
         vm.run_modules(&modules).unwrap();
         assert_eq!(vm.get_output(), &["a"]);
     }
+
+    // ---- Job 023: execution limits (§150 + §133, ISSUES §71) ----
+
+    /// Run `source` under the given limits. Returns the output captured up
+    /// to termination plus the run result — output matters for the §153
+    /// "no instruction after termination" assertions.
+    fn run_source_with_limits(
+        source: &str,
+        limits: Limits,
+    ) -> (Vec<String>, Result<(), VmError>) {
+        let bc = compile_source(source);
+        let mut vm = ZeroVM::new(bc);
+        vm.set_limits(limits).unwrap();
+        let result = vm.run();
+        (vm.get_output().to_vec(), result)
+    }
+
+    #[test]
+    fn test_job023_call_depth_limit_is_catchable() {
+        let src = "function recur() {\n    return recur()\n}\ntry {\n    recur()\n    print(\"no-error\")\n} catch e {\n    print(e.type)\n    print(string(e))\n}";
+        let (output, result) = run_source_with_limits(
+            src,
+            Limits {
+                call_stack_depth: Some(40),
+                ..Default::default()
+            },
+        );
+        result.unwrap();
+        assert_eq!(output[0], "LimitError");
+        assert!(
+            output[1].contains("call stack depth"),
+            "{:?}",
+            output[1]
+        );
+    }
+
+    #[test]
+    fn test_job023_call_depth_limit_uncaught_is_error() {
+        let src = "function recur() {\n    return recur()\n}\nrecur()";
+        let (output, result) = run_source_with_limits(
+            src,
+            Limits {
+                call_stack_depth: Some(30),
+                ..Default::default()
+            },
+        );
+        match result {
+            Err(VmError::RuntimeError(msg)) => {
+                assert!(msg.contains("Execution limit exceeded"), "{}", msg);
+                assert!(msg.contains("call stack depth"), "{}", msg);
+            }
+            other => panic!("expected limit runtime error, got {:?}", other),
+        }
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_job023_instruction_limit_stops_infinite_loop() {
+        let src = "let i = 0\nwhile true { i = i + 1 }";
+        let (_output, result) = run_source_with_limits(
+            src,
+            Limits {
+                instruction_count: Some(5000),
+                ..Default::default()
+            },
+        );
+        match result {
+            Err(VmError::RuntimeError(msg)) => {
+                assert!(msg.contains("instruction count"), "{}", msg)
+            }
+            other => panic!("expected instruction limit error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_job023_instruction_limit_under_budget_completes() {
+        let (output, result) = run_source_with_limits(
+            "print(\"ok\")",
+            Limits {
+                instruction_count: Some(1_000_000),
+                ..Default::default()
+            },
+        );
+        result.unwrap();
+        assert_eq!(output, vec!["ok"]);
+    }
+
+    #[test]
+    fn test_job023_execution_time_limit_stops_busy_loop() {
+        let src = "while true { let x = 1 }";
+        let (_output, result) = run_source_with_limits(
+            src,
+            Limits {
+                execution_time_ms: Some(30),
+                ..Default::default()
+            },
+        );
+        match result {
+            Err(VmError::RuntimeError(msg)) => {
+                assert!(msg.contains("wall clock time"), "{}", msg)
+            }
+            other => panic!("expected wall-clock limit error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_job023_execution_time_limit_is_catchable() {
+        let src = "try {\n    while true {\n        let x = 1\n    }\n} catch e {\n    print(e.type)\n}";
+        let (output, result) = run_source_with_limits(
+            src,
+            Limits {
+                execution_time_ms: Some(30),
+                ..Default::default()
+            },
+        );
+        result.unwrap();
+        assert_eq!(output, vec!["LimitError"]);
+    }
+
+    #[test]
+    fn test_job023_execution_time_under_budget_completes() {
+        let (output, result) = run_source_with_limits(
+            "print(\"ok\")",
+            Limits {
+                execution_time_ms: Some(60_000),
+                ..Default::default()
+            },
+        );
+        result.unwrap();
+        assert_eq!(output, vec!["ok"]);
+    }
+
+    #[test]
+    fn test_job023_task_count_limit_is_error() {
+        let src = "async function f() {\n    return 1\n}\nlet a = f()\nlet b = f()";
+        let (output, result) = run_source_with_limits(
+            src,
+            Limits {
+                task_count: Some(1),
+                ..Default::default()
+            },
+        );
+        match result {
+            Err(VmError::RuntimeError(msg)) => {
+                assert!(msg.contains("task count"), "{}", msg)
+            }
+            other => panic!("expected task count limit error, got {:?}", other),
+        }
+        assert!(output.is_empty());
+    }
+
+    /// ISSUES §71e: the limit counts non-terminal tasks, so a program that
+    /// awaits tasks to completion may create more tasks than the limit over
+    /// the lifetime of the run (terminal tasks never release table slots).
+    #[test]
+    fn test_job023_task_count_counts_only_active_tasks() {
+        let src = "async function f() {\n    return 1\n}\nasync function main() {\n    let a = f()\n    await a\n    let b = f()\n    await b\n    let c = f()\n    print(\"ok\")\n}\nmain()";
+        let (output, result) = run_source_with_limits(
+            src,
+            Limits {
+                task_count: Some(2),
+                ..Default::default()
+            },
+        );
+        result.unwrap();
+        assert_eq!(output, vec!["ok"]);
+    }
+
+    /// §133: exceeding the heap cap is a VM Error — try/catch must not catch
+    /// it (ISSUES §71a), and no instruction runs after the termination (§153).
+    #[test]
+    fn test_job023_memory_limit_exceeded_is_vm_error_not_catchable() {
+        let src = "let k = [1]\ntry {\n    while true {\n        list.add(k, [1])\n    }\n} catch e {\n    print(\"caught\")\n}\nprint(\"after\")";
+        let (output, result) = run_source_with_limits(
+            src,
+            Limits {
+                heap_slots: Some(40),
+                ..Default::default()
+            },
+        );
+        match result {
+            Err(VmError::MemoryLimit(msg)) => {
+                assert!(msg.contains("heap slots"), "{}", msg)
+            }
+            other => panic!("expected memory limit VM error, got {:?}", other),
+        }
+        assert!(output.is_empty(), "{:?}", output);
+    }
+
+    /// §133/§71d: GC runs before the allocation is declared failed, so
+    /// reclaimable garbage does not count — the same cap that a live-growth
+    /// program dies on lets 400 garbage iterations through.
+    #[test]
+    fn test_job023_memory_limit_gc_frees_garbage_before_failing() {
+        let src = "let i = 0\nwhile i < 400 {\n    let g = [i]\n    i = i + 1\n}\nprint(\"done\")";
+        let (output, result) = run_source_with_limits(
+            src,
+            Limits {
+                heap_slots: Some(40),
+                ..Default::default()
+            },
+        );
+        result.unwrap();
+        assert_eq!(output, vec!["done"]);
+    }
+
+    /// §149: a zero budget is invalid configuration — rejected by the setter
+    /// and again at run entry before the first instruction (ISSUES §71f).
+    #[test]
+    fn test_job023_invalid_limit_is_startup_error() {
+        let bc = compile_source("print(1)");
+        let mut vm = ZeroVM::new(bc);
+        for bad in [
+            Limits {
+                execution_time_ms: Some(0),
+                ..Default::default()
+            },
+            Limits {
+                heap_slots: Some(0),
+                ..Default::default()
+            },
+            Limits {
+                call_stack_depth: Some(0),
+                ..Default::default()
+            },
+            Limits {
+                task_count: Some(0),
+                ..Default::default()
+            },
+            Limits {
+                instruction_count: Some(0),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                vm.set_limits(bad),
+                Err(VmError::InvalidRuntimeConfiguration(_))
+            ));
+        }
+        // Defense in depth: a value that bypasses the setter is caught at
+        // run entry, before any instruction executes.
+        vm.limits.heap_slots = Some(0);
+        let result = vm.run();
+        assert!(matches!(
+            result,
+            Err(VmError::InvalidRuntimeConfiguration(_))
+        ));
+        assert!(vm.get_output().is_empty());
+    }
+
+    /// §153: once the limit terminates the program, no further instruction
+    /// executes — the trailing print never runs.
+    #[test]
+    fn test_job023_no_instruction_runs_after_limit_termination() {
+        let src = "let i = 0\nwhile true { i = i + 1 }\nprint(\"after\")";
+        let (output, result) = run_source_with_limits(
+            src,
+            Limits {
+                instruction_count: Some(3000),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(result, Err(VmError::RuntimeError(_))));
+        assert!(output.is_empty(), "{:?}", output);
+    }
+
+    #[test]
+    fn test_job023_unlimited_by_default_completes() {
+        let (output, result) = run_source_with_limits("print(\"ok\")", Limits::default());
+        result.unwrap();
+        assert_eq!(output, vec!["ok"]);
+    }
+
+    /// ISSUES §71b: while HTTP is on the wire the scheduler parks in real
+    /// time — the wall-clock limit still fires there (no instruction
+    /// boundary runs), and with no context loaded it surfaces uncaught
+    /// (ISSUES §71a).
+    #[test]
+    fn test_job023_time_limit_trips_while_waiting_for_http() {
+        let (base, _recs) = spawn_mock_server(|_| {
+            thread::sleep(Duration::from_millis(300));
+            plain_reply("late")
+        });
+        let src = r#"async function main() {
+    let res = await http.get("__URL__/slow")
+    print(res.status)
+}
+main()"#
+            .replace("__URL__", &base);
+        let (output, result) = run_source_with_limits(
+            &src,
+            Limits {
+                execution_time_ms: Some(50),
+                ..Default::default()
+            },
+        );
+        match result {
+            Err(VmError::RuntimeError(msg)) => {
+                assert!(msg.contains("wall clock time"), "{}", msg)
+            }
+            other => panic!("expected wall-clock limit error, got {:?}", other),
+        }
+        assert!(output.is_empty(), "{:?}", output);
+    }

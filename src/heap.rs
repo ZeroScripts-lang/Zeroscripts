@@ -163,6 +163,14 @@ impl Heap {
         }
     }
 
+    /// Occupied slots — allocated objects not on the free list. The §133
+    /// memory-limit metric (ISSUES §71d): reclaimable garbage occupies
+    /// slots until the GC moves them onto the free list, so the cap is
+    /// re-checked after a GC-first pass.
+    pub fn occupied_slots(&self) -> usize {
+        self.slots.len() - self.free_list.len()
+    }
+
     pub fn get(&self, reference: &HeapRef) -> Result<&HeapObject, HeapError> {
         if reference.index >= self.slots.len() {
             return Err(HeapError::InvalidReference(format!(

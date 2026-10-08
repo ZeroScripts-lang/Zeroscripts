@@ -6,6 +6,7 @@ use crate::compiler::Opcode;
 use crate::heap::HeapRef as HeapRefHandle;
 
 use super::value::Value;
+use super::VmError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionState {
@@ -235,4 +236,43 @@ pub(super) struct FinallyMarker {
     pub(super) scope_pops: usize,
     pub(super) target: usize,
     pub(super) handler_pops: usize,
+}
+
+/// Host configuration for the §150 execution limits (execution time, call
+/// stack depth, task count, plus the instruction count sanctioned by
+/// ISSUES §71c) and the §133 heap memory limit (metric per ISSUES §71d).
+/// `None` = unlimited — §150 "dapat menerapkan", §133 "Tidak ada batas
+/// memory tetap yang diwajibkan". The program itself cannot change limits
+/// (§149); host API only (ISSUES §71g).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Limits {
+    /// Wall-clock execution budget in milliseconds (ISSUES §71b).
+    pub execution_time_ms: Option<u64>,
+    /// Heap occupancy cap in occupied slots (ISSUES §71d).
+    pub heap_slots: Option<usize>,
+    /// Maximum call-stack frames, root frame included (§150).
+    pub call_stack_depth: Option<usize>,
+    /// Maximum non-terminal tasks (ISSUES §71e).
+    pub task_count: Option<usize>,
+    /// Maximum dispatched instructions (ISSUES §71c).
+    pub instruction_count: Option<u64>,
+}
+
+impl Limits {
+    /// §149: invalid configuration before the program runs yields a startup
+    /// configuration error. A zero budget can never be satisfied by any
+    /// execution, so `Some(0)` is rejected (ISSUES §71f).
+    pub fn validate(&self) -> Result<(), VmError> {
+        if self.execution_time_ms == Some(0)
+            || self.heap_slots == Some(0)
+            || self.call_stack_depth == Some(0)
+            || self.task_count == Some(0)
+            || self.instruction_count == Some(0)
+        {
+            return Err(VmError::InvalidRuntimeConfiguration(
+                "execution limits must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }

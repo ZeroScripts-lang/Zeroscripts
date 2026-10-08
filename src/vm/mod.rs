@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use crate::compiler::{BytecodeProgram, Constant, FunctionInfo, Opcode, FINALLY_MARKER};
 use crate::gc::Gc;
@@ -15,7 +16,7 @@ mod validate;
 mod value;
 
 pub use error::VmError;
-pub use types::{ExecutionState, TaskState};
+pub use types::{ExecutionState, Limits, TaskState};
 pub use value::Value;
 use error::classify_runtime_error;
 use helpers::{
@@ -67,6 +68,15 @@ pub struct ZeroVM {
     /// Lives outside every execution context so task contexts (§112), which
     /// do not contain the root frame, still resolve globals identically.
     global_scope: HashMap<String, Binding>,
+    /// §150 execution limits + §133 heap limit — host configuration only
+    /// (§149, ISSUES §71g); `None` fields = unlimited (ISSUES §71f default).
+    limits: Limits,
+    /// Dispatched-instruction counter for the §150 instruction-count limit
+    /// (ISSUES §71c) and the amortized wall-time sample (ISSUES §71b).
+    instructions_executed: u64,
+    /// Wall-clock origin stamped at run/run_modules entry — §150 execution
+    /// time is real elapsed resource time, not the virtual `now_ms` (§71b).
+    execution_started: Option<Instant>,
 }
 
 impl ZeroVM {
@@ -92,6 +102,9 @@ impl ZeroVM {
             now_ms: 0,
             next_terminal_seq: 0,
             global_scope: HashMap::new(),
+            limits: Limits::default(),
+            instructions_executed: 0,
+            execution_started: None,
         }
     }
 
@@ -100,6 +113,17 @@ impl ZeroVM {
     /// (e.g. `zerovm app.zs hello world` → `["hello", "world"]`).
     pub fn set_program_args(&mut self, args: Vec<String>) {
         self.program_args = args;
+    }
+
+    /// Configure the §150 execution limits / §133 heap limit. Host-side only
+    /// (§149; the program cannot change limits, ISSUES §71g); `None` fields
+    /// stay unlimited. Invalid values (any limit = 0) are rejected here and
+    /// again at run/run_modules entry before the first instruction (§149
+    /// startup error, ISSUES §71f).
+    pub fn set_limits(&mut self, limits: Limits) -> Result<(), VmError> {
+        limits.validate()?;
+        self.limits = limits;
+        Ok(())
     }
 
     pub fn heap(&self) -> &Heap {
@@ -243,8 +267,95 @@ impl ZeroVM {
         }
     }
 
+    /// §150/§133 enforcement at the instruction boundary: instruction
+    /// count, amortized wall time, and heap occupancy with GC-first (§133,
+    /// ISSUES §71d). Call depth and task count are checked at their push
+    /// sites. Runtime-limit failures are ordinary `RuntimeError`s so the
+    /// existing catch machinery applies (ISSUES §71a); the memory limit
+    /// aborts with a VM Error.
+    fn check_execution_limits(&mut self) -> Result<(), VmError> {
+        self.instructions_executed = self.instructions_executed.wrapping_add(1);
+
+        if let Some(max) = self.limits.instruction_count {
+            if self.instructions_executed > max {
+                return Err(VmError::RuntimeError(format!(
+                    "Execution limit exceeded: instruction count {}",
+                    max
+                )));
+            }
+        }
+
+        if let Some(max_ms) = self.limits.execution_time_ms {
+            // Amortized sample (ISSUES §71b): every 1024 instructions the
+            // real clock is read; idle time is covered by the scheduler's
+            // park-loop check instead.
+            if self.instructions_executed % 1024 == 0 {
+                if let Some(start) = self.execution_started {
+                    if start.elapsed().as_millis() > max_ms as u128 {
+                        return Err(VmError::RuntimeError(format!(
+                            "Execution limit exceeded: wall clock time {}ms",
+                            max_ms
+                        )));
+                    }
+                }
+            }
+        }
+
+        if let Some(max_slots) = self.limits.heap_slots {
+            if self.heap.occupied_slots() > max_slots {
+                // §133: "Garbage collection dapat dijalankan sebelum runtime
+                // menyatakan allocation gagal" — GC first, then re-measure.
+                self.run_gc();
+                let occupied = self.heap.occupied_slots();
+                if occupied > max_slots {
+                    return Err(VmError::MemoryLimit(format!(
+                        "{} heap slots occupied, limit {}",
+                        occupied, max_slots
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// §150 call stack depth: the call that would push frame `max + 1`
+    /// (root frame included) is rejected before it happens (ISSUES §71a).
+    fn check_call_depth(&self) -> Result<(), VmError> {
+        if let Some(max) = self.limits.call_stack_depth {
+            if self.call_stack.len() + 1 > max {
+                return Err(VmError::RuntimeError(format!(
+                    "Execution limit exceeded: call stack depth {}",
+                    max
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// §150 wall-time check for scheduler idle paths where no instruction
+    /// boundary runs (HTTP park, ISSUES §71b). No execution context is
+    /// loaded there, so the failure reaches the host uncaught (ISSUES §71a,
+    /// §153 termination).
+    fn check_idle_time_limit(&self) -> Result<(), VmError> {
+        if let Some(max_ms) = self.limits.execution_time_ms {
+            if let Some(start) = self.execution_started {
+                if start.elapsed().as_millis() > max_ms as u128 {
+                    return Err(VmError::RuntimeError(format!(
+                        "Execution limit exceeded: wall clock time {}ms",
+                        max_ms
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn run(&mut self) -> Result<(), VmError> {
         self.validate()?;
+        self.limits.validate()?;
+        self.instructions_executed = 0;
+        self.execution_started = Some(Instant::now());
         self.state = ExecutionState::Running;
         self.pc = self.program.entry_point;
 
@@ -304,6 +415,9 @@ impl ZeroVM {
         modules: &[crate::module::ModuleMeta],
     ) -> Result<(), VmError> {
         self.validate()?;
+        self.limits.validate()?;
+        self.instructions_executed = 0;
+        self.execution_started = Some(Instant::now());
         self.state = ExecutionState::Running;
 
         self.global_scope.clear();
@@ -488,6 +602,8 @@ impl ZeroVM {
     }
 
     fn execute_instruction(&mut self, instruction: &Opcode) -> Result<(), VmError> {
+        // §150/§133: enforce configured limits before dispatching (ISSUES §71).
+        self.check_execution_limits()?;
         match instruction {
             Opcode::LoadConst(idx) => self.execute_load_const(*idx),
             Opcode::DeclareLocal(name, is_const) => self.execute_declare_local(name, *is_const),
@@ -971,6 +1087,9 @@ impl ZeroVM {
                     return self.create_task(func_idx, args, func_value.clone(), None);
                 }
 
+                // §150 call stack depth — reject before defaults run.
+                self.check_call_depth()?;
+
                 // Job 022 (§30): defaults are evaluated at call time.
                 let Some(root_scope) =
                     self.build_function_scope(&func_info, &args, &func_value, None)?
@@ -1032,6 +1151,9 @@ impl ZeroVM {
                     // §101: async closure call creates a task with its env.
                     return self.create_task(func_idx, args, func_value.clone(), Some(env.clone()));
                 }
+
+                // §150 call stack depth — reject before defaults run.
+                self.check_call_depth()?;
 
                 // Job 022 (§30): defaults are evaluated at call time, with
                 // captured names resolvable through the closure environment.

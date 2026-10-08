@@ -13,6 +13,10 @@ pub enum VmError {
     StackUnderflow(String),
     InvalidRuntimeOperation(String),
     InvalidExecutionState(String),
+    /// §149 startup/runtime configuration error (ISSUES §71f).
+    InvalidRuntimeConfiguration(String),
+    /// §133 heap memory limit — a VM Error, not catchable (ISSUES §71a).
+    MemoryLimit(String),
     RuntimeError(String),
 }
 
@@ -39,6 +43,10 @@ impl fmt::Display for VmError {
             VmError::InvalidExecutionState(msg) => {
                 write!(f, "Invalid execution state: {}", msg)
             }
+            VmError::InvalidRuntimeConfiguration(msg) => {
+                write!(f, "Invalid runtime configuration: {}", msg)
+            }
+            VmError::MemoryLimit(msg) => write!(f, "Memory limit exceeded: {}", msg),
             VmError::RuntimeError(msg) => write!(f, "Runtime error: {}", msg),
         }
     }
@@ -107,6 +115,9 @@ pub(super) fn classify_runtime_error(msg: &str) -> &'static str {
         || TYPE_ERROR_PREFIXES.iter().any(|prefix| msg.starts_with(prefix))
     {
         return "TypeError";
+    }
+    if msg.starts_with("Execution limit exceeded") {
+        return "LimitError";
     }
     "RuntimeError"
 }

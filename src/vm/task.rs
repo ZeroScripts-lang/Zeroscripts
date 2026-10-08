@@ -16,6 +16,16 @@ impl ZeroVM {
         callee: Value,
         env: Option<HeapRefHandle>,
     ) -> Result<(), VmError> {
+        // §150 task count: only non-terminal tasks count (ISSUES §71e).
+        if let Some(max) = self.limits.task_count {
+            let active = self.tasks.len() - self.count_terminal();
+            if active + 1 > max {
+                return Err(VmError::RuntimeError(format!(
+                    "Execution limit exceeded: task count {}",
+                    max
+                )));
+            }
+        }
         let id = self.tasks.len();
         // args/callee/env live in the task table — scanned by gc_roots
         // (§121 "task yang masih berjalan").
@@ -45,6 +55,17 @@ impl ZeroVM {
     /// terminal, so they are evaluated immediately; sleeps only complete when
     /// a timer fires (so `task.sleep(0)` still yields, §111).
     pub(super) fn create_synthetic_task(&mut self, kind: TaskKind) -> Result<usize, VmError> {
+        // §150 task count: synthetic (combinator/sleep) tasks are tasks too
+        // — same non-terminal policy as `create_task` (ISSUES §71e).
+        if let Some(max) = self.limits.task_count {
+            let active = self.tasks.len() - self.count_terminal();
+            if active + 1 > max {
+                return Err(VmError::RuntimeError(format!(
+                    "Execution limit exceeded: task count {}",
+                    max
+                )));
+            }
+        }
         let id = self.tasks.len();
         let is_sleep = matches!(kind, TaskKind::Sleep { .. });
         self.tasks.push(Task {
@@ -549,6 +570,9 @@ impl ZeroVM {
             // wire: wait in real time. Virtual time must not jump here —
             // HTTP progress depends on the real clock (ISSUES §65).
             if self.http_inflight() {
+                // §150: wall time keeps passing while parked (ISSUES §71b);
+                // no context is loaded, so this surfaces uncaught (§71a).
+                self.check_idle_time_limit()?;
                 thread::park_timeout(Duration::from_millis(1));
                 continue;
             }
