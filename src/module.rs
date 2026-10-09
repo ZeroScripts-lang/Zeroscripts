@@ -465,6 +465,21 @@ impl Loader {
 
     /// Load `path` and all its dependencies (DFS post-order, §71).
     fn visit(&mut self, path: &Path) -> Result<(), ModuleError> {
+        self.visit_with_source(path, None)
+    }
+
+    /// Same as `visit` but the entry unit's source is supplied directly
+    /// instead of being read from disk (used by `load_source` for the
+    /// `zsc -e` virtual entry, §100 "Mode Evaluasi" / ISSUES §72a).
+    fn visit_entry_source(&mut self, path: &Path, source: &str) -> Result<(), ModuleError> {
+        self.visit_with_source(path, Some(source))
+    }
+
+    fn visit_with_source(
+        &mut self,
+        path: &Path,
+        source_override: Option<&str>,
+    ) -> Result<(), ModuleError> {
         if self.black.contains_key(path) {
             return Ok(());
         }
@@ -479,9 +494,16 @@ impl Loader {
 
         self.gray.push(path.to_path_buf());
 
-        let source = std::fs::read_to_string(path)
-            .map_err(|e| ModuleError::Io(format!("Cannot read {}: {}", path.display(), e)))?;
-        let (program, raw_imports, raw_re_exports) = parse_and_extract_imports(&source)?;
+        let read_source;
+        let source: &str = match source_override {
+            Some(s) => s,
+            None => {
+                read_source = std::fs::read_to_string(path)
+                    .map_err(|e| ModuleError::Io(format!("Cannot read {}: {}", path.display(), e)))?;
+                &read_source
+            }
+        };
+        let (program, raw_imports, raw_re_exports) = parse_and_extract_imports(source)?;
 
         // Resolve deps in source order (§71). Imports first, then re-exports.
         let mut resolved: Vec<(String, String, String, PathBuf)> = Vec::new();
@@ -631,7 +653,25 @@ pub fn load(entry_path: &Path) -> Result<ModuleBundle, ModuleError> {
 
     let mut loader = Loader::new(project);
     loader.visit(&entry_canon)?;
+    Ok(finish(loader))
+}
 
+/// Compile `source` as the entry module without touching disk for the entry
+/// itself (§100 "Mode Evaluasi", ISSUES §72a): the eval program has no file
+/// and is treated as living at `virtual_path` (typically
+/// `<cwd>/__zsc_eval__.zs`), so relative imports resolve from the current
+/// working directory per §64. Imported files are read normally.
+pub fn load_source(virtual_path: &Path, source: &str) -> Result<ModuleBundle, ModuleError> {
+    let project =
+        Project::discover(virtual_path).map_err(|e| ModuleError::Package(e.message()))?;
+    let mut loader = Loader::new(project);
+    loader.visit_entry_source(virtual_path, source)?;
+    Ok(finish(loader))
+}
+
+/// Merge loaded units into a single program (§58-§60) and build
+/// `ModuleMeta` with instruction ranges by walking the merged layout.
+fn finish(mut loader: Loader) -> ModuleBundle {
     let order = std::mem::take(&mut loader.order);
     let units = loader.units;
 
@@ -641,7 +681,6 @@ pub fn load(entry_path: &Path) -> Result<ModuleBundle, ModuleError> {
         .collect();
     let program = merge_modules(&unit_list);
 
-    // Build ModuleMeta with instruction ranges by walking merged layout.
     let mut modules = Vec::new();
     let mut cursor = 0usize;
     for p in &order {
@@ -658,7 +697,7 @@ pub fn load(entry_path: &Path) -> Result<ModuleBundle, ModuleError> {
         cursor += len;
     }
 
-    Ok(ModuleBundle { program, modules })
+    ModuleBundle { program, modules }
 }
 
 #[cfg(test)]
