@@ -19,7 +19,4 @@ jobs-extended.md
 jobs-tambahan.md
 jawaban.md
 opsi.md
-color-test.zs
-hello.zs
-math.zs
-test.zs
+/examples/*.zsbc

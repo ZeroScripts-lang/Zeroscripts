@@ -1,0 +1,11 @@
+{
+    name: "My-Project",
+    version: "0.1.0",
+    description: "Idk",
+    author: "Kaelzyy",
+    license: "MIT",
+    keywords: [
+        "Idk"
+    ],
+    dependencies: {}
+}

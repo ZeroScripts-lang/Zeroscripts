@@ -1,0 +1,6 @@
+print(color.red("Error"))
+print(color.green("Success"))
+print(color.yellow("Warning"))
+print(color.blue("Info"))
+print(color.bold("Bold"))
+print(color.bold(color.red("Bold Error")))
