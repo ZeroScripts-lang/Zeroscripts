@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod bytecode_io;
 pub mod compiler;
 pub mod error;
 pub mod gc;
