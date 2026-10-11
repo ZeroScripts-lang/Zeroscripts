@@ -34,7 +34,11 @@ use types::{
 pub struct ZeroVM {
     program: BytecodeProgram,
     pc: usize,
-    stack: Vec<Value>,
+    /// §116: value-stack values not owned by any frame. Normally empty —
+    /// every frame keeps its operands in `Frame.stack`. Non-empty only in
+    /// the degenerate top-level-return window after the root frame was
+    /// popped, preserving the pre-refactor paths (ISSUES §75).
+    orphan_stack: Vec<Value>,
     call_stack: Vec<Frame>,
     state: ExecutionState,
     output: Vec<String>,
@@ -56,7 +60,8 @@ pub struct ZeroVM {
     /// (§112 lets the scheduler choose; FIFO keeps it deterministic).
     ready_queue: VecDeque<usize>,
     /// Id of the task whose context is currently loaded into the instruction
-    /// loop fields (pc/instructions/stack/call_stack/handlers).
+    /// loop fields (pc/instructions/call_stack/handlers; value stacks ride
+    /// inside their frames).
     active_task: Option<usize>,
     /// Virtual monotonic clock (milliseconds) for sleep/timeout (§110, §111).
     /// Advanced to the earliest deadline only when nothing is runnable; the
@@ -84,7 +89,7 @@ impl ZeroVM {
         Self {
             program,
             pc: 0,
-            stack: Vec::new(),
+            orphan_stack: Vec::new(),
             call_stack: Vec::new(),
             state: ExecutionState::Running,
             output: Vec::new(),
@@ -186,7 +191,7 @@ impl ZeroVM {
     /// §120/§121 leave GC timing to the implementation.
     fn gc_roots(&self) -> Vec<HeapRefHandle> {
         let mut roots = Vec::new();
-        for value in &self.stack {
+        for value in &self.orphan_stack {
             collect_value_refs(value, &mut roots);
         }
         for frame in &self.call_stack {
@@ -218,9 +223,6 @@ impl ZeroVM {
                 collect_value_refs(value, &mut roots);
             }
             if let Some(ctx) = &task.context {
-                for value in &ctx.stack {
-                    collect_value_refs(value, &mut roots);
-                }
                 for frame in &ctx.call_stack {
                     collect_frame_refs(frame, &mut roots);
                 }
@@ -366,6 +368,7 @@ impl ZeroVM {
         self.call_stack.push(Frame {
             function_index: 0,
             scopes: vec![HashMap::new()],
+            stack: Vec::new(),
             return_pc: 0,
             captured_env: None,
             scope_env: None,
@@ -425,6 +428,7 @@ impl ZeroVM {
         self.call_stack.push(Frame {
             function_index: 0,
             scopes: vec![HashMap::new()],
+            stack: Vec::new(),
             return_pc: 0,
             captured_env: None,
             scope_env: None,
@@ -597,8 +601,28 @@ impl ZeroVM {
         &self.state
     }
 
+    /// §116 view of the active frame's value stack (or the orphan slot when
+    /// no frame exists). At program end the root frame holds exactly what
+    /// the old shared stack held, so embedder/tests see the same slice.
     pub fn get_stack(&self) -> &[Value] {
-        &self.stack
+        self.stack()
+    }
+
+    /// §116: value stack of the active execution frame. Falls back to the
+    /// orphan slot only while no frame exists (top-level return window).
+    fn stack(&self) -> &Vec<Value> {
+        match self.call_stack.last() {
+            Some(frame) => &frame.stack,
+            None => &self.orphan_stack,
+        }
+    }
+
+    fn stack_mut(&mut self) -> &mut Vec<Value> {
+        if let Some(frame) = self.call_stack.last_mut() {
+            &mut frame.stack
+        } else {
+            &mut self.orphan_stack
+        }
     }
 
     fn execute_instruction(&mut self, instruction: &Opcode) -> Result<(), VmError> {
@@ -683,7 +707,7 @@ impl ZeroVM {
             return Err(VmError::InvalidConstantIndex(idx));
         }
         let value = self.constant_to_value(&self.program.constants[idx]);
-        self.stack.push(value);
+        self.stack_mut().push(value);
         Ok(())
     }
 
@@ -786,12 +810,12 @@ impl ZeroVM {
                                     name
                                 ))
                             })?;
-                            self.stack.push(value);
+                            self.stack_mut().push(value);
                             return Ok(());
                         }
                     }
                     let value = binding.value.clone();
-                    self.stack.push(value);
+                    self.stack_mut().push(value);
                     return Ok(());
                 }
             }
@@ -831,7 +855,7 @@ impl ZeroVM {
     fn execute_load_global(&mut self, name: &str) -> Result<(), VmError> {
         if let Some(binding) = self.global_scope.get(name) {
             let value = binding.value.clone();
-            self.stack.push(value);
+            self.stack_mut().push(value);
             return Ok(());
         }
         Err(VmError::RuntimeError(format!(
@@ -904,7 +928,7 @@ impl ZeroVM {
         let right = self.pop_stack("binary op")?;
         let left = self.pop_stack("binary op")?;
         let result = op(&left, &right)?;
-        self.stack.push(result);
+        self.stack_mut().push(result);
         Ok(())
     }
 
@@ -919,11 +943,11 @@ impl ZeroVM {
                         "Arithmetic result is not finite".to_string(),
                     ));
                 }
-                self.stack.push(Value::Number(result));
+                self.stack_mut().push(Value::Number(result));
                 Ok(())
             }
             Value::Null => {
-                self.stack.push(Value::Number(0.0));
+                self.stack_mut().push(Value::Number(0.0));
                 Ok(())
             }
             _ => Err(VmError::RuntimeError(format!(
@@ -937,11 +961,11 @@ impl ZeroVM {
         let value = self.pop_stack("positive")?;
         match &value {
             Value::Number(_) => {
-                self.stack.push(value);
+                self.stack_mut().push(value);
                 Ok(())
             }
             Value::Null => {
-                self.stack.push(Value::Number(0.0));
+                self.stack_mut().push(Value::Number(0.0));
                 Ok(())
             }
             _ => Err(VmError::RuntimeError(format!(
@@ -955,7 +979,7 @@ impl ZeroVM {
         let value = self.pop_stack("not")?;
         match &value {
             Value::Boolean(b) => {
-                self.stack.push(Value::Boolean(!b));
+                self.stack_mut().push(Value::Boolean(!b));
                 Ok(())
             }
             _ => Err(VmError::RuntimeError(format!(
@@ -973,16 +997,16 @@ impl ZeroVM {
 
     fn execute_dup(&mut self) -> Result<(), VmError> {
         let value = self.peek_stack("dup")?;
-        self.stack.push(value);
+        self.stack_mut().push(value);
         Ok(())
     }
 
     fn execute_swap(&mut self) -> Result<(), VmError> {
-        if self.stack.len() < 2 {
+        if self.stack().len() < 2 {
             return Err(VmError::StackUnderflow("swap needs 2 values".to_string()));
         }
-        let len = self.stack.len();
-        self.stack.swap(len - 1, len - 2);
+        let len = self.stack().len();
+        self.stack_mut().swap(len - 1, len - 2);
         Ok(())
     }
 
@@ -1035,20 +1059,23 @@ impl ZeroVM {
     }
 
     fn execute_call(&mut self, argc: usize) -> Result<(), VmError> {
-        if self.stack.len() < argc + 1 {
+        if self.stack().len() < argc + 1 {
             return Err(VmError::StackUnderflow(format!(
                 "Call needs {} args + function, stack has {}",
                 argc,
-                self.stack.len()
+                self.stack().len()
             )));
         }
 
-        let func_value = self.stack[self.stack.len() - argc - 1].clone();
+        let func_value = {
+            let stack = self.stack();
+            stack[stack.len() - argc - 1].clone()
+        };
 
         match &func_value {
             Value::BuiltIn(name) => {
                 let result = self.execute_builtin(name, argc)?;
-                self.stack.push(result);
+                self.stack_mut().push(result);
                 Ok(())
             }
             Value::Function(idx) => {
@@ -1109,6 +1136,7 @@ impl ZeroVM {
                 self.call_stack.push(Frame {
                     function_index: func_idx,
                     scopes: vec![root_scope],
+                    stack: Vec::new(),
                     return_pc,
                     captured_env: None,
                     scope_env: None,
@@ -1177,6 +1205,7 @@ impl ZeroVM {
                 self.call_stack.push(Frame {
                     function_index: func_idx,
                     scopes: vec![root_scope],
+                    stack: Vec::new(),
                     return_pc,
                     captured_env: Some(env.clone()),
                     scope_env: None,
@@ -1197,12 +1226,12 @@ impl ZeroVM {
 
     /// Pop `argc` values pushed as call arguments (no callee on the stack).
     fn pop_native_args(&mut self, argc: usize, context: &str) -> Result<Vec<Value>, VmError> {
-        if self.stack.len() < argc {
+        if self.stack().len() < argc {
             return Err(VmError::StackUnderflow(format!(
                 "{} needs {} argument(s), stack has {}",
                 context,
                 argc,
-                self.stack.len()
+                self.stack().len()
             )));
         }
         let mut args = Vec::with_capacity(argc);
@@ -1221,7 +1250,7 @@ impl ZeroVM {
                 index
             )));
         }
-        self.stack.push(Value::Function(index));
+        self.stack_mut().push(Value::Function(index));
         Ok(())
     }
 
@@ -1230,7 +1259,7 @@ impl ZeroVM {
     fn execute_call_native(&mut self, operation: &str, argc: usize) -> Result<(), VmError> {
         let args = self.pop_native_args(argc, operation)?;
         let result = self.call_native(operation, &args)?;
-        self.stack.push(result);
+        self.stack_mut().push(result);
         Ok(())
     }
 
@@ -1238,7 +1267,7 @@ impl ZeroVM {
     fn execute_list_add(&mut self, argc: usize) -> Result<(), VmError> {
         let args = self.pop_native_args(argc, "list.add")?;
         let result = self.native_list_add(&args)?;
-        self.stack.push(result);
+        self.stack_mut().push(result);
         Ok(())
     }
 
@@ -1246,7 +1275,7 @@ impl ZeroVM {
     fn execute_list_remove(&mut self, argc: usize) -> Result<(), VmError> {
         let args = self.pop_native_args(argc, "list.remove")?;
         let result = self.native_list_remove(&args)?;
-        self.stack.push(result);
+        self.stack_mut().push(result);
         Ok(())
     }
 
@@ -1254,7 +1283,7 @@ impl ZeroVM {
     fn execute_object_remove(&mut self, argc: usize) -> Result<(), VmError> {
         let args = self.pop_native_args(argc, "object.remove")?;
         let result = self.native_object_remove(&args)?;
-        self.stack.push(result);
+        self.stack_mut().push(result);
         Ok(())
     }
 
@@ -1384,13 +1413,14 @@ impl ZeroVM {
         }
 
         let saved_pc = self.pc;
-        let stack_at_start = self.stack.len();
+        let stack_at_start = self.stack().len();
         let default_body = self.program.default_bodies[default_idx].clone();
         let saved_instructions = std::mem::replace(&mut self.program.instructions, default_body);
         self.call_stack.push(Frame {
             // Default bodies are not functions; nothing reads this index.
             function_index: usize::MAX,
             scopes: vec![scope],
+            stack: Vec::new(),
             return_pc: saved_pc,
             captured_env,
             scope_env: None,
@@ -1434,9 +1464,9 @@ impl ZeroVM {
         // aborted evaluation — the call must not proceed.
         if self.call_stack.len() == depth - 1
             && self.pc == saved_pc
-            && self.stack.len() == stack_at_start + 1
+            && self.stack().len() == stack_at_start + 1
         {
-            Ok(Some(self.stack.pop().unwrap_or(Value::Null)))
+            Ok(Some(self.stack_mut().pop().unwrap_or(Value::Null)))
         } else {
             Ok(None)
         }
@@ -2158,7 +2188,7 @@ impl ZeroVM {
             catch_pc: catch,
             finally_pc: finally,
             scope_depth,
-            stack_depth: self.stack.len(),
+            stack_depth: self.stack().len(),
             frame_depth,
             phase: TryPhase::TryBody,
         });
@@ -2208,23 +2238,23 @@ impl ZeroVM {
     /// the four slots exist so FinallyEnd consumes exactly one marker on every
     /// path; the pending branch discards it without reading the fields.
     fn push_pending_finally_marker(&mut self) {
-        self.stack.push(Value::Number(0.0));
-        self.stack.push(Value::Number(0.0));
-        self.stack.push(Value::Number(0.0));
-        self.stack.push(Value::Str(FINALLY_MARKER.to_string()));
+        self.stack_mut().push(Value::Number(0.0));
+        self.stack_mut().push(Value::Number(0.0));
+        self.stack_mut().push(Value::Number(0.0));
+        self.stack_mut().push(Value::Str(FINALLY_MARKER.to_string()));
     }
 
     fn pop_finally_marker(&mut self) -> Result<FinallyMarker, VmError> {
         let invalid = |reason: &str| {
             VmError::InvalidExecutionState(format!("finally continuation marker: {}", reason))
         };
-        if self.stack.len() < 4 {
+        if self.stack().len() < 4 {
             return Err(invalid("stack underflow"));
         }
-        let sentinel = self.stack.pop().unwrap();
-        let handler_pops = self.stack.pop().unwrap();
-        let target = self.stack.pop().unwrap();
-        let scope_pops = self.stack.pop().unwrap();
+        let sentinel = self.stack_mut().pop().unwrap();
+        let handler_pops = self.stack_mut().pop().unwrap();
+        let target = self.stack_mut().pop().unwrap();
+        let scope_pops = self.stack_mut().pop().unwrap();
         match sentinel {
             Value::Str(ref s) if s == FINALLY_MARKER => {}
             _ => return Err(invalid("sentinel missing at stack top")),
@@ -2310,7 +2340,7 @@ impl ZeroVM {
                             frame.phase = TryPhase::Catch;
                         }
                         let error_value = self.make_error_object(&msg);
-                        self.stack.push(error_value);
+                        self.stack_mut().push(error_value);
                         self.pc = catch_pc;
                         return Ok(());
                     } else if let Some(finally_pc) = handler.finally_pc {
@@ -2362,8 +2392,8 @@ impl ZeroVM {
             }
         }
         // Unwind value stack
-        if self.stack.len() > handler.stack_depth {
-            self.stack.truncate(handler.stack_depth);
+        if self.stack().len() > handler.stack_depth {
+            self.stack_mut().truncate(handler.stack_depth);
         }
     }
 
@@ -2374,7 +2404,7 @@ impl ZeroVM {
             .retain(|h| h.frame_depth < frame_depth);
 
         if self.call_stack.is_empty() {
-            self.stack.push(return_value);
+            self.stack_mut().push(return_value);
             self.state = ExecutionState::Completed;
             return Ok(());
         }
@@ -2396,16 +2426,16 @@ impl ZeroVM {
             // resolves its await when the scheduler resumes it (§107).
             self.finish_task(tid, &return_value)?;
         } else {
-            self.stack.push(return_value);
+            self.stack_mut().push(return_value);
         }
         Ok(())
     }
 
     fn execute_return(&mut self) -> Result<(), VmError> {
-        let return_value = if self.stack.is_empty() {
+        let return_value = if self.stack().is_empty() {
             Value::Null
         } else {
-            self.stack.pop().unwrap()
+            self.stack_mut().pop().unwrap()
         };
 
         // If returning through a try with finally, run finally first (§43)
@@ -2423,8 +2453,8 @@ impl ZeroVM {
                     frame.scopes.pop();
                 }
             }
-            if self.stack.len() > handler.stack_depth {
-                self.stack.truncate(handler.stack_depth);
+            if self.stack().len() > handler.stack_depth {
+                self.stack_mut().truncate(handler.stack_depth);
             }
             self.pending_return = Some(return_value);
             // Marker after truncation: FinallyEnd consumes it, then completes
@@ -2438,7 +2468,7 @@ impl ZeroVM {
         self.handlers.retain(|h| h.frame_depth < frame_depth);
 
         if self.call_stack.is_empty() {
-            self.stack.push(return_value);
+            self.stack_mut().push(return_value);
             self.state = ExecutionState::Completed;
             return Ok(());
         }
@@ -2456,7 +2486,7 @@ impl ZeroVM {
             // resolves its await when the scheduler resumes it (§107).
             self.finish_task(tid, &return_value)?;
         } else {
-            self.stack.push(return_value);
+            self.stack_mut().push(return_value);
         }
 
         Ok(())
@@ -2528,7 +2558,7 @@ impl ZeroVM {
             param_defaults,
         };
 
-        self.stack.push(closure);
+        self.stack_mut().push(closure);
 
         Ok(())
     }
@@ -2628,7 +2658,7 @@ impl ZeroVM {
         };
 
         if let Some(value) = found {
-            self.stack.push(value);
+            self.stack_mut().push(value);
             return Ok(());
         }
 
@@ -2718,11 +2748,11 @@ impl ZeroVM {
     }
 
     fn execute_make_list(&mut self, size: usize) -> Result<(), VmError> {
-        if self.stack.len() < size {
+        if self.stack().len() < size {
             return Err(VmError::StackUnderflow(format!(
                 "MakeList needs {} elements, stack has {}",
                 size,
-                self.stack.len()
+                self.stack().len()
             )));
         }
 
@@ -2738,16 +2768,16 @@ impl ZeroVM {
         let list_ref = self.heap.allocate(HeapObject::list(items));
         self.gc.on_allocation();
 
-        self.stack.push(Value::List(list_ref));
+        self.stack_mut().push(Value::List(list_ref));
         Ok(())
     }
 
     fn execute_make_object(&mut self, keys: &[String]) -> Result<(), VmError> {
-        if self.stack.len() < keys.len() {
+        if self.stack().len() < keys.len() {
             return Err(VmError::StackUnderflow(format!(
                 "MakeObject needs {} values, stack has {}",
                 keys.len(),
-                self.stack.len()
+                self.stack().len()
             )));
         }
 
@@ -2768,7 +2798,7 @@ impl ZeroVM {
         let obj_ref = self.heap.allocate(HeapObject::object(props));
         self.gc.on_allocation();
 
-        self.stack.push(Value::Object(obj_ref));
+        self.stack_mut().push(Value::Object(obj_ref));
         Ok(())
     }
 
@@ -2797,7 +2827,7 @@ impl ZeroVM {
                         let elem = items[idx].clone();
                         let value = Value::from_heap_ref(&elem, &self.heap)
                             .map_err(|_| VmError::RuntimeError("Failed to convert element".to_string()))?;
-                        self.stack.push(value);
+                        self.stack_mut().push(value);
                         Ok(())
                     }
                     _ => Err(VmError::RuntimeError(
@@ -2815,7 +2845,7 @@ impl ZeroVM {
                     )));
                 }
                 let ch = s.chars().nth(idx).unwrap();
-                self.stack.push(Value::Str(ch.to_string()));
+                self.stack_mut().push(Value::Str(ch.to_string()));
                 Ok(())
             }
             (Value::Object(obj_ref), Value::Str(key)) => match self.heap.get(obj_ref) {
@@ -2825,7 +2855,7 @@ impl ZeroVM {
                             let value = Value::from_heap_ref(vr, &self.heap).map_err(|_| {
                                 VmError::RuntimeError("Failed to convert property".to_string())
                             })?;
-                            self.stack.push(value);
+                            self.stack_mut().push(value);
                             return Ok(());
                         }
                     }
@@ -2874,7 +2904,7 @@ impl ZeroVM {
                         ))
                     }
                 }
-                self.stack.push(value);
+                self.stack_mut().push(value);
                 Ok(())
             }
             (Value::Object(obj_ref), Value::Str(key)) => {
@@ -2899,7 +2929,7 @@ impl ZeroVM {
                         ))
                     }
                 }
-                self.stack.push(value);
+                self.stack_mut().push(value);
                 Ok(())
             }
             (Value::Str(_), _) => Err(VmError::RuntimeError(
@@ -2923,7 +2953,7 @@ impl ZeroVM {
                             let value = Value::from_heap_ref(vr, &self.heap).map_err(|_| {
                                 VmError::RuntimeError("Failed to convert property".to_string())
                             })?;
-                            self.stack.push(value);
+                            self.stack_mut().push(value);
                             return Ok(());
                         }
                     }
@@ -2943,7 +2973,7 @@ impl ZeroVM {
             Value::BuiltIn(base) => {
                 let known = native::native_methods(base);
                 if known.contains(&name) {
-                    self.stack
+                    self.stack_mut()
                         .push(Value::BuiltIn(format!("{}.{}", base, name)));
                     Ok(())
                 } else {
@@ -2987,7 +3017,7 @@ impl ZeroVM {
                         ))
                     }
                 }
-                self.stack.push(value);
+                self.stack_mut().push(value);
                 Ok(())
             }
             _ => Err(VmError::RuntimeError(format!(
@@ -3005,7 +3035,7 @@ impl ZeroVM {
     }
 
     fn pop_stack(&mut self, context: &str) -> Result<Value, VmError> {
-        self.stack.pop().ok_or_else(|| {
+        self.stack_mut().pop().ok_or_else(|| {
             VmError::StackUnderflow(format!(
                 "{}: stack is empty",
                 context
@@ -3014,7 +3044,7 @@ impl ZeroVM {
     }
 
     fn peek_stack(&self, context: &str) -> Result<Value, VmError> {
-        self.stack.last().cloned().ok_or_else(|| {
+        self.stack().last().cloned().ok_or_else(|| {
             VmError::StackUnderflow(format!(
                 "{}: stack is empty",
                 context

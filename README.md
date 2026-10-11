@@ -4,7 +4,7 @@
 
 Development is **spec-first**: a detailed written specification defines every language rule and runtime behavior before (or together with) the implementation, and the implementation is audited against it continuously.
 
-> **Status:** experimental, under active development. The core language, toolchain, and package ecosystem work end-to-end, with **944 tests passing and 0 failing**.
+> **Status:** experimental, under active development. The core language, toolchain, and package ecosystem work end-to-end, with **948 tests passing and 0 failing**.
 
 ---
 
@@ -50,7 +50,7 @@ mkdir my-app && cd my-app
 Run the full test suite:
 
 ```bash
-cargo test        # 944 tests, 0 failed
+cargo test        # 948 tests, 0 failed
 ```
 
 ---
@@ -187,12 +187,12 @@ The full language specification (in Indonesian, ~158 numbered sections across th
 
 ## Current Progress
 
-**Implemented and covered by the 944-test suite (0 failing):**
+**Implemented and covered by the 948-test suite (0 failing):**
 
 - **Frontend** — complete lexer (keywords, string/number literals, symbolic `&&`/`||` operators), parser (21 grammar areas), and AST, all fully covered by tests.
 - **Compiler** — 37/37 tracked compiler/opcode areas complete: expressions, control flow (unlimited `else if` depth, `switch`, ternary, compound assignment, postfix `++/--`), functions (named/anonymous/arrow), default parameters evaluated at call time (including inside `async` functions), closures compiled to shared environments, `const` binding checks, block/function scoping.
 - **Runtime values & heap** — numbers, strings, booleans, null, lists, objects, functions/closures; all collections heap-allocated with shared references (no accidental cloning on assignment); `HeapRefHandle` with deterministic drop.
-- **VM execution** — full instruction set with pre-execution validation (§124/§125 header + version checks), bytecode serialization with checksummed artifacts, execution limits (wall-time, instructions, memory, call depth, active-task policy), GC with structurally complete roots.
+- **VM execution** — full instruction set with pre-execution validation (§124/§125 header + version checks), per-frame value stacks (§116), bytecode serialization with checksummed artifacts, execution limits (wall-time, instructions, memory, call depth, active-task policy), GC with structurally complete roots.
 - **Modules** — static import graph, re-export/alias/conflict rules, circular detection, single-initialization guarantee, package import boundaries (`pkg/sub` resolution, escape protection, dependency scoping).
 - **Async** — `async`/`await`, task lifecycle, `all`/`race`/`wait`/`timeout` combinators with input-order results and fail-fast semantics, unobserved-failure warnings, scheduler integration with execution limits.
 - **Error handling** — `try`/`catch`/`finally` (including `break`/`continue` crossing `finally`), error classes, stderr channel, exit-code conventions.
@@ -202,19 +202,18 @@ The full language specification (in Indonesian, ~158 numbered sections across th
 
 **Disclosed gaps currently tracked:**
 
-- Per-frame value stacks (the VM currently uses one shared stack) — the largest remaining spec-vs-implementation divergence.
 - CLI flags for execution limits (the embedder API `ZeroVM::set_limits` exists; no `zsc` flags, because the spec does not define any yet).
 - Debug/source-location info inside `.zsbc` artifacts (would be a bytecode version bump).
 - A networked package registry (registries today are local directories + Git sources, which is what the spec requires of the registry layer).
 
-**Development discipline:** 19 tracked implementation jobs (008–026) have been completed in dependency order, each with its own job file, test batch, and spec-coverage audit. Specification ambiguities are never resolved by guessing — they are recorded as explicit decisions.
+**Development discipline:** 20 tracked implementation jobs (008–027) have been completed in dependency order, each with its own job file, test batch, and spec-coverage audit. Specification ambiguities are never resolved by guessing — they are recorded as explicit decisions.
 
 ---
 
 ## Testing
 
 ```bash
-cargo test          # full suite: 944 passed, 0 failed
+cargo test          # full suite: 948 passed, 0 failed
 ```
 
 The suite spans lexer, parser, compiler, VM, heap/GC, modules, async, stdlib, dependencies, and end-to-end CLI behavior (including bytecode round-trips, corruption rejection, eval-mode semantics, and `zpm` flows). Every feature lands with tests, and existing tests are never weakened to make a change pass.

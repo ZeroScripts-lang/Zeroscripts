@@ -49,7 +49,12 @@ pub(super) fn collect_binding_refs(binding: &Binding, roots: &mut Vec<HeapRefHan
 /// Local variables and parameters live in frame scopes; closure
 /// environments hang off the frame (§121 "local variables pada Execution
 /// Frame yang aktif", "parameter fungsi"; §131 "closure environment").
+/// The frame's own value stack is rooted here too — §116 makes it local
+/// to the execution frame, so it lives inside `Frame`.
 pub(super) fn collect_frame_refs(frame: &Frame, roots: &mut Vec<HeapRefHandle>) {
+    for value in &frame.stack {
+        collect_value_refs(value, roots);
+    }
     for scope in &frame.scopes {
         for binding in scope.values() {
             collect_binding_refs(binding, roots);
@@ -88,6 +93,9 @@ pub(super) enum ExportBinding {
 pub(super) struct Frame {
     pub(super) function_index: usize,
     pub(super) scopes: Vec<HashMap<String, Binding>>,
+    /// §116: the value stack is local to this execution frame — PUSH/POP/
+    /// DUP/SWAP and underflow all operate here, never on an ancestor's.
+    pub(super) stack: Vec<Value>,
     pub(super) return_pc: usize,
     pub(super) captured_env: Option<HeapRefHandle>,
     pub(super) scope_env: Option<HeapRefHandle>,
@@ -170,12 +178,13 @@ pub(super) struct HttpOutcome {
 
 /// A suspended task's execution context: everything the linear instruction
 /// loop operates on, swapped in/out of `ZeroVM`'s active fields by the
-/// cooperative scheduler (§112).
+/// cooperative scheduler (§112). Value stacks are not listed separately —
+/// §116 keeps each stack inside its `Frame`, so swapping `call_stack`
+/// carries them along.
 #[derive(Debug, Clone)]
 pub(super) struct TaskContext {
     pub(super) pc: usize,
     pub(super) instructions: Vec<Opcode>,
-    pub(super) stack: Vec<Value>,
     pub(super) call_stack: Vec<Frame>,
     pub(super) handlers: Vec<TryHandler>,
     pub(super) pending_error: Option<String>,
@@ -224,6 +233,9 @@ pub(super) struct TryHandler {
     pub(super) catch_pc: Option<usize>,
     pub(super) finally_pc: Option<usize>,
     pub(super) scope_depth: usize,
+    /// Depth within the *handler frame's own* value stack at try entry
+    /// (§116: stacks are frame-local, so unwinding truncates only that
+    /// frame's stack).
     pub(super) stack_depth: usize,
     pub(super) frame_depth: usize,
     pub(super) phase: TryPhase,

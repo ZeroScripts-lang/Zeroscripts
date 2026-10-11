@@ -136,8 +136,8 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack.len(), 1);
-        assert_eq!(vm.stack[0], Value::Number(42.0));
+        assert_eq!(vm.get_stack().len(), 1);
+        assert_eq!(vm.get_stack()[0], Value::Number(42.0));
     }
 
     #[test]
@@ -165,9 +165,9 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack.len(), 2);
-        assert_eq!(vm.stack[0], Value::Number(10.0));
-        assert_eq!(vm.stack[1], Value::Number(10.0));
+        assert_eq!(vm.get_stack().len(), 2);
+        assert_eq!(vm.get_stack()[0], Value::Number(10.0));
+        assert_eq!(vm.get_stack()[1], Value::Number(10.0));
     }
 
     #[test]
@@ -186,8 +186,8 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(20.0));
-        assert_eq!(vm.stack[1], Value::Number(10.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(20.0));
+        assert_eq!(vm.get_stack()[1], Value::Number(10.0));
     }
 
     #[test]
@@ -225,10 +225,10 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(10.0));
-        assert_eq!(vm.stack[1], Value::Str("hello".to_string()));
-        assert_eq!(vm.stack[2], Value::Boolean(true));
-        assert_eq!(vm.stack[3], Value::Null);
+        assert_eq!(vm.get_stack()[0], Value::Number(10.0));
+        assert_eq!(vm.get_stack()[1], Value::Str("hello".to_string()));
+        assert_eq!(vm.get_stack()[2], Value::Boolean(true));
+        assert_eq!(vm.get_stack()[3], Value::Null);
     }
 
     #[test]
@@ -260,7 +260,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(30.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(30.0));
     }
 
     #[test]
@@ -279,7 +279,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(7.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(7.0));
     }
 
     #[test]
@@ -298,7 +298,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(12.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(12.0));
     }
 
     #[test]
@@ -317,7 +317,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(5.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(5.0));
     }
 
     #[test]
@@ -354,7 +354,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(1.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(1.0));
     }
 
     #[test]
@@ -391,7 +391,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(8.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(8.0));
     }
 
     #[test]
@@ -405,7 +405,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(-10.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(-10.0));
     }
 
     #[test]
@@ -419,7 +419,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(10.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(10.0));
     }
 
     #[test]
@@ -433,7 +433,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(false));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(false));
     }
 
     #[test]
@@ -465,7 +465,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(true));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(true));
     }
 
     #[test]
@@ -484,7 +484,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(false));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(false));
     }
 
     #[test]
@@ -503,7 +503,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(true));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(true));
     }
 
     #[test]
@@ -522,7 +522,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(true));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(true));
     }
 
     #[test]
@@ -541,7 +541,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(true));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(true));
     }
 
     #[test]
@@ -560,7 +560,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(false));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(false));
     }
 
     #[test]
@@ -579,7 +579,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(true));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(true));
     }
 
     #[test]
@@ -598,7 +598,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(true));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(true));
     }
 
     #[test]
@@ -617,7 +617,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(true));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(true));
     }
 
     #[test]
@@ -636,7 +636,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(true));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(true));
     }
 
     #[test]
@@ -655,7 +655,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(false));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(false));
     }
 
     #[test]
@@ -674,7 +674,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Boolean(true));
+        assert_eq!(vm.get_stack()[0], Value::Boolean(true));
     }
 
     #[test]
@@ -706,7 +706,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(20.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(20.0));
     }
 
     #[test]
@@ -731,7 +731,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(20.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(20.0));
     }
 
     #[test]
@@ -756,7 +756,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(20.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(20.0));
     }
 
     #[test]
@@ -802,7 +802,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(42.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(42.0));
     }
 
     #[test]
@@ -865,8 +865,8 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack.len(), 1);
-        assert_eq!(vm.stack[0], Value::Number(10.0));
+        assert_eq!(vm.get_stack().len(), 1);
+        assert_eq!(vm.get_stack()[0], Value::Number(10.0));
     }
 
     #[test]
@@ -891,7 +891,7 @@
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
         // List is heap-backed; check structure
-        match &vm.stack[0] {
+        match &vm.get_stack()[0] {
             Value::List(r) => match vm.heap.get(r).unwrap() {
                 HeapObject::List { items, .. } => {
                     assert_eq!(items.len(), 3);
@@ -925,7 +925,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        match &vm.stack[0] {
+        match &vm.get_stack()[0] {
             Value::List(r) => match vm.heap.get(r).unwrap() {
                 HeapObject::List { items, .. } => assert_eq!(items.len(), 0),
                 _ => panic!("Expected list on heap"),
@@ -953,7 +953,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        match &vm.stack[0] {
+        match &vm.get_stack()[0] {
             Value::Object(r) => match vm.heap.get(r).unwrap() {
                 HeapObject::Object { props, .. } => {
                     assert_eq!(props.len(), 2);
@@ -996,7 +996,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(10.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(10.0));
     }
 
     #[test]
@@ -1036,7 +1036,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Str("Kael".to_string()));
+        assert_eq!(vm.get_stack()[0], Value::Str("Kael".to_string()));
     }
 
     #[test]
@@ -1075,7 +1075,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Str("Hello World".to_string()));
+        assert_eq!(vm.get_stack()[0], Value::Str("Hello World".to_string()));
     }
 
     #[test]
@@ -1094,7 +1094,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(10.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(10.0));
     }
 
     #[test]
@@ -1113,7 +1113,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(10.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(10.0));
     }
 
     #[test]
@@ -1132,7 +1132,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(0.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(0.0));
     }
 
     #[test]
@@ -1146,7 +1146,7 @@
         };
         let mut vm = ZeroVM::new(bc);
         vm.run().unwrap();
-        assert_eq!(vm.stack[0], Value::Number(0.0));
+        assert_eq!(vm.get_stack()[0], Value::Number(0.0));
     }
 
     #[test]
@@ -2229,6 +2229,7 @@
         vm.call_stack.push(Frame {
             function_index: 0,
             scopes: vec![scope],
+            stack: Vec::new(),
             return_pc: 0,
             captured_env: None,
             scope_env: None,
@@ -6629,4 +6630,135 @@ main()"#
             other => panic!("expected wall-clock limit error, got {:?}", other),
         }
         assert!(output.is_empty(), "{:?}", output);
+    }
+
+    // ===== Job 027: value stack local per execution frame (ZeroVM.md §116) =====
+
+    /// §116 "Value Stack bersifat lokal terhadap execution frame": after a
+    /// program whose values go through function calls, the root frame's
+    /// stack must equal the stack of the same computation without calls —
+    /// no callee temporary may remain visible anywhere.
+    #[test]
+    fn test_job027_value_stack_is_frame_local() {
+        let bc_calls = compile_source(
+            "function junk() {\n    let t = 1 + 2\n    let u = t * 3\n    return u\n}\nlet a = junk()\nprint(a)",
+        );
+        let mut vm_calls = ZeroVM::new(bc_calls);
+        vm_calls.run().unwrap();
+        assert_eq!(vm_calls.get_output(), ["9"]);
+        assert_eq!(*vm_calls.get_state(), ExecutionState::Completed);
+
+        let bc_direct = compile_source("let a = 9\nprint(a)");
+        let mut vm_direct = ZeroVM::new(bc_direct);
+        vm_direct.run().unwrap();
+
+        assert_eq!(
+            vm_calls.get_stack(),
+            vm_direct.get_stack(),
+            "callee temporaries leaked into the visible stack: {:?}",
+            vm_calls.get_stack()
+        );
+    }
+
+    /// §116/§117: deep recursion creates many frames, each carrying its own
+    /// value stack; the root frame still ends clean and the result correct.
+    #[test]
+    fn test_job027_recursive_frames_each_own_stack() {
+        let bc = compile_source(
+            "function sum(n) {\n    if n <= 0 {\n        return 0\n    }\n    return n + sum(n - 1)\n}\nprint(sum(50))",
+        );
+        let mut vm = ZeroVM::new(bc);
+        vm.run().unwrap();
+        assert_eq!(vm.get_output(), ["1275"]);
+        assert_eq!(*vm.get_state(), ExecutionState::Completed);
+
+        let bc_direct = compile_source("print(1275)");
+        let mut vm_direct = ZeroVM::new(bc_direct);
+        vm_direct.run().unwrap();
+        assert_eq!(vm.get_stack(), vm_direct.get_stack());
+    }
+
+    /// §116 + §115 unwinding: list elements pushed before a throw are
+    /// residue inside the handler's own frame; catch must truncate that
+    /// frame's stack back to the try-entry depth (cross-frame throw pops
+    /// the callee first), leaving no residue on return.
+    #[test]
+    fn test_job027_unwind_truncates_handler_frame_stack() {
+        let bc = compile_source(
+            "function boom() {\n    throw \"bad\"\n}\nfunction f() {\n    try {\n        let l = [1, 2, boom(), 4]\n        return 1\n    } catch e {\n        return 2\n    }\n}\nprint(f())",
+        );
+        let mut vm = ZeroVM::new(bc);
+        vm.run().unwrap();
+        assert_eq!(vm.get_output(), ["2"]);
+        assert_eq!(*vm.get_state(), ExecutionState::Completed);
+
+        let bc_direct = compile_source("print(2)");
+        let mut vm_direct = ZeroVM::new(bc_direct);
+        vm_direct.run().unwrap();
+        assert_eq!(
+            vm.get_stack(),
+            vm_direct.get_stack(),
+            "unwind left residue: {:?}",
+            vm.get_stack()
+        );
+    }
+
+    /// §121 "nilai pada Value Stack" under §116 locality: between building
+    /// the list and returning it, the value exists only on the callee
+    /// frame's own stack — gc_roots must find it there (threshold 0 = GC
+    /// at every instruction boundary).
+    #[test]
+    fn test_job027_callee_frame_stack_roots_survive_gc() {
+        let (out, collections, _) = run_source_with_gc_pressure(
+            "function make() {\n    return [7, 8, 9]\n}\nfunction first(l) {\n    return l[0]\n}\nprint(first(make()))",
+            0,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["7"]);
+        assert!(collections > 0, "GC must actually run during execution");
+    }
+
+    // ===== Switch runtime behavior (bug found while building examples/demo.zs) =====
+
+    /// Multi-case switch: the value must reach the matching case, not the
+    /// default — JumpIfFalse peeks, so a missed case previously left a
+    /// stale `false` that the next case duplicated and compared instead.
+    #[test]
+    fn test_switch_matches_second_case() {
+        let output = run_source(
+            "let hari = 2\nswitch hari {\n    case 1 {\n        print(\"c1\")\n    }\n    case 2 {\n        print(\"c2\")\n    }\n    default {\n        print(\"def\")\n    }\n}",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["c2"]);
+    }
+
+    #[test]
+    fn test_switch_default_when_no_case_matches() {
+        let output = run_source(
+            "let x = 9\nswitch x {\n    case 1 {\n        print(\"c1\")\n    }\n    case 2 {\n        print(\"c2\")\n    }\n    default {\n        print(\"def\")\n    }\n}",
+        )
+        .unwrap();
+        assert_eq!(output, vec!["def"]);
+    }
+
+    /// A matched switch leaves nothing on the caller's value stack — any
+    /// residue breaks the balance of the statements that follow.
+    #[test]
+    fn test_switch_stack_balanced_after_match() {
+        let bc = compile_source(
+            "let x = 2\nswitch x {\n    case 1 {\n        print(\"c1\")\n    }\n    case 2 {\n        print(\"c2\")\n    }\n    default {\n        print(\"def\")\n    }\n}\nprint(x + 1)",
+        );
+        let mut vm = ZeroVM::new(bc);
+        vm.run().unwrap();
+        assert_eq!(vm.get_output(), ["c2", "3"]);
+
+        let bc_direct = compile_source("let x = 2\nprint(x + 1)");
+        let mut vm_direct = ZeroVM::new(bc_direct);
+        vm_direct.run().unwrap();
+        assert_eq!(
+            vm.get_stack(),
+            vm_direct.get_stack(),
+            "switch leaked stack residue: {:?}",
+            vm.get_stack()
+        );
     }

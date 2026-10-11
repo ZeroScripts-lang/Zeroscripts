@@ -46,7 +46,7 @@ impl ZeroVM {
             terminal_seq: None,
         });
         self.ready_queue.push_back(id);
-        self.stack.push(Value::Task(id));
+        self.stack_mut().push(Value::Task(id));
         Ok(())
     }
 
@@ -145,10 +145,10 @@ impl ZeroVM {
         Ok(TaskContext {
             pc: 0,
             instructions,
-            stack: Vec::new(),
             call_stack: vec![Frame {
                 function_index: func_idx,
                 scopes: vec![root_scope],
+                stack: Vec::new(),
                 return_pc: 0,
                 captured_env: env,
                 scope_env: None,
@@ -167,7 +167,6 @@ impl ZeroVM {
         let ctx = TaskContext {
             pc: self.pc,
             instructions: std::mem::take(&mut self.program.instructions),
-            stack: std::mem::take(&mut self.stack),
             call_stack: std::mem::take(&mut self.call_stack),
             handlers: std::mem::take(&mut self.handlers),
             pending_error: self.pending_error.take(),
@@ -180,7 +179,6 @@ impl ZeroVM {
     pub(super) fn load_context(&mut self, ctx: TaskContext) {
         self.pc = ctx.pc;
         self.program.instructions = ctx.instructions;
-        self.stack = ctx.stack;
         self.call_stack = ctx.call_stack;
         self.handlers = ctx.handlers;
         self.pending_error = ctx.pending_error;
@@ -216,7 +214,7 @@ impl ZeroVM {
             if self.active_task == Some(task_id) {
                 // The failing task owns the active loop fields: clear them so
                 // the step loop exits.
-                self.stack.clear();
+                self.stack_mut().clear();
                 self.call_stack.clear();
                 self.handlers.clear();
                 self.pending_error = None;
@@ -616,7 +614,7 @@ impl ZeroVM {
                             let result =
                                 self.tasks[target].result.clone().unwrap_or(Value::Null);
                             self.tasks[tid].wait = None;
-                            self.stack.push(result);
+                            self.stack_mut().push(result);
                         }
                         TaskState::Failed => {
                             let msg = self.tasks[target]
@@ -710,7 +708,7 @@ impl ZeroVM {
         match self.tasks[target].state {
             TaskState::Completed => {
                 let result = self.tasks[target].result.clone().unwrap_or(Value::Null);
-                self.stack.push(result);
+                self.stack_mut().push(result);
                 Ok(())
             }
             TaskState::Failed => Err(VmError::RuntimeError(

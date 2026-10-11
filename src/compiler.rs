@@ -1354,7 +1354,12 @@ impl Compiler {
 
                 let mut end_jumps = Vec::new();
 
-                // Compile each case
+                // Compile each case. JumpIfFalse only peeks, so each path
+                // must drop the comparison result itself: the match path
+                // pops result + switch value before running its body, the
+                // miss path pops the result and falls into the next case's
+                // Dup (otherwise the stale `false` is what gets duplicated
+                // and case 2+ never matches).
                 for case in cases {
                     // Duplicate the switch value
                     self.emit(Opcode::Dup);
@@ -1368,7 +1373,8 @@ impl Compiler {
                     // Jump if not equal
                     let jump_if_false = self.emit(Opcode::JumpIfFalse(0));
 
-                    // Pop the switch value
+                    // Match: drop comparison result and switch value
+                    self.emit(Opcode::Pop);
                     self.emit(Opcode::Pop);
 
                     // Compile case body in its own scope
@@ -1382,10 +1388,12 @@ impl Compiler {
                     let jump_to_end = self.emit(Opcode::Jump(0));
                     end_jumps.push(jump_to_end);
 
+                    // Miss: drop comparison result, keep switch value
                     self.patch_jump(jump_if_false);
+                    self.emit(Opcode::Pop);
                 }
 
-                // Default case
+                // Default case (also the no-case path): drop switch value
                 self.emit(Opcode::Pop);
                 if let Some(default) = default_case {
                     self.push_scope();
