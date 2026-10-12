@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 use std::time::Instant;
 
 use crate::compiler::{BytecodeProgram, Constant, FunctionInfo, Opcode, FINALLY_MARKER};
@@ -2495,7 +2496,7 @@ impl ZeroVM {
     fn execute_make_closure(
         &mut self,
         func_idx: usize,
-        captured: &[(String, bool)],
+        captured: &[(Rc<str>, bool)],
     ) -> Result<(), VmError> {
         let _func_value = self.pop_stack("make closure")?;
 
@@ -2517,7 +2518,7 @@ impl ZeroVM {
                     let value = self.execute_load_variable_deep(name)?;
                     let heap_val = value.heap_object_for_element(&mut self.heap);
                     self.heap
-                        .set_env_binding(&shared, name.clone(), heap_val, *is_const)
+                        .set_env_binding(&shared, name.to_string(), heap_val, *is_const)
                         .map_err(|_| {
                             VmError::RuntimeError(format!("Failed to set env binding '{}'", name))
                         })?;
@@ -2531,7 +2532,7 @@ impl ZeroVM {
                 let value = self.execute_load_variable_deep(name)?;
                 let heap_val = value.heap_object_for_element(&mut self.heap);
                 env_bindings.push(EnvBinding {
-                    name: name.clone(),
+                    name: name.to_string(),
                     value: heap_val,
                     is_const: *is_const,
                 });
@@ -2772,7 +2773,7 @@ impl ZeroVM {
         Ok(())
     }
 
-    fn execute_make_object(&mut self, keys: &[String]) -> Result<(), VmError> {
+    fn execute_make_object(&mut self, keys: &[Rc<str>]) -> Result<(), VmError> {
         if self.stack().len() < keys.len() {
             return Err(VmError::StackUnderflow(format!(
                 "MakeObject needs {} values, stack has {}",
@@ -2792,7 +2793,7 @@ impl ZeroVM {
         for (key, value) in keys.iter().zip(values) {
             let r = value.heap_object_for_element(&mut self.heap);
             self.gc.on_allocation();
-            props.push((key.clone(), r));
+            props.push((key.to_string(), r));
         }
 
         let obj_ref = self.heap.allocate(HeapObject::object(props));

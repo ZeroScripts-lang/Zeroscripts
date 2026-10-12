@@ -2,6 +2,7 @@ use crate::ast::*;
 use crate::error::CompilerError;
 use crate::native;
 use std::collections::HashSet;
+use std::rc::Rc;
 
 /// Magic marker of a ZeroScript bytecode image (§125 conceptual header).
 pub const BYTECODE_MAGIC: &str = "ZERO";
@@ -52,12 +53,12 @@ pub enum Opcode {
     LoadFunction(usize),
 
     // Variables
-    DeclareLocal(String, bool), // name, is_const
-    LoadLocal(String),
-    StoreLocal(String),
-    DeclareGlobal(String, bool), // name, is_const
-    LoadGlobal(String),
-    StoreGlobal(String),
+    DeclareLocal(Rc<str>, bool), // name, is_const
+    LoadLocal(Rc<str>),
+    StoreLocal(Rc<str>),
+    DeclareGlobal(Rc<str>, bool), // name, is_const
+    LoadGlobal(Rc<str>),
+    StoreGlobal(Rc<str>),
 
     // Scopes
     PushScope,
@@ -111,18 +112,18 @@ pub enum Opcode {
     Call(usize),
     /// `CALL_NATIVE <operation>` (§145, §146): native operation call.
     /// `usize` is the argument count; no callee is pushed on the value stack.
-    CallNative(String, usize),
+    CallNative(Rc<str>, usize),
     Return,
-    MakeClosure(usize, Vec<(String, bool)>), // captured: (name, is_const)
-    LoadCaptured(String),
-    StoreCaptured(String),
+    MakeClosure(usize, Vec<(Rc<str>, bool)>), // captured: (name, is_const)
+    LoadCaptured(Rc<str>),
+    StoreCaptured(Rc<str>),
 
     // Async (§49, §101): wait for a task to reach a terminal state
     Await,
 
     // Collections
     MakeList(usize),
-    MakeObject(Vec<String>),
+    MakeObject(Vec<Rc<str>>),
     /// `LIST_ADD` (§144): append a value to a mutable list. Operand = argc.
     ListAdd(usize),
     /// `LIST_REMOVE` (§144): remove a list element by index. Operand = argc.
@@ -131,8 +132,8 @@ pub enum Opcode {
     ObjectRemove(usize),
     GetIndex,
     SetIndex,
-    GetProperty(String),
-    SetProperty(String),
+    GetProperty(Rc<str>),
+    SetProperty(Rc<str>),
 
     // Output
     Print,
@@ -291,7 +292,7 @@ struct Compiler {
     /// from deduplication so neither they nor ordinary constants can alias
     /// each other and be corrupted by a later patch.
     patchable_constants: HashSet<usize>,
-    captured_vars: Vec<(String, bool)>,
+    captured_vars: Vec<(Rc<str>, bool)>,
     scope_depth: usize,
     /// Index of the current function's base scope. 0 = global/top-level program.
     function_base: usize,
@@ -612,8 +613,8 @@ impl Compiler {
 
     fn track_captured(&mut self, name: &str, res: VarRes) {
         let is_const = matches!(res, VarRes::ConstCaptured | VarRes::ConstModuleScope);
-        if !self.captured_vars.iter().any(|(n, _)| name == n) {
-            self.captured_vars.push((name.to_string(), is_const));
+        if !self.captured_vars.iter().any(|(n, _)| name == &**n) {
+            self.captured_vars.push((Rc::from(name), is_const));
         }
     }
 
@@ -979,24 +980,24 @@ impl Compiler {
                 let is_global_root = self.function_base == 0 && self.scopes.len() == 1;
 
                 if is_global_root {
-                    self.emit(Opcode::DeclareGlobal(name.clone(), *is_const));
+                    self.emit(Opcode::DeclareGlobal(name.clone().into(), *is_const));
                     if let Some(init) = initializer {
                         self.compile_expression(init)?;
-                        self.emit(Opcode::StoreGlobal(name.clone()));
+                        self.emit(Opcode::StoreGlobal(name.clone().into()));
                     } else {
                         let idx = self.add_constant(Constant::Null);
                         self.emit(Opcode::LoadConst(idx));
-                        self.emit(Opcode::StoreGlobal(name.clone()));
+                        self.emit(Opcode::StoreGlobal(name.clone().into()));
                     }
                 } else {
-                    self.emit(Opcode::DeclareLocal(name.clone(), *is_const));
+                    self.emit(Opcode::DeclareLocal(name.clone().into(), *is_const));
                     if let Some(init) = initializer {
                         self.compile_expression(init)?;
-                        self.emit(Opcode::StoreLocal(name.clone()));
+                        self.emit(Opcode::StoreLocal(name.clone().into()));
                     } else {
                         let idx = self.add_constant(Constant::Null);
                         self.emit(Opcode::LoadConst(idx));
-                        self.emit(Opcode::StoreLocal(name.clone()));
+                        self.emit(Opcode::StoreLocal(name.clone().into()));
                     }
                 }
                 if *exported {
@@ -1151,7 +1152,7 @@ impl Compiler {
                 // entry_point is 0 because we compiled into a fresh buffer
                 self.functions[func_idx].entry_point = 0;
                 self.functions[func_idx].local_count = local_count;
-                self.functions[func_idx].captured_vars = captured.iter().map(|(n, _)| n.clone()).collect();
+                self.functions[func_idx].captured_vars = captured.iter().map(|(n, _)| n.to_string()).collect();
 
                 // Store function reference
                 // Function metadata stays in the constant pool (§126) but the
@@ -1164,9 +1165,9 @@ impl Compiler {
                 }
 
                 if is_global_root {
-                    self.emit(Opcode::StoreGlobal(name.clone()));
+                    self.emit(Opcode::StoreGlobal(name.clone().into()));
                 } else {
-                    self.emit(Opcode::StoreLocal(name.clone()));
+                    self.emit(Opcode::StoreLocal(name.clone().into()));
                 }
 
                 // Store this function's body first, then inner bodies
@@ -1468,7 +1469,7 @@ impl Compiler {
                     // VM pushes error value on stack before entering catch
                     let param = catch_param.as_ref().unwrap();
                     self.declare_variable(param, false)?;
-                    self.emit(Opcode::StoreLocal(param.clone()));
+                    self.emit(Opcode::StoreLocal(param.clone().into()));
                     for stmt in catch_body.as_ref().unwrap() {
                         self.compile_statement(stmt)?;
                     }
@@ -1585,20 +1586,20 @@ impl Compiler {
                 match res {
                     VarRes::Captured | VarRes::ConstCaptured => {
                         self.track_captured(name, res);
-                        self.emit(Opcode::LoadCaptured(name.clone()));
+                        self.emit(Opcode::LoadCaptured(name.clone().into()));
                     }
                     VarRes::ModuleScope | VarRes::ConstModuleScope => {
                         // §70d: read through the module environment; the
                         // binding stays in the closure's captured list so the
                         // module env outlives init (§65/§130).
                         self.track_captured(name, res);
-                        self.emit(Opcode::LoadCaptured(name.clone()));
+                        self.emit(Opcode::LoadCaptured(name.clone().into()));
                     }
                     VarRes::Local | VarRes::ConstLocal => {
-                        self.emit(Opcode::LoadLocal(name.clone()));
+                        self.emit(Opcode::LoadLocal(name.clone().into()));
                     }
                     VarRes::Global | VarRes::ConstGlobal => {
-                        self.emit(Opcode::LoadGlobal(name.clone()));
+                        self.emit(Opcode::LoadGlobal(name.clone().into()));
                     }
                 }
                 Ok(())
@@ -1666,13 +1667,13 @@ impl Compiler {
                         match res {
                             VarRes::Captured | VarRes::ConstCaptured | VarRes::ConstModuleScope => {
                                 self.track_captured(name, res);
-                                self.emit(Opcode::StoreCaptured(name.clone()));
+                                self.emit(Opcode::StoreCaptured(name.clone().into()));
                             }
                             VarRes::Local | VarRes::ConstLocal | VarRes::ModuleScope => {
-                                self.emit(Opcode::StoreLocal(name.clone()));
+                                self.emit(Opcode::StoreLocal(name.clone().into()));
                             }
                             VarRes::Global | VarRes::ConstGlobal => {
-                                self.emit(Opcode::StoreGlobal(name.clone()));
+                                self.emit(Opcode::StoreGlobal(name.clone().into()));
                             }
                         }
                         if create_local {
@@ -1682,7 +1683,7 @@ impl Compiler {
                     Expr::Member { object, property, .. } => {
                         self.compile_expression(object)?;
                         self.compile_expression(value)?;
-                        self.emit(Opcode::SetProperty(property.clone()));
+                        self.emit(Opcode::SetProperty(property.clone().into()));
                     }
                     Expr::Index { object, index, .. } => {
                         self.compile_expression(object)?;
@@ -1712,19 +1713,19 @@ impl Compiler {
                         match load_res {
                             VarRes::Captured | VarRes::ConstCaptured => {
                                 self.track_captured(name, load_res);
-                                self.emit(Opcode::LoadCaptured(name.clone()));
+                                self.emit(Opcode::LoadCaptured(name.clone().into()));
                             }
                             VarRes::ModuleScope | VarRes::ConstModuleScope => {
                                 // §70d: read current value from module env
                                 // before a §4-local store (compound/postfix).
                                 self.track_captured(name, load_res);
-                                self.emit(Opcode::LoadCaptured(name.clone()));
+                                self.emit(Opcode::LoadCaptured(name.clone().into()));
                             }
                             VarRes::Local | VarRes::ConstLocal => {
-                                self.emit(Opcode::LoadLocal(name.clone()));
+                                self.emit(Opcode::LoadLocal(name.clone().into()));
                             }
                             VarRes::Global | VarRes::ConstGlobal => {
-                                self.emit(Opcode::LoadGlobal(name.clone()));
+                                self.emit(Opcode::LoadGlobal(name.clone().into()));
                             }
                         }
                         // Load new value
@@ -1741,13 +1742,13 @@ impl Compiler {
                         self.emit(Opcode::Dup);
                         match store_res {
                             VarRes::Captured | VarRes::ConstCaptured | VarRes::ConstModuleScope => {
-                                self.emit(Opcode::StoreCaptured(name.clone()));
+                                self.emit(Opcode::StoreCaptured(name.clone().into()));
                             }
                             VarRes::Local | VarRes::ConstLocal | VarRes::ModuleScope => {
-                                self.emit(Opcode::StoreLocal(name.clone()));
+                                self.emit(Opcode::StoreLocal(name.clone().into()));
                             }
                             VarRes::Global | VarRes::ConstGlobal => {
-                                self.emit(Opcode::StoreGlobal(name.clone()));
+                                self.emit(Opcode::StoreGlobal(name.clone().into()));
                             }
                         }
                         if create_local {
@@ -1758,7 +1759,7 @@ impl Compiler {
                         // [object, value]
                         self.compile_expression(object)?;
                         self.emit(Opcode::Dup);
-                        self.emit(Opcode::GetProperty(property.clone()));
+                        self.emit(Opcode::GetProperty(property.clone().into()));
                         self.compile_expression(value)?;
                         match op {
                             CompoundAssignOp::Add => self.emit(Opcode::Add),
@@ -1767,7 +1768,7 @@ impl Compiler {
                             CompoundAssignOp::Divide => self.emit(Opcode::Div),
                             CompoundAssignOp::Modulo => self.emit(Opcode::Mod),
                         };
-                        self.emit(Opcode::SetProperty(property.clone()));
+                        self.emit(Opcode::SetProperty(property.clone().into()));
                     }
                     Expr::Index { object, index, .. } => {
                         // [object, index, value]
@@ -1803,19 +1804,19 @@ impl Compiler {
                         match load_res {
                             VarRes::Captured | VarRes::ConstCaptured => {
                                 self.track_captured(name, load_res);
-                                self.emit(Opcode::LoadCaptured(name.clone()));
+                                self.emit(Opcode::LoadCaptured(name.clone().into()));
                             }
                             VarRes::ModuleScope | VarRes::ConstModuleScope => {
                                 // §70d: read current value from module env
                                 // before a §4-local store (compound/postfix).
                                 self.track_captured(name, load_res);
-                                self.emit(Opcode::LoadCaptured(name.clone()));
+                                self.emit(Opcode::LoadCaptured(name.clone().into()));
                             }
                             VarRes::Local | VarRes::ConstLocal => {
-                                self.emit(Opcode::LoadLocal(name.clone()));
+                                self.emit(Opcode::LoadLocal(name.clone().into()));
                             }
                             VarRes::Global | VarRes::ConstGlobal => {
-                                self.emit(Opcode::LoadGlobal(name.clone()));
+                                self.emit(Opcode::LoadGlobal(name.clone().into()));
                             }
                         }
 
@@ -1835,13 +1836,13 @@ impl Compiler {
                         // Store back (consumes the new value; leaves original on stack)
                         match store_res {
                             VarRes::Captured | VarRes::ConstCaptured | VarRes::ConstModuleScope => {
-                                self.emit(Opcode::StoreCaptured(name.clone()));
+                                self.emit(Opcode::StoreCaptured(name.clone().into()));
                             }
                             VarRes::Local | VarRes::ConstLocal | VarRes::ModuleScope => {
-                                self.emit(Opcode::StoreLocal(name.clone()));
+                                self.emit(Opcode::StoreLocal(name.clone().into()));
                             }
                             VarRes::Global | VarRes::ConstGlobal => {
-                                self.emit(Opcode::StoreGlobal(name.clone()));
+                                self.emit(Opcode::StoreGlobal(name.clone().into()));
                             }
                         }
                         if create_local {
@@ -1868,7 +1869,7 @@ impl Compiler {
                     }
                     match target {
                         StaticCallTarget::Native(operation) => {
-                            self.emit(Opcode::CallNative(operation, args.len()))
+                            self.emit(Opcode::CallNative(operation.into(), args.len()))
                         }
                         StaticCallTarget::ListAdd => self.emit(Opcode::ListAdd(args.len())),
                         StaticCallTarget::ListRemove => self.emit(Opcode::ListRemove(args.len())),
@@ -1894,7 +1895,7 @@ impl Compiler {
             }
             Expr::Member { object, property, .. } => {
                 self.compile_expression(object)?;
-                self.emit(Opcode::GetProperty(property.clone()));
+                self.emit(Opcode::GetProperty(property.clone().into()));
                 Ok(())
             }
             Expr::Index { object, index, .. } => {
@@ -1911,7 +1912,7 @@ impl Compiler {
                 Ok(())
             }
             Expr::Object { properties, .. } => {
-                let keys: Vec<String> = properties.iter().map(|p| p.key.clone()).collect();
+                let keys: Vec<Rc<str>> = properties.iter().map(|p| Rc::from(p.key.clone())).collect();
                 for prop in properties {
                     self.compile_expression(&prop.value)?;
                 }
@@ -2030,7 +2031,7 @@ impl Compiler {
 
                 self.functions[func_idx].entry_point = entry_point;
                 self.functions[func_idx].local_count = local_count;
-                self.functions[func_idx].captured_vars = captured.iter().map(|(n, _)| n.clone()).collect();
+                self.functions[func_idx].captured_vars = captured.iter().map(|(n, _)| n.to_string()).collect();
 
                 // Store function reference
                 // Function metadata stays in the constant pool (§126) but the
@@ -2170,7 +2171,7 @@ impl Compiler {
 
                 self.functions[func_idx].entry_point = entry_point;
                 self.functions[func_idx].local_count = local_count;
-                self.functions[func_idx].captured_vars = captured.iter().map(|(n, _)| n.clone()).collect();
+                self.functions[func_idx].captured_vars = captured.iter().map(|(n, _)| n.to_string()).collect();
 
                 // Function metadata stays in the constant pool (§126) but the
                 // value itself is pushed by LOAD_FUNCTION (§141).
@@ -2472,27 +2473,27 @@ mod tests {
     #[test]
     fn test_let_declaration() {
         let bc = compile_source("let A = 10");
-        assert!(bc.instructions.contains(&Opcode::DeclareGlobal("A".to_string(), false)));
-        assert!(bc.instructions.contains(&Opcode::StoreGlobal("A".to_string())));
+        assert!(bc.instructions.contains(&Opcode::DeclareGlobal("A".into(), false)));
+        assert!(bc.instructions.contains(&Opcode::StoreGlobal("A".into())));
     }
 
     #[test]
     fn test_const_declaration() {
         let bc = compile_source("const A = 10");
-        assert!(bc.instructions.contains(&Opcode::DeclareGlobal("A".to_string(), true)));
+        assert!(bc.instructions.contains(&Opcode::DeclareGlobal("A".into(), true)));
     }
 
     #[test]
     fn test_identifier_access() {
         let bc = compile_source("let A = 10\nA");
         // Should have LoadGlobal for A
-        assert!(bc.instructions.iter().any(|op| matches!(op, Opcode::LoadGlobal(name) if name == "A")));
+        assert!(bc.instructions.iter().any(|op| matches!(op, Opcode::LoadGlobal(name) if name.as_ref() == "A")));
     }
 
     #[test]
     fn test_assignment() {
         let bc = compile_source("let A = 10\nA = 20");
-        assert!(bc.instructions.contains(&Opcode::StoreGlobal("A".to_string())));
+        assert!(bc.instructions.contains(&Opcode::StoreGlobal("A".into())));
     }
 
     #[test]
@@ -2660,7 +2661,7 @@ mod tests {
     #[test]
     fn test_member_access() {
         let bc = compile_source("user.name");
-        assert!(bc.instructions.contains(&Opcode::GetProperty("name".to_string())));
+        assert!(bc.instructions.contains(&Opcode::GetProperty("name".into())));
     }
 
     #[test]
@@ -2673,7 +2674,7 @@ mod tests {
     fn test_compound_assignment() {
         let bc = compile_source("let A = 10\nA += 5");
         assert!(bc.instructions.contains(&Opcode::Add));
-        assert!(bc.instructions.contains(&Opcode::StoreGlobal("A".to_string())));
+        assert!(bc.instructions.contains(&Opcode::StoreGlobal("A".into())));
     }
 
     #[test]
@@ -2756,9 +2757,9 @@ mod tests {
     #[test]
     fn test_global_load_store() {
         let bc = compile_source("let A = 1\nA = 2\nA");
-        assert!(bc.instructions.contains(&Opcode::DeclareGlobal("A".to_string(), false)));
-        assert!(bc.instructions.contains(&Opcode::StoreGlobal("A".to_string())));
-        assert!(bc.instructions.contains(&Opcode::LoadGlobal("A".to_string())));
+        assert!(bc.instructions.contains(&Opcode::DeclareGlobal("A".into(), false)));
+        assert!(bc.instructions.contains(&Opcode::StoreGlobal("A".into())));
+        assert!(bc.instructions.contains(&Opcode::LoadGlobal("A".into())));
     }
 
     #[test]
@@ -2827,7 +2828,7 @@ mod tests {
         let bc = compile_source("print(\"x\")");
         assert!(bc
             .instructions
-            .contains(&Opcode::CallNative("print".to_string(), 1)));
+            .contains(&Opcode::CallNative("print".into(), 1)));
         assert!(!bc.instructions.iter().any(|op| matches!(op, Opcode::Call(_))));
     }
 
@@ -2838,7 +2839,7 @@ mod tests {
             assert!(
                 bc.instructions
                     .iter()
-                    .any(|op| matches!(op, Opcode::CallNative(name, _) if name.as_str() == operation)),
+                    .any(|op| matches!(op, Opcode::CallNative(name, _) if &**name == operation)),
                 "missing CALL_NATIVE {}",
                 operation
             );
@@ -2864,7 +2865,7 @@ mod tests {
             assert!(
                 bc.instructions
                     .iter()
-                    .any(|op| matches!(op, Opcode::CallNative(name, _) if name.as_str() == operation)),
+                    .any(|op| matches!(op, Opcode::CallNative(name, _) if &**name == operation)),
                 "missing CALL_NATIVE {}",
                 operation
             );
@@ -2882,7 +2883,7 @@ mod tests {
         assert!(bc.instructions.contains(&Opcode::ObjectRemove(2)));
         assert!(!bc.instructions.iter().any(
             |op| matches!(op, Opcode::CallNative(name, _)
-                if matches!(name.as_str(), "list.add" | "list.remove" | "object.remove"))
+                if matches!(&**name, "list.add" | "list.remove" | "object.remove"))
         ));
     }
 
@@ -2898,7 +2899,7 @@ mod tests {
     #[test]
     fn test_job019_unknown_method_keeps_dynamic_call() {
         let bc = compile_source("string.bogus(\"x\")");
-        assert!(bc.instructions.contains(&Opcode::GetProperty("bogus".to_string())));
+        assert!(bc.instructions.contains(&Opcode::GetProperty("bogus".into())));
         assert!(bc.instructions.contains(&Opcode::Call(1)));
         assert!(!bc.instructions.iter().any(|op| matches!(op, Opcode::CallNative(..))));
     }
@@ -2909,7 +2910,7 @@ mod tests {
         let body = &bc.function_bodies[0];
         assert!(body
             .iter()
-            .any(|op| matches!(op, Opcode::LoadLocal(name) if name.as_str() == "print")));
+            .any(|op| matches!(op, Opcode::LoadLocal(name) if &**name == "print")));
         assert!(!body.iter().any(|op| matches!(op, Opcode::CallNative(..))));
     }
 
@@ -2923,7 +2924,7 @@ mod tests {
     #[test]
     fn test_job019_builtin_as_value_keeps_dynamic_call() {
         let bc = compile_source("let f = string.length");
-        assert!(bc.instructions.contains(&Opcode::GetProperty("length".to_string())));
+        assert!(bc.instructions.contains(&Opcode::GetProperty("length".into())));
         assert!(!bc.instructions.iter().any(|op| matches!(op, Opcode::CallNative(..))));
     }
 

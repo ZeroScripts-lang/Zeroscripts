@@ -17,6 +17,7 @@
 use crate::compiler::{BytecodeHeader, BytecodeProgram, Constant, FunctionInfo, Opcode};
 use crate::hash::Sha256;
 use crate::module::{ModuleBundle, ModuleMeta};
+use std::rc::Rc;
 
 /// Length of the trailing SHA-256 checksum (§158: 32 byte).
 pub const CHECKSUM_LEN: usize = 32;
@@ -435,17 +436,17 @@ fn get_opcode(r: &mut Reader) -> Result<Opcode, BytecodeFileError> {
         2 => {
             let name = r.str()?;
             let is_const = r.bool()?;
-            Opcode::DeclareLocal(name, is_const)
+            Opcode::DeclareLocal(Rc::from(name), is_const)
         }
-        3 => Opcode::LoadLocal(r.str()?),
-        4 => Opcode::StoreLocal(r.str()?),
+        3 => Opcode::LoadLocal(Rc::from(r.str()?)),
+        4 => Opcode::StoreLocal(Rc::from(r.str()?)),
         5 => {
             let name = r.str()?;
             let is_const = r.bool()?;
-            Opcode::DeclareGlobal(name, is_const)
+            Opcode::DeclareGlobal(Rc::from(name), is_const)
         }
-        6 => Opcode::LoadGlobal(r.str()?),
-        7 => Opcode::StoreGlobal(r.str()?),
+        6 => Opcode::LoadGlobal(Rc::from(r.str()?)),
+        7 => Opcode::StoreGlobal(Rc::from(r.str()?)),
         8 => Opcode::PushScope,
         9 => Opcode::PopScope,
         10 => Opcode::Add,
@@ -483,7 +484,7 @@ fn get_opcode(r: &mut Reader) -> Result<Opcode, BytecodeFileError> {
         38 => {
             let name = r.str()?;
             let argc = r.usize_()?;
-            Opcode::CallNative(name, argc)
+            Opcode::CallNative(Rc::from(name), argc)
         }
         39 => Opcode::Return,
         40 => {
@@ -491,22 +492,22 @@ fn get_opcode(r: &mut Reader) -> Result<Opcode, BytecodeFileError> {
             let captured = r.vec(|r| {
                 let name = r.str()?;
                 let is_const = r.bool()?;
-                Ok((name, is_const))
+                Ok((Rc::from(name), is_const))
             })?;
             Opcode::MakeClosure(function_index, captured)
         }
-        41 => Opcode::LoadCaptured(r.str()?),
-        42 => Opcode::StoreCaptured(r.str()?),
+        41 => Opcode::LoadCaptured(Rc::from(r.str()?)),
+        42 => Opcode::StoreCaptured(Rc::from(r.str()?)),
         43 => Opcode::Await,
         44 => Opcode::MakeList(r.usize_()?),
-        45 => Opcode::MakeObject(r.vec(|r| r.str())?),
+        45 => Opcode::MakeObject(r.vec(|r| r.str().map(Rc::from))?),
         46 => Opcode::ListAdd(r.usize_()?),
         47 => Opcode::ListRemove(r.usize_()?),
         48 => Opcode::ObjectRemove(r.usize_()?),
         49 => Opcode::GetIndex,
         50 => Opcode::SetIndex,
-        51 => Opcode::GetProperty(r.str()?),
-        52 => Opcode::SetProperty(r.str()?),
+        51 => Opcode::GetProperty(Rc::from(r.str()?)),
+        52 => Opcode::SetProperty(Rc::from(r.str()?)),
         53 => Opcode::Print,
         54 => Opcode::Halt,
         55 => Opcode::EndModule,

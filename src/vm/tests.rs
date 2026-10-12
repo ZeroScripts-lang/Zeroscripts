@@ -790,10 +790,10 @@
         let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![Constant::Number(42.0)],
             instructions: vec![
-                Opcode::DeclareLocal("A".to_string(), false),
+                Opcode::DeclareLocal("A".into(), false),
                 Opcode::LoadConst(0),
-                Opcode::StoreLocal("A".to_string()),
-                Opcode::LoadLocal("A".to_string()),
+                Opcode::StoreLocal("A".into()),
+                Opcode::LoadLocal("A".into()),
                 Opcode::Halt,
             ],
             functions: vec![],
@@ -809,7 +809,7 @@
     fn test_variable_undefined() {
         let bc = BytecodeProgram { header: BytecodeHeader::current(), entry_point: 0,
             constants: vec![],
-            instructions: vec![Opcode::LoadLocal("X".to_string())],
+            instructions: vec![Opcode::LoadLocal("X".into())],
             functions: vec![],
             function_bodies: vec![],
             default_bodies: vec![],
@@ -944,7 +944,7 @@
             instructions: vec![
                 Opcode::LoadConst(0),
                 Opcode::LoadConst(1),
-                Opcode::MakeObject(vec!["name".to_string(), "age".to_string()]),
+                Opcode::MakeObject(vec!["name".into(), "age".into()]),
                 Opcode::Halt,
             ],
             functions: vec![],
@@ -1026,8 +1026,8 @@
             constants: vec![Constant::Str("Kael".to_string())],
             instructions: vec![
                 Opcode::LoadConst(0),
-                Opcode::MakeObject(vec!["name".to_string()]),
-                Opcode::GetProperty("name".to_string()),
+                Opcode::MakeObject(vec!["name".into()]),
+                Opcode::GetProperty("name".into()),
                 Opcode::Halt,
             ],
             functions: vec![],
@@ -1045,8 +1045,8 @@
             constants: vec![Constant::Str("Kael".to_string())],
             instructions: vec![
                 Opcode::LoadConst(0),
-                Opcode::MakeObject(vec!["name".to_string()]),
-                Opcode::GetProperty("missing".to_string()),
+                Opcode::MakeObject(vec!["name".into()]),
+                Opcode::GetProperty("missing".into()),
             ],
             functions: vec![],
             function_bodies: vec![],
@@ -6099,7 +6099,7 @@ main()"#
 
     #[test]
     fn test_job019_empty_variable_operand_rejected() {
-        let bc = hand_built(vec![], vec![Opcode::LoadLocal("".to_string()), Opcode::Halt]);
+        let bc = hand_built(vec![], vec![Opcode::LoadLocal("".into()), Opcode::Halt]);
         let mut vm = ZeroVM::new(bc);
         assert!(matches!(vm.run().unwrap_err(), VmError::InvalidOperand(_)));
         assert!(vm.get_output().is_empty());
@@ -6107,7 +6107,7 @@ main()"#
 
     #[test]
     fn test_job019_empty_native_operation_rejected() {
-        let bc = hand_built(vec![], vec![Opcode::CallNative("".to_string(), 0), Opcode::Halt]);
+        let bc = hand_built(vec![], vec![Opcode::CallNative("".into(), 0), Opcode::Halt]);
         let mut vm = ZeroVM::new(bc);
         assert!(matches!(vm.run().unwrap_err(), VmError::InvalidOperand(_)));
         assert!(vm.get_output().is_empty());
@@ -6115,7 +6115,7 @@ main()"#
 
     #[test]
     fn test_job019_empty_object_key_rejected() {
-        let bc = hand_built(vec![], vec![Opcode::MakeObject(vec!["".to_string()]), Opcode::Halt]);
+        let bc = hand_built(vec![], vec![Opcode::MakeObject(vec!["".into()]), Opcode::Halt]);
         let mut vm = ZeroVM::new(bc);
         assert!(matches!(vm.run().unwrap_err(), VmError::InvalidOperand(_)));
     }
@@ -6137,7 +6137,7 @@ main()"#
             vec![Constant::Str("hi".to_string())],
             vec![
                 Opcode::LoadConst(0),
-                Opcode::CallNative("print".to_string(), 1),
+                Opcode::CallNative("print".into(), 1),
                 Opcode::Halt,
             ],
         );
@@ -6151,7 +6151,7 @@ main()"#
         let bc = hand_built(
             vec![],
             vec![
-                Opcode::CallNative("nope".to_string(), 0),
+                Opcode::CallNative("nope".into(), 0),
                 Opcode::Halt,
             ],
         );
@@ -6172,7 +6172,7 @@ main()"#
             vec![
                 Opcode::LoadConst(0),
                 Opcode::LoadConst(0),
-                Opcode::CallNative("type".to_string(), 2),
+                Opcode::CallNative("type".into(), 2),
                 Opcode::Halt,
             ],
         );
