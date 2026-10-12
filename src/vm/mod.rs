@@ -572,10 +572,24 @@ impl ZeroVM {
 
     fn run_module_range(&mut self, start: usize, end: usize) -> Result<(), VmError> {
         self.pc = start;
-        while self.pc < end {
+        loop {
             // GC boundary (§121) — same safe point as the main loop.
             self.maybe_gc();
             if self.pc >= self.program.instructions.len() {
+                break;
+            }
+            // Job 029: while a function/eval frame is active, Call has swapped
+            // `program.instructions` to that body and `pc` lives in the body's
+            // address space — the module's top-level `end` no longer bounds it
+            // (body-relative jumps could exceed `end` and silently kill the
+            // loop before Return restored the caller). The root frame still
+            // ends at the module's `end`.
+            let in_body_frame = self
+                .call_stack
+                .last()
+                .map(|f| f.return_instructions.is_some())
+                .unwrap_or(false);
+            if !in_body_frame && self.pc >= end {
                 break;
             }
             let instruction = self.program.instructions[self.pc].clone();

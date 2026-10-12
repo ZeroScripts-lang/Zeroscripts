@@ -6762,3 +6762,73 @@ main()"#
             vm.get_stack()
         );
     }
+
+    // ===== Job 029: if/while dalam function tidak boleh mematikan range modul =====
+    // Jalur module (compile_module + run_modules) = jalur `zsc file.zs` yang
+    // terbukti rusak: run_module_range memakai `end` top-level walau pc sudah
+    // berada di ruang-alamat body function (instructions di-swap saat Call).
+
+    fn run_as_module(source: &str) -> Vec<String> {
+        fn parse_program(source: &str) -> crate::ast::Program {
+            let mut lexer = Lexer::new(source);
+            let tokens = lexer.tokenize().unwrap();
+            let mut parser = Parser::new(tokens);
+            parser.parse().unwrap()
+        }
+        let unit =
+            crate::compiler::compile_module("./main.zs", &parse_program(source)).unwrap();
+        let end = unit.instructions.len();
+        let merged = crate::compiler::merge_modules(&[unit]);
+        let modules = vec![crate::module::ModuleMeta {
+            path: "./main.zs".to_string(),
+            start: 0,
+            end,
+            exports: vec![],
+            imports: vec![],
+            re_exports: vec![],
+        }];
+        let mut vm = ZeroVM::new(merged);
+        vm.run_modules(&modules).unwrap();
+        vm.get_output().to_vec()
+    }
+
+    #[test]
+    fn test_job029_if_in_function_returns_to_caller() {
+        let out = run_as_module(
+            "function f() {\n    if true {\n        print(\"in\")\n    }\n    return 2\n}\nprint(f())\nprint(\"top\")",
+        );
+        assert_eq!(out, vec!["in", "2", "top"]);
+    }
+
+    #[test]
+    fn test_job029_while_false_in_function_continues_top_level() {
+        let out = run_as_module(
+            "function f() {\n    while false { }\n    print(\"after\")\n    return 1\n}\nf()\nprint(\"top\")",
+        );
+        assert_eq!(out, vec!["after", "top"]);
+    }
+
+    #[test]
+    fn test_job029_while_iterations_return_sum() {
+        let out = run_as_module(
+            "function sum5() {\n    let i = 0\n    let t = 0\n    while i < 5 {\n        t = t + i\n        i = i + 1\n    }\n    return t\n}\nprint(sum5())\nprint(\"end\")",
+        );
+        assert_eq!(out, vec!["10", "end"]);
+    }
+
+    #[test]
+    fn test_job029_while_break_without_try_returns() {
+        let out = run_as_module(
+            "function f() {\n    while true {\n        print(\"b\")\n        break\n    }\n    return 7\n}\nprint(f())\nprint(\"top\")",
+        );
+        assert_eq!(out, vec!["b", "7", "top"]);
+    }
+
+    #[test]
+    fn test_job029_if_while_guard_on_run_path() {
+        // Guard jalur non-module (vm.run) tetap menghasilkan output lengkap.
+        let out = run_source(
+            "function f() {\n    if true {\n        print(\"in\")\n    }\n    return 2\n}\nprint(f())\nprint(\"top\")",
+        );
+        assert_eq!(out.unwrap(), vec!["in", "2", "top"]);
+    }
