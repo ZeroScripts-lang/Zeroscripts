@@ -6832,3 +6832,53 @@ main()"#
         );
         assert_eq!(out.unwrap(), vec!["in", "2", "top"]);
     }
+
+    #[test]
+    fn test_job030_local_store_create_then_cached_hits() {
+        // Bare assignment creates the local on first store; later iterations
+        // must hit the per-pc cache and still see the same binding.
+        let out = run_as_module(
+            "function g() {\n    let i = 0\n    x = 1\n    while i < 3 {\n        i = i + 1\n        x = x + 1\n    }\n    return x\n}\nprint(g())",
+        );
+        assert_eq!(out, vec!["4"]);
+    }
+
+    #[test]
+    fn test_job030_global_store_cached_in_loop() {
+        // Jalur run(): top-level let = DeclareGlobal/StoreGlobal; StoreGlobal
+        // di dalam loop resolve sekalu lalu hit per pc; LoadGlobal print juga.
+        let out = run_source(
+            "let g = 0\nlet i = 0\nwhile i < 3 {\n    i = i + 1\n    g = i\n}\nprint(g)",
+        );
+        assert_eq!(out.unwrap(), vec!["3"]);
+    }
+
+    #[test]
+    fn test_job030_module_let_store_local_cached_in_loop() {
+        // Jalur module: top-level let memakai StoreLocal; binding yang sama
+        // diakses dari loop harus ter-cache dengan distance benar.
+        let out = run_as_module(
+            "let i = 0\nwhile i < 3 {\n    i = i + 1\n}\nprint(i)",
+        );
+        assert_eq!(out, vec!["3"]);
+    }
+
+    #[test]
+    fn test_job030_cached_local_shadowing_dist() {
+        // Dua pc dengan distance berbeda pada nama yang sama (shadowing):
+        // cache tidak boleh menyilangkan hasil resolve.
+        let out = run_source(
+            "function h() {\n    let v = 100\n    let r = 0\n    if true {\n        let v = 1\n        r = r + v\n    }\n    r = r + v\n    return r\n}\nprint(h())",
+        );
+        assert_eq!(out.unwrap(), vec!["101"]);
+    }
+
+    #[test]
+    fn test_job030_cache_correct_across_call_swap() {
+        // Tiap Call/Return mengganti instruction stream (cache_gen bump);
+        // resolusi ulang setelah swap harus identik dengan resolve awal.
+        let out = run_source(
+            "let a = 5\nfunction f(n) {\n    let r = n + a\n    return r\n}\nprint(f(1))\nprint(f(10))\nprint(a)",
+        );
+        assert_eq!(out.unwrap(), vec!["6", "15", "5"]);
+    }

@@ -173,12 +173,13 @@ impl ZeroVM {
             pending_return: self.pending_return.take(),
         };
         self.tasks[task_id].context = Some(ctx);
+        self.bump_cache_gen();
     }
 
     /// Load a saved context into the instruction-loop fields.
     pub(super) fn load_context(&mut self, ctx: TaskContext) {
         self.pc = ctx.pc;
-        self.program.instructions = ctx.instructions;
+        self.swap_instructions(ctx.instructions);
         self.call_stack = ctx.call_stack;
         self.handlers = ctx.handlers;
         self.pending_error = ctx.pending_error;
@@ -659,8 +660,9 @@ impl ZeroVM {
                 ));
             }
             let instruction = self.program.instructions[self.pc].clone();
+            let instr_pc = self.pc;
             self.pc += 1;
-            if let Err(err) = self.execute_instruction(&instruction) {
+            if let Err(err) = self.execute_instruction(instr_pc, &instruction) {
                 if let VmError::RuntimeError(msg) = err {
                     self.raise_runtime_error(msg)?;
                 } else {

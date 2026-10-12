@@ -32,6 +32,21 @@ use types::{
 };
 
 
+/// Cached name-resolution result for one instruction pc (Job 030).
+/// Keyed by `cache_gen` — invalid whenever the active instruction stream
+/// changes (function-body swap/restore, default body, task context load).
+#[derive(Clone, Copy)]
+enum ResCache {
+    Global(usize),
+    Local { dist: u32, scope_len: u32 },
+}
+
+#[derive(Clone, Copy)]
+struct ResEntry {
+    generation: u64,
+    slot: Option<ResCache>,
+}
+
 pub struct ZeroVM {
     program: BytecodeProgram,
     pc: usize,
@@ -73,7 +88,15 @@ pub struct ZeroVM {
     /// Top-level/global bindings (builtins + `let`/`const` at program scope).
     /// Lives outside every execution context so task contexts (§112), which
     /// do not contain the root frame, still resolve globals identically.
-    global_scope: HashMap<String, Binding>,
+    /// Append-only after `clear()` (Job 030) so binding indices stay stable
+    /// and cacheable.
+    global_scope: Vec<(String, Binding)>,
+    /// Per-pc name-resolution cache (Job 030): O(1) lookup after the first
+    /// resolve of an instruction instead of hashing/walking every execution.
+    resolve_cache: Vec<ResEntry>,
+    /// Generation counter for `resolve_cache`; bumped on every
+    /// `program.instructions` swap and on global-scope reset.
+    cache_gen: u64,
     /// §150 execution limits + §133 heap limit — host configuration only
     /// (§149, ISSUES §71g); `None` fields = unlimited (ISSUES §71f default).
     limits: Limits,
@@ -107,7 +130,9 @@ impl ZeroVM {
             active_task: None,
             now_ms: 0,
             next_terminal_seq: 0,
-            global_scope: HashMap::new(),
+            global_scope: Vec::new(),
+            resolve_cache: Vec::new(),
+            cache_gen: 0,
             limits: Limits::default(),
             instructions_executed: 0,
             execution_started: None,
@@ -198,7 +223,7 @@ impl ZeroVM {
         for frame in &self.call_stack {
             collect_frame_refs(frame, &mut roots);
         }
-        for binding in self.global_scope.values() {
+        for (_, binding) in &self.global_scope {
             collect_binding_refs(binding, &mut roots);
         }
         if let Some(value) = &self.pending_return {
@@ -258,16 +283,69 @@ impl ZeroVM {
     /// Install built-in bindings into the shared global scope (§42-§53).
     fn install_builtins(&mut self) {
         for name in native::BUILTIN_ROOTS {
-            self.global_scope.insert(
-                name.to_string(),
-                Binding {
-                    value: Value::BuiltIn(name.to_string()),
-                    is_const: true,
-                    initialized: true,
-                    live: None,
-                },
-            );
+            let binding = Binding {
+                value: Value::BuiltIn(name.to_string()),
+                is_const: true,
+                initialized: true,
+                live: None,
+            };
+            match self.global_index(name) {
+                Some(idx) => self.global_scope[idx].1 = binding,
+                None => self.global_scope.push((name.to_string(), binding)),
+            }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Name-resolution cache (Job 030)
+    // ------------------------------------------------------------------
+
+    fn global_index(&self, name: &str) -> Option<usize> {
+        self.global_scope.iter().position(|(k, _)| k == name)
+    }
+
+    fn res_get(&self, pc: usize) -> Option<ResCache> {
+        self.resolve_cache
+            .get(pc)
+            .filter(|e| e.generation == self.cache_gen)
+            .and_then(|e| e.slot)
+    }
+
+    fn res_put(&mut self, pc: usize, slot: ResCache) {
+        let entry = ResEntry {
+            generation: self.cache_gen,
+            slot: Some(slot),
+        };
+        if pc >= self.resolve_cache.len() {
+            self.resolve_cache
+                .resize(pc + 1, ResEntry { generation: 0, slot: None });
+        }
+        self.resolve_cache[pc] = entry;
+    }
+
+    /// Called whenever `program.instructions` is replaced — the pc space of
+    /// the previous stream must never be read against the new one (Job 030).
+    fn bump_cache_gen(&mut self) {
+        self.cache_gen = self.cache_gen.wrapping_add(1);
+    }
+
+    /// Reset cache + global scope between runs: `clear()` drops bindings the
+    /// cached indices point at, and a new run re-executes every pc anyway.
+    fn reset_run_state(&mut self) {
+        self.global_scope.clear();
+        self.install_builtins();
+        self.resolve_cache.clear();
+        self.resolve_cache.resize(
+            self.program.instructions.len(),
+            ResEntry { generation: 0, slot: None },
+        );
+        self.bump_cache_gen();
+    }
+
+    /// Swap in a new instruction stream and invalidate per-pc cache entries.
+    fn swap_instructions(&mut self, instructions: Vec<Opcode>) {
+        self.program.instructions = instructions;
+        self.bump_cache_gen();
     }
 
     /// §150/§133 enforcement at the instruction boundary: instruction
@@ -364,8 +442,7 @@ impl ZeroVM {
 
         // Globals live in `global_scope` (shared across task contexts); the
         // root frame only hosts the top-level lexical scope stack.
-        self.global_scope.clear();
-        self.install_builtins();
+        self.reset_run_state();
         self.call_stack.push(Frame {
             function_index: 0,
             scopes: vec![HashMap::new()],
@@ -387,9 +464,10 @@ impl ZeroVM {
             }
 
             let instruction = self.program.instructions[self.pc].clone();
+            let instr_pc = self.pc;
             self.pc += 1;
 
-            if let Err(err) = self.execute_instruction(&instruction) {
+            if let Err(err) = self.execute_instruction(instr_pc, &instruction) {
                 // Only ZeroScript runtime errors are catchable (§43, §154)
                 if let VmError::RuntimeError(msg) = err {
                     self.raise_runtime_error(msg)?;
@@ -424,8 +502,7 @@ impl ZeroVM {
         self.execution_started = Some(Instant::now());
         self.state = ExecutionState::Running;
 
-        self.global_scope.clear();
-        self.install_builtins();
+        self.reset_run_state();
         self.call_stack.push(Frame {
             function_index: 0,
             scopes: vec![HashMap::new()],
@@ -593,11 +670,12 @@ impl ZeroVM {
                 break;
             }
             let instruction = self.program.instructions[self.pc].clone();
+            let instr_pc = self.pc;
             self.pc += 1;
             if matches!(instruction, Opcode::EndModule) {
                 break;
             }
-            if let Err(err) = self.execute_instruction(&instruction) {
+            if let Err(err) = self.execute_instruction(instr_pc, &instruction) {
                 if let VmError::RuntimeError(msg) = err {
                     self.raise_runtime_error(msg)?;
                 } else {
@@ -640,17 +718,17 @@ impl ZeroVM {
         }
     }
 
-    fn execute_instruction(&mut self, instruction: &Opcode) -> Result<(), VmError> {
+    fn execute_instruction(&mut self, pc: usize, instruction: &Opcode) -> Result<(), VmError> {
         // §150/§133: enforce configured limits before dispatching (ISSUES §71).
         self.check_execution_limits()?;
         match instruction {
             Opcode::LoadConst(idx) => self.execute_load_const(*idx),
             Opcode::DeclareLocal(name, is_const) => self.execute_declare_local(name, *is_const),
-            Opcode::StoreLocal(name) => self.execute_store_local(name),
-            Opcode::LoadLocal(name) => self.execute_load_local(name),
+            Opcode::StoreLocal(name) => self.execute_store_local(pc, name),
+            Opcode::LoadLocal(name) => self.execute_load_local(pc, name),
             Opcode::DeclareGlobal(name, is_const) => self.execute_declare_global(name, *is_const),
-            Opcode::LoadGlobal(name) => self.execute_load_global(name),
-            Opcode::StoreGlobal(name) => self.execute_store_global(name),
+            Opcode::LoadGlobal(name) => self.execute_load_global(pc, name),
+            Opcode::StoreGlobal(name) => self.execute_store_global(pc, name),
             Opcode::PushScope => self.execute_push_scope(),
             Opcode::PopScope => self.execute_pop_scope(),
             Opcode::Add => self.execute_binary_op(|a, b| Self::add_values(a, b)),
@@ -761,14 +839,46 @@ impl ZeroVM {
         Ok(())
     }
 
-    fn execute_store_local(&mut self, name: &str) -> Result<(), VmError> {
+    fn execute_store_local(&mut self, pc: usize, name: &str) -> Result<(), VmError> {
         let value = self.pop_stack("store local")?;
+        let cached = self.res_get(pc);
 
-        // Find binding in current frame's scopes (innermost first)
-        let mut found = false;
-        let mut write_env: Option<HeapRefHandle> = None;
         if let Some(frame) = self.call_stack.last_mut() {
-            for scope in frame.scopes.iter_mut().rev() {
+            let scope_len = frame.scopes.len();
+
+            // Cached distance (Job 030): one get_mut and no walk, valid only
+            // while the scope depth matches the depth at resolve time.
+            if let Some(ResCache::Local { dist, scope_len: l }) = cached {
+                if l as usize == scope_len && (scope_len as u32) > dist {
+                    let idx = scope_len - 1 - dist as usize;
+                    if let Some(binding) = frame.scopes[idx].get_mut(name) {
+                        if binding.is_const && binding.initialized {
+                            return Err(VmError::RuntimeError(format!(
+                                "Cannot assign to const '{}'",
+                                name
+                            )));
+                        }
+                        binding.value = value.clone();
+                        binding.initialized = true;
+                        let write_env = frame.scope_env.clone();
+                        self.res_put(
+                            pc,
+                            ResCache::Local { dist, scope_len: scope_len as u32 },
+                        );
+                        // Keep shared closure env in sync when this frame owns it (§66).
+                        if let Some(env) = write_env {
+                            if let Ok(Some(_)) = self.heap.get_env_binding(&env, name) {
+                                self.store_in_env(&env, name, value.clone())?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Resolve innermost-first in the same pass as the write.
+            let mut resolved: Option<u32> = None;
+            for (i, scope) in frame.scopes.iter_mut().rev().enumerate() {
                 if let Some(binding) = scope.get_mut(name) {
                     if binding.is_const && binding.initialized {
                         return Err(VmError::RuntimeError(format!(
@@ -778,72 +888,95 @@ impl ZeroVM {
                     }
                     binding.value = value.clone();
                     binding.initialized = true;
-                    found = true;
+                    resolved = Some(i as u32);
                     break;
                 }
             }
-            // Keep shared closure env in sync when this frame owns it (§66).
-            if found {
-                write_env = frame.scope_env.clone();
-            }
-            if !found {
-                // §4: assignment to unknown name inside a function creates a local
-                if let Some(scope) = frame.scopes.last_mut() {
-                    scope.insert(
-                        name.to_string(),
-                        Binding {
-                            value: value.clone(),
-                            is_const: false,
-                            initialized: true,
-                            live: None,
-                        },
-                    );
-                    return Ok(());
+            if let Some(dist) = resolved {
+                let write_env = frame.scope_env.clone();
+                self.res_put(
+                    pc,
+                    ResCache::Local { dist, scope_len: scope_len as u32 },
+                );
+                if let Some(env) = write_env {
+                    if let Ok(Some(_)) = self.heap.get_env_binding(&env, name) {
+                        self.store_in_env(&env, name, value.clone())?;
+                    }
                 }
+                return Ok(());
             }
-        }
 
-        if let Some(env) = write_env {
-            if let Ok(Some(_)) = self.heap.get_env_binding(&env, name) {
-                self.store_in_env(&env, name, value.clone())?;
+            // §4: assignment to unknown name inside a function creates a local
+            if let Some(scope) = frame.scopes.last_mut() {
+                scope.insert(
+                    name.to_string(),
+                    Binding {
+                        value: value.clone(),
+                        is_const: false,
+                        initialized: true,
+                        live: None,
+                    },
+                );
+                self.res_put(
+                    pc,
+                    ResCache::Local { dist: 0, scope_len: scope_len as u32 },
+                );
             }
         }
 
         Ok(())
     }
 
-    fn execute_load_local(&mut self, name: &str) -> Result<(), VmError> {
+    /// Read a binding's value, following a live import source when present
+    /// (§66/§74). Falls back to the stored value if the source env is gone.
+    fn read_binding_value(heap: &Heap, binding: &Binding, name: &str) -> Result<Value, VmError> {
+        if let Some((env, env_name)) = &binding.live {
+            if let Ok(Some(heap_ref)) = heap.get_env_binding(env, env_name) {
+                return Value::from_heap_ref(&heap_ref, heap).map_err(|_| {
+                    VmError::RuntimeError(format!("Failed to convert heap value for '{}'", name))
+                });
+            }
+        }
+        Ok(binding.value.clone())
+    }
+
+    fn execute_load_local(&mut self, pc: usize, name: &str) -> Result<(), VmError> {
+        let cached = self.res_get(pc);
+        let mut resolved: Option<(u32, usize, Value)> = None;
+
         if let Some(frame) = self.call_stack.last() {
-            for scope in frame.scopes.iter().rev() {
-                if let Some(binding) = scope.get(name) {
-                    // Live import binding (§66/§74): read through source env.
-                    if let Some((env, env_name)) = &binding.live {
-                        if let Ok(Some(heap_ref)) = self.heap.get_env_binding(env, env_name) {
-                            let value = Value::from_heap_ref(&heap_ref, &self.heap).map_err(|_| {
-                                VmError::RuntimeError(format!(
-                                    "Failed to convert heap value for '{}'",
-                                    name
-                                ))
-                            })?;
-                            self.stack_mut().push(value);
-                            return Ok(());
-                        }
+            let scope_len = frame.scopes.len();
+
+            if let Some(ResCache::Local { dist, scope_len: l }) = cached {
+                if l as usize == scope_len && (scope_len as u32) > dist {
+                    let idx = scope_len - 1 - dist as usize;
+                    if let Some(binding) = frame.scopes[idx].get(name) {
+                        let value = Self::read_binding_value(&self.heap, binding, name)?;
+                        resolved = Some((dist, scope_len, value));
                     }
-                    let value = binding.value.clone();
-                    self.stack_mut().push(value);
-                    return Ok(());
+                }
+            }
+            if resolved.is_none() {
+                for (i, scope) in frame.scopes.iter().rev().enumerate() {
+                    if let Some(binding) = scope.get(name) {
+                        let value = Self::read_binding_value(&self.heap, binding, name)?;
+                        resolved = Some((i as u32, scope_len, value));
+                        break;
+                    }
                 }
             }
         }
-        Err(VmError::RuntimeError(format!(
-            "Undefined variable '{}'",
-            name
-        )))
+
+        let (dist, scope_len, value) = resolved.ok_or_else(|| {
+            VmError::RuntimeError(format!("Undefined variable '{}'", name))
+        })?;
+        self.res_put(pc, ResCache::Local { dist, scope_len: scope_len as u32 });
+        self.stack_mut().push(value);
+        Ok(())
     }
 
     fn execute_declare_global(&mut self, name: &str, is_const: bool) -> Result<(), VmError> {
-        let scope = &mut self.global_scope;
-        if scope.contains_key(name) {
+        if self.global_index(name).is_some() {
             if native::is_builtin_root(name) {
                 return Err(VmError::RuntimeError(format!(
                     "Cannot redeclare built-in '{}'",
@@ -855,7 +988,7 @@ impl ZeroVM {
                 name
             )));
         }
-        scope.insert(
+        self.global_scope.push((
             name.to_string(),
             Binding {
                 value: Value::Null,
@@ -863,52 +996,66 @@ impl ZeroVM {
                 initialized: false,
                 live: None,
             },
-        );
+        ));
         Ok(())
     }
 
-    fn execute_load_global(&mut self, name: &str) -> Result<(), VmError> {
-        if let Some(binding) = self.global_scope.get(name) {
-            let value = binding.value.clone();
-            self.stack_mut().push(value);
-            return Ok(());
-        }
-        Err(VmError::RuntimeError(format!(
-            "Undefined variable '{}'",
-            name
-        )))
+    fn execute_load_global(&mut self, pc: usize, name: &str) -> Result<(), VmError> {
+        let idx = match self.res_get(pc) {
+            Some(ResCache::Global(i))
+                if i < self.global_scope.len() && self.global_scope[i].0 == name =>
+            {
+                i
+            }
+            _ => {
+                let i = self.global_index(name).ok_or_else(|| {
+                    VmError::RuntimeError(format!("Undefined variable '{}'", name))
+                })?;
+                self.res_put(pc, ResCache::Global(i));
+                i
+            }
+        };
+        let value = self.global_scope[idx].1.value.clone();
+        self.stack_mut().push(value);
+        Ok(())
     }
 
-    fn execute_store_global(&mut self, name: &str) -> Result<(), VmError> {
+    fn execute_store_global(&mut self, pc: usize, name: &str) -> Result<(), VmError> {
         let value = self.pop_stack("store global")?;
 
-        {
-            let scope = &mut self.global_scope;
+        let idx = match self.res_get(pc) {
+            Some(ResCache::Global(i))
+                if i < self.global_scope.len() && self.global_scope[i].0 == name =>
             {
-                if let Some(binding) = scope.get_mut(name) {
-                    if binding.is_const && binding.initialized {
-                        return Err(VmError::RuntimeError(format!(
-                            "Cannot assign to const '{}'",
-                            name
-                        )));
-                    }
-                    binding.value = value.clone();
-                    binding.initialized = true;
-                } else {
-                    // Bare assignment creates a mutable global
-                    scope.insert(
-                        name.to_string(),
-                        Binding {
-                            value: value.clone(),
-                            is_const: false,
-                            initialized: true,
-                            live: None,
-                        },
-                    );
-                }
+                Some(i)
             }
-        }
+            _ => self.global_index(name),
+        };
 
+        if let Some(i) = idx {
+            let binding = &mut self.global_scope[i].1;
+            if binding.is_const && binding.initialized {
+                return Err(VmError::RuntimeError(format!(
+                    "Cannot assign to const '{}'",
+                    name
+                )));
+            }
+            binding.value = value.clone();
+            binding.initialized = true;
+            self.res_put(pc, ResCache::Global(i));
+        } else {
+            // Bare assignment creates a mutable global
+            self.global_scope.push((
+                name.to_string(),
+                Binding {
+                    value: value.clone(),
+                    is_const: false,
+                    initialized: true,
+                    live: None,
+                },
+            ));
+            self.res_put(pc, ResCache::Global(self.global_scope.len() - 1));
+        }
         Ok(())
     }
 
@@ -1145,7 +1292,8 @@ impl ZeroVM {
                 let return_instructions = self.program.instructions.clone();
 
                 if func_idx < self.program.function_bodies.len() {
-                    self.program.instructions = self.program.function_bodies[func_idx].clone();
+                    let body = self.program.function_bodies[func_idx].clone();
+                    self.swap_instructions(body);
                 }
 
                 self.call_stack.push(Frame {
@@ -1214,7 +1362,8 @@ impl ZeroVM {
                 let return_instructions = self.program.instructions.clone();
 
                 if func_idx < self.program.function_bodies.len() {
-                    self.program.instructions = self.program.function_bodies[func_idx].clone();
+                    let body = self.program.function_bodies[func_idx].clone();
+                    self.swap_instructions(body);
                 }
 
                 self.call_stack.push(Frame {
@@ -1431,6 +1580,7 @@ impl ZeroVM {
         let stack_at_start = self.stack().len();
         let default_body = self.program.default_bodies[default_idx].clone();
         let saved_instructions = std::mem::replace(&mut self.program.instructions, default_body);
+        self.bump_cache_gen();
         self.call_stack.push(Frame {
             // Default bodies are not functions; nothing reads this index.
             function_index: usize::MAX,
@@ -1454,9 +1604,10 @@ impl ZeroVM {
             }
 
             let instruction = self.program.instructions[self.pc].clone();
+            let instr_pc = self.pc;
             self.pc += 1;
 
-            if let Err(err) = self.execute_instruction(&instruction) {
+            if let Err(err) = self.execute_instruction(instr_pc, &instruction) {
                 // Mirror the outer loops: only ZeroScript runtime errors are
                 // catchable (§43, §154); anything else aborts evaluation.
                 if let VmError::RuntimeError(msg) = err {
@@ -2396,7 +2547,7 @@ impl ZeroVM {
         while self.call_stack.len() > handler.frame_depth {
             if let Some(frame) = self.call_stack.pop() {
                 if let Some(instrs) = frame.return_instructions {
-                    self.program.instructions = instrs;
+                    self.swap_instructions(instrs);
                 }
             }
         }
@@ -2428,7 +2579,7 @@ impl ZeroVM {
         self.pc = frame.return_pc;
 
         if let Some(instructions) = frame.return_instructions {
-            self.program.instructions = instructions;
+            self.swap_instructions(instructions);
         }
 
         // Also discard handlers that were in the popped frame
@@ -2492,7 +2643,7 @@ impl ZeroVM {
         self.pc = frame.return_pc;
 
         if let Some(instructions) = frame.return_instructions {
-            self.program.instructions = instructions;
+            self.swap_instructions(instructions);
         }
 
         if let Some(tid) = frame.task_id {
@@ -2597,8 +2748,8 @@ impl ZeroVM {
         }
 
         // Fall back to the shared global scope (builtins + top-level vars).
-        if let Some(binding) = self.global_scope.get(name) {
-            return Ok(binding.value.clone());
+        if let Some(idx) = self.global_index(name) {
+            return Ok(self.global_scope[idx].1.value.clone());
         }
 
         Err(VmError::RuntimeError(format!(
@@ -2626,8 +2777,8 @@ impl ZeroVM {
         }
 
         // Fall back to the shared global scope (builtins + top-level vars).
-        if let Some(binding) = self.global_scope.get(name) {
-            return Ok(binding.value.clone());
+        if let Some(idx) = self.global_index(name) {
+            return Ok(self.global_scope[idx].1.value.clone());
         }
 
         Err(VmError::RuntimeError(format!(
