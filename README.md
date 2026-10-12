@@ -33,6 +33,9 @@ cargo build --release
 # Run a script
 ./target/release/zsc examples/hello.zs        # → 42
 
+# Guided tour of the whole language (one file)
+./target/release/zsc examples/demo.zs
+
 # Run code without a file
 ./target/release/zsc -e 'print(1 + 2)'        # → 3
 
@@ -176,7 +179,7 @@ Supporting layers: `module.rs` (module graph, package resolution), `package.rs` 
 ```
 src/          language implementation (compiler, VM, stdlib, zsc, zpm) — 30 files
 tests/        end-to-end CLI test suites (zsc compile/run/eval/init, zpm)
-examples/     runnable example scripts and a sample project
+examples/     demo.zs feature tour, runnable example scripts, and a sample project
 Cargo.toml    build manifest — zero external crates
 LICENSE       MIT
 ```
