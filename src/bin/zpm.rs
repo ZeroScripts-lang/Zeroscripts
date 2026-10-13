@@ -11,6 +11,8 @@ use zeroscript::package::{
     InstallReport, Project, Registry, Sources, MANIFEST_FILE,
 };
 
+const VERSION: &str = "zpm v0.1.0";
+
 const USAGE: &str = "usage: zpm [--registry <dir>] <command> [args]
 
 commands:
@@ -240,6 +242,10 @@ fn main() {
         "update" => cmd_update(&registry_flags, &rest[1..]),
         "publish" => cmd_publish(&registry_flags, &rest[1..]),
         "run" => cmd_run(&rest[1..]),
+        "--version" | "-V" => {
+            println!("{}", VERSION);
+            std::process::exit(0);
+        }
         "--help" | "-h" => {
             println!("{}", USAGE);
             std::process::exit(0);

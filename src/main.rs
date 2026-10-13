@@ -17,7 +17,7 @@ use zeroscript::vm::{Limits, ZeroVM};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
-const VERSION: &str = "ZeroScript VM v0.1.0";
+const VERSION: &str = "zsc v0.1.0";
 
 fn usage() -> &'static str {
     "usage: zsc [--max-instructions=N] [--time-limit=MS] [--max-memory-slots=N]\n            [--max-call-depth=N] [--max-tasks=N]\n            <file.zs> [args...]\n       zsc [flags] -e <code> [args...]\n       zsc compile <file.zs> [-o <out.zsbc>]\n       zsc run <file.zsbc> [args...]\n       zsc init\n       zsc --version\n\nExecution-limit flags are recognized only before the code/mode argument\n(Dependencies.md section 100 \"Flag Execution Limits\")."
