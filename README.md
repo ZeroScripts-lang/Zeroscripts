@@ -205,7 +205,6 @@ The full language specification (in Indonesian, ~158 numbered sections across th
 
 **Disclosed gaps currently tracked:**
 
-- CLI flags for execution limits (the embedder API `ZeroVM::set_limits` exists; no `zsc` flags, because the spec does not define any yet).
 - Debug/source-location info inside `.zsbc` artifacts (would be a bytecode version bump).
 - A networked package registry (registries today are local directories + Git sources, which is what the spec requires of the registry layer).
 

@@ -13,17 +13,74 @@ use zeroscript::bytecode_io;
 use zeroscript::json::{self, JsonValue};
 use zeroscript::module;
 use zeroscript::package;
-use zeroscript::vm::ZeroVM;
+use zeroscript::vm::{Limits, ZeroVM};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 const VERSION: &str = "ZeroScript VM v0.1.0";
 
 fn usage() -> &'static str {
-    "usage: zsc <file.zs> [args...]\n       zsc -e <code> [args...]\n       zsc compile <file.zs> [-o <out.zsbc>]\n       zsc run <file.zsbc> [args...]\n       zsc init\n       zsc --version"
+    "usage: zsc [--max-instructions=N] [--time-limit=MS] [--max-memory-slots=N]\n            [--max-call-depth=N] [--max-tasks=N]\n            <file.zs> [args...]\n       zsc [flags] -e <code> [args...]\n       zsc compile <file.zs> [-o <out.zsbc>]\n       zsc run <file.zsbc> [args...]\n       zsc init\n       zsc --version\n\nExecution-limit flags are recognized only before the code/mode argument\n(Dependencies.md section 100 \"Flag Execution Limits\")."
+}
+
+/// Split leading execution-limit flags off `argv` (Dependencies.md §100
+/// "Flag Execution Limits"). Only the five `--name=<value>` forms count;
+/// scanning stops at the first non-flag token, which becomes the mode/code
+/// argument — everything after it stays program data (§52/§100).
+fn split_limits_flags(argv: &[String]) -> Result<(Limits, Vec<String>), String> {
+    fn positive(arg: &str, name: &str, value: &str) -> Result<u64, String> {
+        let n = value
+            .parse::<u64>()
+            .map_err(|_| format!("ERROR: invalid value for {}: {}", name, arg))?;
+        if n == 0 {
+            return Err(format!("ERROR: {} must be greater than 0", name));
+        }
+        Ok(n)
+    }
+
+    let mut limits = Limits::default();
+    let mut rest: Vec<String> = Vec::new();
+    let mut iter = argv.iter().peekable();
+    while let Some(arg) = iter.peek() {
+        if let Some((key, value)) = arg.split_once('=') {
+            match key {
+                "--max-instructions" => {
+                    limits.instruction_count = Some(positive(arg, key, value)?);
+                    iter.next();
+                    continue;
+                }
+                "--time-limit" => {
+                    limits.execution_time_ms = Some(positive(arg, key, value)?);
+                    iter.next();
+                    continue;
+                }
+                "--max-memory-slots" => {
+                    limits.heap_slots = Some(positive(arg, key, value)? as usize);
+                    iter.next();
+                    continue;
+                }
+                "--max-call-depth" => {
+                    limits.call_stack_depth = Some(positive(arg, key, value)? as usize);
+                    iter.next();
+                    continue;
+                }
+                "--max-tasks" => {
+                    limits.task_count = Some(positive(arg, key, value)? as usize);
+                    iter.next();
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        break;
+    }
+    rest.extend(iter.cloned());
+    Ok((limits, rest))
 }
 
 fn run(argv: &[String]) -> Result<(), String> {
+    let (limits, argv) = split_limits_flags(argv)?;
+    let argv = argv.as_slice();
     let first = match argv.first() {
         Some(s) if s == "--help" || s == "-h" => {
             println!("{}", usage());
@@ -42,10 +99,10 @@ fn run(argv: &[String]) -> Result<(), String> {
     // `./-e`.
     match first.as_str() {
         "compile" => cmd_compile(&argv[1..]),
-        "run" => cmd_run(&argv[1..]),
+        "run" => cmd_run(&argv[1..], &limits),
         "init" => cmd_init(&argv[1..]),
-        "-e" | "--eval" => cmd_eval(&argv[1..]),
-        _ => run_file(first, &argv[1..]),
+        "-e" | "--eval" => cmd_eval(&argv[1..], &limits),
+        _ => run_file(first, &argv[1..], &limits),
     }
 }
 
@@ -59,7 +116,7 @@ fn print_output(vm: &ZeroVM) {
     }
 }
 
-fn run_file(script: &str, args: &[String]) -> Result<(), String> {
+fn run_file(script: &str, args: &[String], limits: &Limits) -> Result<(), String> {
     let path = Path::new(script);
     if !path.is_file() {
         return Err(format!("ERROR: Cannot read {}", script));
@@ -67,6 +124,7 @@ fn run_file(script: &str, args: &[String]) -> Result<(), String> {
 
     let bundle = module::load(path).map_err(|e| e.to_string())?;
     let mut vm = ZeroVM::new(bundle.program);
+    vm.set_limits(*limits).map_err(|e| e.to_string())?;
     vm.set_program_args(args.to_vec());
     vm.run_modules(&bundle.modules).map_err(|e| e.to_string())?;
     print_output(&vm);
@@ -78,13 +136,14 @@ fn run_file(script: &str, args: &[String]) -> Result<(), String> {
 /// at the current working directory, so relative imports resolve from cwd
 /// (§64); everything after `code` is program args (§52) and is never
 /// re-parsed as zsc flags.
-fn cmd_eval(args: &[String]) -> Result<(), String> {
+fn cmd_eval(args: &[String], limits: &Limits) -> Result<(), String> {
     const USAGE: &str = "ERROR: usage: zsc -e <code> [args...]";
     let code = args.first().ok_or(USAGE)?;
     let cwd = std::env::current_dir().map_err(|e| format!("ERROR: {}", e))?;
     let virtual_path = cwd.join("__zsc_eval__.zs");
     let bundle = module::load_source(&virtual_path, code).map_err(|e| e.to_string())?;
     let mut vm = ZeroVM::new(bundle.program);
+    vm.set_limits(*limits).map_err(|e| e.to_string())?;
     vm.set_program_args(args[1..].to_vec());
     vm.run_modules(&bundle.modules).map_err(|e| e.to_string())?;
     print_output(&vm);
@@ -264,7 +323,7 @@ fn cmd_compile(args: &[String]) -> Result<(), String> {
 /// `zsc run <file.zsbc> [args...]` (§158): verify checksum, parse payload,
 /// hand the bundle to the VM — §124/§125 validation runs inside `run_modules`
 /// before the first instruction.
-fn cmd_run(args: &[String]) -> Result<(), String> {
+fn cmd_run(args: &[String], limits: &Limits) -> Result<(), String> {
     const USAGE: &str = "ERROR: usage: zsc run <file.zsbc> [args...]";
     let file = args.first().ok_or(USAGE)?;
     let path = Path::new(file);
@@ -276,6 +335,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let bundle =
         bytecode_io::load(&bytes).map_err(|e| format!("ERROR: {}", e))?;
     let mut vm = ZeroVM::new(bundle.program);
+    vm.set_limits(*limits).map_err(|e| e.to_string())?;
     vm.set_program_args(args[1..].to_vec());
     vm.run_modules(&bundle.modules).map_err(|e| e.to_string())?;
     print_output(&vm);
