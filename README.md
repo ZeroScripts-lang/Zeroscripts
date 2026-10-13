@@ -21,6 +21,16 @@ Development is **spec-first**: a detailed written specification defines every la
 
 ---
 
+## Install
+
+Prebuilt binaries for Linux (x86_64/arm64, static musl), macOS (x64/arm64), and Windows (x86_64) ship with every GitHub release. On Linux/macOS, one command — no need to pick a file:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ZeroScripts-lang/Zeroscripts/main/install.sh | sh
+```
+
+The script auto-detects OS/architecture, installs `zsc` + `zpm` to `~/.zeroscript/bin`, and prints the PATH line to add. Override the location with `ZSC_INSTALL_DIR`; pin a version with `ZSC_TAG`. Windows: download the `.zip` asset from the release page.
+
 ## Quick Start
 
 Requires a stable [Rust toolchain](https://rustup.rs/).
