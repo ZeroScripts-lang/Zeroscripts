@@ -90,6 +90,7 @@ jobs:
           shopt -s nullglob
           assets=(zeroscript-*)
           gh release create "$GITHUB_REF_NAME" \
+            -R "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --notes "ZeroScript $GITHUB_REF_NAME — see https://github.com/$GITHUB_REPOSITORY/blob/main/README.md" \
             "${assets[@]}"
