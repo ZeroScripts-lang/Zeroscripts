@@ -572,6 +572,11 @@ impl ZeroVM {
                 self.handlers.clear();
                 return Err(e);
             }
+            if self.state == ExecutionState::Completed {
+                // Top-level return ended the program (ISSUES §75e): the root
+                // frame is gone — skip export capture and remaining modules.
+                break;
+            }
 
             // Capture shared closure env before clearing (live binding root).
             let scope_env = {
@@ -681,6 +686,11 @@ impl ZeroVM {
                 } else {
                     return Err(err);
                 }
+            }
+            // Top-level return completed the program (ISSUES §75e) — stop
+            // instead of re-executing from pc 0.
+            if self.state == ExecutionState::Completed {
+                break;
             }
         }
         Ok(())
@@ -2592,6 +2602,12 @@ impl ZeroVM {
             // resolves its await when the scheduler resumes it (§107).
             self.finish_task(tid, &return_value)?;
         } else {
+            if self.call_stack.is_empty() {
+                // Top-level return (ISSUES §75e, Language.md §26): the program
+                // frame has no caller — the program completes here; the value
+                // lands in the orphan slot and stays unobservable.
+                self.state = ExecutionState::Completed;
+            }
             self.stack_mut().push(return_value);
         }
         Ok(())
@@ -2652,6 +2668,12 @@ impl ZeroVM {
             // resolves its await when the scheduler resumes it (§107).
             self.finish_task(tid, &return_value)?;
         } else {
+            if self.call_stack.is_empty() {
+                // Top-level return (ISSUES §75e, Language.md §26): the program
+                // frame has no caller — the program completes here; the value
+                // lands in the orphan slot and stays unobservable.
+                self.state = ExecutionState::Completed;
+            }
             self.stack_mut().push(return_value);
         }
 

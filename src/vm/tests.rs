@@ -6882,3 +6882,41 @@ main()"#
         );
         assert_eq!(out.unwrap(), vec!["6", "15", "5"]);
     }
+
+    #[test]
+    fn test_job032_top_level_return_module_path() {
+        // ISSUES §75e / opsi B: top-level return ends the program; output
+        // before it is kept, code after it never runs, no "No root frame".
+        let out = run_as_module("print(\"a\")\nreturn 42\nprint(\"b\")");
+        assert_eq!(out, vec!["a"]);
+    }
+
+    #[test]
+    fn test_job032_top_level_return_run_path() {
+        let out = run_source("print(\"a\")\nreturn 42\nprint(\"b\")");
+        assert_eq!(out.unwrap(), vec!["a"]);
+    }
+
+    #[test]
+    fn test_job032_top_level_bare_return() {
+        // Bare return di top level (sebelum EOF) mengakhiri program.
+        // Catatan: `return\n<stmt>` memakan statement berikutnya sbg expression
+        // (parser quirk pre-existing — dicatat sbg kandidat gap CHECK, terpisah
+        // dari job ini).
+        let out = run_source("print(\"a\")\nreturn");
+        assert_eq!(out.unwrap(), vec!["a"]);
+    }
+
+    #[test]
+    fn test_job032_function_return_unchanged() {
+        // Aturan fungsi tidak berubah: nilai tetap dikembalikan ke pemanggil.
+        let out = run_source("function f() {\n    return 7\n}\nprint(f())\nprint(\"after\")");
+        assert_eq!(out.unwrap(), vec!["7", "after"]);
+    }
+
+    #[test]
+    fn test_job032_top_level_return_runs_finally() {
+        // Jalur complete_pending_return: finally yang terlewati tetap jalan.
+        let out = run_source("try {\n    return 1\n} finally {\n    print(\"f\")\n}\nprint(\"never\")");
+        assert_eq!(out.unwrap(), vec!["f"]);
+    }
