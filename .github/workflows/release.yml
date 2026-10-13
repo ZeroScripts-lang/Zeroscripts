@@ -18,11 +18,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,       target: x86_64-unknown-linux-musl,  ext: "",    bin: tar.gz }
-          - { os: ubuntu-24.04-arm,    target: aarch64-unknown-linux-musl, ext: "",    bin: tar.gz }
-          - { os: macos-13,            target: x86_64-apple-darwin,        ext: "",    bin: tar.gz }
-          - { os: macos-latest,        target: aarch64-apple-darwin,       ext: "",    bin: tar.gz }
-          - { os: windows-latest,      target: x86_64-pc-windows-msvc,     ext: ".exe", bin: zip }
+          - { os: ubuntu-latest,       target: x86_64-unknown-linux-musl,  bin: tar.gz, extra_target: "" }
+          - { os: ubuntu-24.04-arm,    target: aarch64-unknown-linux-musl, bin: tar.gz, extra_target: "" }
+          # One macOS job (10x billing multiplier) cross-builds both arches —
+          # the crate is pure Rust, so x86_64-apple-darwin cross-compiles fine.
+          - { os: macos-latest,        target: aarch64-apple-darwin,       bin: tar.gz, extra_target: x86_64-apple-darwin }
+          - { os: windows-latest,      target: x86_64-pc-windows-msvc,     bin: zip,    extra_target: "" }
     steps:
       - uses: actions/checkout@v4
 
@@ -34,20 +35,28 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: |
+            ${{ matrix.target }}
+            ${{ matrix.extra_target }}
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build extra target (macOS cross)
+        if: matrix.extra_target != ''
+        run: cargo build --release --target ${{ matrix.extra_target }}
 
       - name: Package (unix)
         if: matrix.bin == 'tar.gz'
         shell: bash
         run: |
-          stage="zeroscript-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir -p "$stage"
-          cp target/${{ matrix.target }}/release/zsc target/${{ matrix.target }}/release/zpm "$stage/"
-          tar -czf "${stage}.tar.gz" "$stage"
-          echo "ASSET=${stage}.tar.gz" >> "$GITHUB_ENV"
+          for t in "${{ matrix.target }}" ${{ matrix.extra_target }}; do
+            [ -n "$t" ] || continue
+            stage="zeroscript-${GITHUB_REF_NAME}-$t"
+            mkdir -p "$stage"
+            cp "target/$t/release/zsc" "target/$t/release/zpm" "$stage/"
+            tar -czf "${stage}.tar.gz" "$stage"
+          done
 
       - name: Package (windows)
         if: matrix.bin == 'zip'
@@ -57,12 +66,13 @@ jobs:
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/zsc.exe" "target/${{ matrix.target }}/release/zpm.exe" "$stage/"
           7z a "${stage}.zip" "$stage"
-          echo "ASSET=${stage}.zip" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ASSET }}
-          path: ${{ env.ASSET }}
+          name: assets-${{ matrix.target }}
+          path: |
+            zeroscript-*.tar.gz
+            zeroscript-*.zip
           if-no-files-found: error
 
   release:
