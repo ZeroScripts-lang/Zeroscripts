@@ -83,6 +83,10 @@ impl From<CompilerError> for ModuleError {
 #[derive(Debug, Clone)]
 pub struct ModuleMeta {
     pub path: String,
+    /// Job 036 (ISSUES §75f): path shown in `e.location.file` — the input
+    /// path as written for the entry module, the canonical path for deps
+    /// (decision 2026-10-13).
+    pub display_path: String,
     pub start: usize,
     /// Exclusive end (index after EndModule).
     pub end: usize,
@@ -653,7 +657,7 @@ pub fn load(entry_path: &Path) -> Result<ModuleBundle, ModuleError> {
 
     let mut loader = Loader::new(project);
     loader.visit(&entry_canon)?;
-    Ok(finish(loader))
+    Ok(finish(loader, &entry_path.to_string_lossy(), &entry_canon))
 }
 
 /// Compile `source` as the entry module without touching disk for the entry
@@ -666,12 +670,12 @@ pub fn load_source(virtual_path: &Path, source: &str) -> Result<ModuleBundle, Mo
         Project::discover(virtual_path).map_err(|e| ModuleError::Package(e.message()))?;
     let mut loader = Loader::new(project);
     loader.visit_entry_source(virtual_path, source)?;
-    Ok(finish(loader))
+    Ok(finish(loader, &virtual_path.to_string_lossy(), virtual_path))
 }
 
 /// Merge loaded units into a single program (§58-§60) and build
 /// `ModuleMeta` with instruction ranges by walking the merged layout.
-fn finish(mut loader: Loader) -> ModuleBundle {
+fn finish(mut loader: Loader, entry_display: &str, entry_canon: &Path) -> ModuleBundle {
     let order = std::mem::take(&mut loader.order);
     let units = loader.units;
 
@@ -686,8 +690,14 @@ fn finish(mut loader: Loader) -> ModuleBundle {
     for p in &order {
         let loaded = units.get(p).unwrap();
         let len = loaded.unit.instructions.len();
+        let display_path = if p == entry_canon {
+            entry_display.to_string()
+        } else {
+            p.display().to_string()
+        };
         modules.push(ModuleMeta {
             path: p.display().to_string(),
+            display_path,
             start: cursor,
             end: cursor + len,
             exports: loaded.exports_set.clone(),

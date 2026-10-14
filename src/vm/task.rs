@@ -145,6 +145,8 @@ impl ZeroVM {
         Ok(TaskContext {
             pc: 0,
             instructions,
+            debug: func_info.debug.clone(),
+            source_file: func_info.source_file.clone(),
             call_stack: vec![Frame {
                 function_index: func_idx,
                 scopes: vec![root_scope],
@@ -153,6 +155,8 @@ impl ZeroVM {
                 captured_env: env,
                 scope_env: None,
                 return_instructions: None,
+                return_debug: None,
+                return_source: None,
                 task_id: Some(task_id),
             }],
             handlers: Vec::new(),
@@ -167,6 +171,8 @@ impl ZeroVM {
         let ctx = TaskContext {
             pc: self.pc,
             instructions: std::mem::take(&mut self.program.instructions),
+            debug: std::mem::take(&mut self.active_debug),
+            source_file: std::mem::take(&mut self.active_source),
             call_stack: std::mem::take(&mut self.call_stack),
             handlers: std::mem::take(&mut self.handlers),
             pending_error: self.pending_error.take(),
@@ -179,7 +185,7 @@ impl ZeroVM {
     /// Load a saved context into the instruction-loop fields.
     pub(super) fn load_context(&mut self, ctx: TaskContext) {
         self.pc = ctx.pc;
-        self.swap_instructions(ctx.instructions);
+        self.swap_instructions(ctx.instructions, ctx.debug, ctx.source_file);
         self.call_stack = ctx.call_stack;
         self.handlers = ctx.handlers;
         self.pending_error = ctx.pending_error;
@@ -664,6 +670,7 @@ impl ZeroVM {
             self.pc += 1;
             if let Err(err) = self.execute_instruction(instr_pc, &instruction) {
                 if let VmError::RuntimeError(msg) = err {
+                    self.note_error_pc(instr_pc);
                     self.raise_runtime_error(msg)?;
                 } else {
                     return Err(err);

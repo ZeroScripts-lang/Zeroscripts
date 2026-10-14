@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::compiler::Opcode;
+use crate::compiler::{DebugEntry, Opcode};
 
 use crate::heap::HeapRef as HeapRefHandle;
 
@@ -100,6 +100,10 @@ pub(super) struct Frame {
     pub(super) captured_env: Option<HeapRefHandle>,
     pub(super) scope_env: Option<HeapRefHandle>,
     pub(super) return_instructions: Option<Vec<Opcode>>,
+    /// Job 036 (ISSUES §75f): debug/source companions of
+    /// `return_instructions`, swapped back on Return/unwind.
+    pub(super) return_debug: Option<Vec<DebugEntry>>,
+    pub(super) return_source: Option<String>,
     /// Set when this frame belongs to an async task's own context (§101).
     pub(super) task_id: Option<usize>,
 }
@@ -185,6 +189,10 @@ pub(super) struct HttpOutcome {
 pub(super) struct TaskContext {
     pub(super) pc: usize,
     pub(super) instructions: Vec<Opcode>,
+    /// Job 036 (ISSUES §75f): active debug table + source path of the
+    /// stream saved with `instructions`.
+    pub(super) debug: Vec<DebugEntry>,
+    pub(super) source_file: String,
     pub(super) call_stack: Vec<Frame>,
     pub(super) handlers: Vec<TryHandler>,
     pub(super) pending_error: Option<String>,

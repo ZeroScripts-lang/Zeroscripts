@@ -420,7 +420,7 @@ impl Parser {
         let expr = self.parse_or()?;
 
         if self.check(&TokenKind::Equal) {
-            let span = expr.span().clone();
+            let span = self.current_span();
             self.advance(); // consume =
             let value = self.parse_assignment()?; // right-associative
             return Ok(Expr::Assignment {
@@ -431,7 +431,7 @@ impl Parser {
         }
 
         if let Some(op) = self.check_compound_assignment() {
-            let span = expr.span().clone();
+            let span = self.current_span();
             self.advance(); // consume op
             let value = self.parse_assignment()?;
             return Ok(Expr::CompoundAssignment {
@@ -491,14 +491,14 @@ impl Parser {
                 TokenKind::TripleEqual => BinaryOp::RawEqual,
                 _ => break,
             };
-            let span = left.span().clone();
+            let op_span = self.current_span();
             self.advance();
             let right = self.parse_comparison()?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
-                span,
+                span: op_span,
             };
         }
 
@@ -516,14 +516,14 @@ impl Parser {
                 TokenKind::LessEqual => BinaryOp::LessEqual,
                 _ => break,
             };
-            let span = left.span().clone();
+            let op_span = self.current_span();
             self.advance();
             let right = self.parse_addition()?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
-                span,
+                span: op_span,
             };
         }
 
@@ -539,14 +539,14 @@ impl Parser {
                 TokenKind::Minus => BinaryOp::Subtract,
                 _ => break,
             };
-            let span = left.span().clone();
+            let op_span = self.current_span();
             self.advance();
             let right = self.parse_multiplication()?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
-                span,
+                span: op_span,
             };
         }
 
@@ -563,14 +563,14 @@ impl Parser {
                 TokenKind::Percent => BinaryOp::Modulo,
                 _ => break,
             };
-            let span = left.span().clone();
+            let op_span = self.current_span();
             self.advance();
             let right = self.parse_power()?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
-                span,
+                span: op_span,
             };
         }
 
@@ -581,7 +581,7 @@ impl Parser {
         let base = self.parse_unary()?;
 
         if self.check(&TokenKind::StarStar) {
-            let span = base.span().clone();
+            let span = self.current_span();
             self.advance();
             let exponent = self.parse_power()?; // right-associative
             return Ok(Expr::Binary {
@@ -675,8 +675,8 @@ impl Parser {
 
         loop {
             if self.check(&TokenKind::LeftParen) {
-                // Function call
-                let span = expr.span().clone();
+                // Function call — span is the `(` token (ISSUES §75f).
+                let span = self.current_span();
                 self.advance(); // consume (
                 let args = self.parse_arguments()?;
                 self.expect(&TokenKind::RightParen)?;
@@ -686,8 +686,8 @@ impl Parser {
                     span,
                 };
             } else if self.check(&TokenKind::Dot) {
-                // Member access
-                let span = expr.span().clone();
+                // Member access — span is the `.` token (ISSUES §75f).
+                let span = self.current_span();
                 self.advance(); // consume .
                 let property = self.expect_identifier()?;
                 expr = Expr::Member {
@@ -696,8 +696,8 @@ impl Parser {
                     span,
                 };
             } else if self.check(&TokenKind::LeftBracket) {
-                // Index access
-                let span = expr.span().clone();
+                // Index access — span is the `[` token (ISSUES §75f).
+                let span = self.current_span();
                 self.advance(); // consume [
                 let index = self.parse_expression()?;
                 self.expect(&TokenKind::RightBracket)?;

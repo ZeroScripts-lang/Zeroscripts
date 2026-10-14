@@ -14,7 +14,7 @@
 //! `Opcode::Unknown` so §124 rejects the stream as a VM Error (ISSUES §68e)
 //! instead of a format error.
 
-use crate::compiler::{BytecodeHeader, BytecodeProgram, Constant, FunctionInfo, Opcode};
+use crate::compiler::{BytecodeHeader, BytecodeProgram, Constant, FunctionInfo, Opcode, DebugEntry};
 use crate::hash::Sha256;
 use crate::module::{ModuleBundle, ModuleMeta};
 use std::rc::Rc;
@@ -241,6 +241,19 @@ fn put_opcode(out: &mut Vec<u8>, op: &Opcode) {
     }
 }
 
+fn put_debug_entry(out: &mut Vec<u8>, e: &DebugEntry) {
+    put_u32(out, e.pc);
+    put_u32(out, e.line);
+    put_u32(out, e.column);
+}
+
+fn get_debug_entry(r: &mut Reader) -> Result<DebugEntry, BytecodeFileError> {
+    let pc = r.u32()?;
+    let line = r.u32()?;
+    let column = r.u32()?;
+    Ok(DebugEntry { pc, line, column })
+}
+
 fn put_constant(out: &mut Vec<u8>, c: &Constant) {
     match c {
         Constant::Number(v) => {
@@ -271,10 +284,21 @@ fn put_function_info(out: &mut Vec<u8>, f: &FunctionInfo) {
     put_usize(out, f.local_count);
     put_vec(out, &f.captured_vars, |out, v| put_str(out, v));
     put_bool(out, f.is_async);
+    // Job 036 (ISSUES §75f): source path + debug tables.
+    put_str(out, &f.source_file);
+    put_vec(out, &f.debug, put_debug_entry);
+    put_vec(out, &f.default_debug, |out, d| match d {
+        Some(entries) => {
+            put_bool(out, true);
+            put_vec(out, entries, put_debug_entry);
+        }
+        None => put_bool(out, false),
+    });
 }
 
 fn put_module_meta(out: &mut Vec<u8>, m: &ModuleMeta) {
     put_str(out, &m.path);
+    put_str(out, &m.display_path);
     put_usize(out, m.start);
     put_usize(out, m.end);
     put_vec(out, &m.exports, |out, e| put_str(out, e));
@@ -303,6 +327,8 @@ fn put_bundle(out: &mut Vec<u8>, bundle: &ModuleBundle) {
     put_vec(out, &p.default_bodies, |out, body| {
         put_vec(out, body, put_opcode);
     });
+    // Job 036 (ISSUES §75f): top-level debug side table.
+    put_vec(out, &p.debug, put_debug_entry);
     put_vec(out, &bundle.modules, put_module_meta);
 }
 
@@ -542,6 +568,15 @@ fn get_function_info(r: &mut Reader) -> Result<FunctionInfo, BytecodeFileError> 
     let local_count = r.usize_()?;
     let captured_vars = r.vec(|r| r.str())?;
     let is_async = r.bool()?;
+    let source_file = r.str()?;
+    let debug = r.vec(get_debug_entry)?;
+    let default_debug = r.vec(|r| {
+        if r.bool()? {
+            Ok(Some(r.vec(get_debug_entry)?))
+        } else {
+            Ok(None)
+        }
+    })?;
     Ok(FunctionInfo {
         name,
         params,
@@ -550,11 +585,15 @@ fn get_function_info(r: &mut Reader) -> Result<FunctionInfo, BytecodeFileError> 
         local_count,
         captured_vars,
         is_async,
+        source_file,
+        debug,
+        default_debug,
     })
 }
 
 fn get_module_meta(r: &mut Reader) -> Result<ModuleMeta, BytecodeFileError> {
     let path = r.str()?;
+    let display_path = r.str()?;
     let start = r.usize_()?;
     let end = r.usize_()?;
     let exports = r.vec(|r| r.str())?;
@@ -571,6 +610,7 @@ fn get_module_meta(r: &mut Reader) -> Result<ModuleMeta, BytecodeFileError> {
     })?;
     Ok(ModuleMeta {
         path,
+        display_path,
         start,
         end,
         exports,
@@ -588,6 +628,7 @@ fn get_bundle(r: &mut Reader) -> Result<ModuleBundle, BytecodeFileError> {
     let functions = r.vec(get_function_info)?;
     let function_bodies = r.vec(|r| r.vec(get_opcode))?;
     let default_bodies = r.vec(|r| r.vec(get_opcode))?;
+    let debug = r.vec(get_debug_entry)?;
     let modules = r.vec(get_module_meta)?;
     Ok(ModuleBundle {
         program: BytecodeProgram {
@@ -598,6 +639,7 @@ fn get_bundle(r: &mut Reader) -> Result<ModuleBundle, BytecodeFileError> {
             functions,
             function_bodies,
             default_bodies,
+            debug,
         },
         modules,
     })
@@ -722,10 +764,14 @@ mod tests {
                     local_count: 4,
                     captured_vars: vec!["cap".into()],
                     is_async: true,
-                }],
+                    source_file: String::new(),
+                    debug: Vec::new(),
+                    default_debug: Vec::new(),
+}],
                 function_bodies: vec![all_ops.clone()],
                 default_bodies: vec![all_ops.clone()],
-            },
+                debug: Vec::new(),
+},
             modules: vec![ModuleMeta {
                 path: "/tmp/main.zs".into(),
                 start: 0,
@@ -733,7 +779,8 @@ mod tests {
                 exports: vec!["e".into()],
                 imports: vec![("l".into(), "/tmp/util.zs".into(), "e".into())],
                 re_exports: vec![("re".into(), "/tmp/util.zs".into())],
-            }],
+                display_path: String::new(),
+}],
         }
     }
 
@@ -806,15 +853,16 @@ mod tests {
     fn test_job024_foreign_opcode_tag_becomes_unknown_and_fails_validation() {
         let mut payload = Vec::new();
         put_str(&mut payload, "ZERO");
-        put_u32(&mut payload, 1);
+        put_u32(&mut payload, 2);
         put_usize(&mut payload, 0);
         put_vec(&mut payload, &[] as &[u32], |_, _| {});
         put_u64(&mut payload, 1); // one instruction
         put_u32(&mut payload, 99); // foreign opcode tag
-        put_vec(&mut payload, &[] as &[u32], |_, _| {});
-        put_vec(&mut payload, &[] as &[u32], |_, _| {});
-        put_vec(&mut payload, &[] as &[u32], |_, _| {});
-        put_vec(&mut payload, &[] as &[u32], |_, _| {});
+        put_vec(&mut payload, &[] as &[u32], |_, _| {}); // functions
+        put_vec(&mut payload, &[] as &[u32], |_, _| {}); // function_bodies
+        put_vec(&mut payload, &[] as &[u32], |_, _| {}); // default_bodies
+        put_vec(&mut payload, &[] as &[u32], |_, _| {}); // debug (v2, Job 036)
+        put_vec(&mut payload, &[] as &[u32], |_, _| {}); // modules
         let mut file = payload;
         let mut hasher = Sha256::new();
         hasher.update(&file);

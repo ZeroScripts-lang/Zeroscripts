@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::Instant;
 
-use crate::compiler::{BytecodeProgram, Constant, FunctionInfo, Opcode, FINALLY_MARKER};
+use crate::compiler::{BytecodeProgram, Constant, DebugEntry, FunctionInfo, Opcode, FINALLY_MARKER};
 use crate::gc::Gc;
 use crate::heap::{EnvBinding, Heap, HeapObject, HeapRef as HeapRefHandle};
 use crate::native;
@@ -106,6 +106,17 @@ pub struct ZeroVM {
     /// Wall-clock origin stamped at run/run_modules entry — §150 execution
     /// time is real elapsed resource time, not the virtual `now_ms` (§71b).
     execution_started: Option<Instant>,
+    /// Job 036 (ISSUES §75f): debug side table of the active instruction
+    /// stream, swapped with `instructions` on Call/Return/task switches.
+    active_debug: Vec<DebugEntry>,
+    /// Source path of the active stream (`e.location.file`).
+    active_source: String,
+    /// Position of the runtime error currently propagating into
+    /// `make_error_object`; `None` ⇒ `e.location` is null (§154,
+    /// "jika informasi tersebut tersedia" — never fabricated).
+    current_error_loc: Option<(String, u32, u32)>,
+    /// Companion of `pending_error` (finally re-raise, ISSUES §59d).
+    pending_error_loc: Option<(String, u32, u32)>,
 }
 
 impl ZeroVM {
@@ -136,6 +147,10 @@ impl ZeroVM {
             limits: Limits::default(),
             instructions_executed: 0,
             execution_started: None,
+            active_debug: Vec::new(),
+            active_source: String::new(),
+            current_error_loc: None,
+            pending_error_loc: None,
         }
     }
 
@@ -340,12 +355,45 @@ impl ZeroVM {
             ResEntry { generation: 0, slot: None },
         );
         self.bump_cache_gen();
+        // Job 036 (ISSUES §75f): the main stream's debug table is the
+        // program-level one; the source path is set per module in
+        // `run_modules` (empty for embedder `run()`).
+        self.active_debug = self.program.debug.clone();
+        self.active_source = String::new();
+        self.current_error_loc = None;
+        self.pending_error_loc = None;
     }
 
     /// Swap in a new instruction stream and invalidate per-pc cache entries.
-    fn swap_instructions(&mut self, instructions: Vec<Opcode>) {
+    /// Job 036: the debug table and source path of the new stream travel
+    /// with it so runtime errors can fill `e.location` (ISSUES §75f).
+    fn swap_instructions(
+        &mut self,
+        instructions: Vec<Opcode>,
+        debug: Vec<DebugEntry>,
+        source: String,
+    ) {
         self.program.instructions = instructions;
+        self.active_debug = debug;
+        self.active_source = source;
         self.bump_cache_gen();
+    }
+
+    /// Exact pc → source position of the active stream (ISSUES §75f).
+    /// Missing entry ⇒ `None`; positions are never fabricated (§154).
+    fn lookup_debug_loc(&self, pc: usize) -> Option<(String, u32, u32)> {
+        let idx = self
+            .active_debug
+            .binary_search_by_key(&(pc as u32), |e| e.pc)
+            .ok()?;
+        let entry = &self.active_debug[idx];
+        Some((self.active_source.clone(), entry.line, entry.column))
+    }
+
+    /// Stamp the failing instruction's position before unwinding (ISSUES
+    /// §75f). `instr_pc` is the pc of the opcode that failed, never pc+1.
+    fn note_error_pc(&mut self, instr_pc: usize) {
+        self.current_error_loc = self.lookup_debug_loc(instr_pc);
     }
 
     /// §150/§133 enforcement at the instruction boundary: instruction
@@ -451,6 +499,8 @@ impl ZeroVM {
             captured_env: None,
             scope_env: None,
             return_instructions: None,
+            return_debug: None,
+            return_source: None,
             task_id: None,
         });
 
@@ -470,6 +520,7 @@ impl ZeroVM {
             if let Err(err) = self.execute_instruction(instr_pc, &instruction) {
                 // Only ZeroScript runtime errors are catchable (§43, §154)
                 if let VmError::RuntimeError(msg) = err {
+                    self.note_error_pc(instr_pc);
                     self.raise_runtime_error(msg)?;
                 } else {
                     return Err(err);
@@ -511,6 +562,8 @@ impl ZeroVM {
             captured_env: None,
             scope_env: None,
             return_instructions: None,
+            return_debug: None,
+            return_source: None,
             task_id: None,
         });
 
@@ -560,6 +613,10 @@ impl ZeroVM {
                 frame.scope_env = None;
             }
 
+            // Job 036 (ISSUES §75f): errors in this module's top-level
+            // report the module's display path (entry input path / dep
+            // canonical path).
+            self.active_source = meta.display_path.clone();
             let run_result = self.run_module_range(meta.start, meta.end);
             if let Err(e) = run_result {
                 // §73: do not cache failed module; drop its scope.
@@ -682,6 +739,7 @@ impl ZeroVM {
             }
             if let Err(err) = self.execute_instruction(instr_pc, &instruction) {
                 if let VmError::RuntimeError(msg) = err {
+                    self.note_error_pc(instr_pc);
                     self.raise_runtime_error(msg)?;
                 } else {
                     return Err(err);
@@ -1300,10 +1358,14 @@ impl ZeroVM {
 
                 let return_pc = self.pc;
                 let return_instructions = self.program.instructions.clone();
+                let return_debug = self.active_debug.clone();
+                let return_source = self.active_source.clone();
 
                 if func_idx < self.program.function_bodies.len() {
                     let body = self.program.function_bodies[func_idx].clone();
-                    self.swap_instructions(body);
+                    let fdebug = func_info.debug.clone();
+                    let fsource = func_info.source_file.clone();
+                    self.swap_instructions(body, fdebug, fsource);
                 }
 
                 self.call_stack.push(Frame {
@@ -1314,6 +1376,8 @@ impl ZeroVM {
                     captured_env: None,
                     scope_env: None,
                     return_instructions: Some(return_instructions),
+                    return_debug: Some(return_debug),
+                    return_source: Some(return_source),
                     task_id: None,
                 });
 
@@ -1370,10 +1434,14 @@ impl ZeroVM {
 
                 let return_pc = self.pc;
                 let return_instructions = self.program.instructions.clone();
+                let return_debug = self.active_debug.clone();
+                let return_source = self.active_source.clone();
 
                 if func_idx < self.program.function_bodies.len() {
                     let body = self.program.function_bodies[func_idx].clone();
-                    self.swap_instructions(body);
+                    let fdebug = func_info.debug.clone();
+                    let fsource = func_info.source_file.clone();
+                    self.swap_instructions(body, fdebug, fsource);
                 }
 
                 self.call_stack.push(Frame {
@@ -1384,6 +1452,8 @@ impl ZeroVM {
                     captured_env: Some(env.clone()),
                     scope_env: None,
                     return_instructions: Some(return_instructions),
+                    return_debug: Some(return_debug),
+                    return_source: Some(return_source),
                     task_id: None,
                 });
 
@@ -1589,7 +1659,15 @@ impl ZeroVM {
         let saved_pc = self.pc;
         let stack_at_start = self.stack().len();
         let default_body = self.program.default_bodies[default_idx].clone();
+        let default_debug = func_info
+            .default_debug
+            .get(default_idx)
+            .cloned()
+            .flatten()
+            .unwrap_or_default();
         let saved_instructions = std::mem::replace(&mut self.program.instructions, default_body);
+        let saved_debug = std::mem::replace(&mut self.active_debug, default_debug);
+        let saved_source = self.active_source.clone();
         self.bump_cache_gen();
         self.call_stack.push(Frame {
             // Default bodies are not functions; nothing reads this index.
@@ -1600,6 +1678,8 @@ impl ZeroVM {
             captured_env,
             scope_env: None,
             return_instructions: Some(saved_instructions),
+            return_debug: Some(saved_debug),
+            return_source: Some(saved_source),
             task_id: None,
         });
         self.pc = 0;
@@ -1621,6 +1701,7 @@ impl ZeroVM {
                 // Mirror the outer loops: only ZeroScript runtime errors are
                 // catchable (§43, §154); anything else aborts evaluation.
                 if let VmError::RuntimeError(msg) = err {
+                    self.note_error_pc(instr_pc);
                     self.raise_runtime_error(msg)?;
                 } else {
                     return Err(err);
@@ -2382,6 +2463,9 @@ impl ZeroVM {
         // path before deciding where control goes.
         let marker = self.pop_finally_marker()?;
         if let Some(msg) = self.pending_error.take() {
+            if self.current_error_loc.is_none() {
+                self.current_error_loc = self.pending_error_loc.take();
+            }
             // Marker discarded: the error continues outward unchanged.
             return self.raise_runtime_error(msg);
         }
@@ -2466,7 +2550,22 @@ impl ZeroVM {
             .heap
             .allocate(HeapObject::Str(classify_runtime_error(msg).to_string()));
         let message_ref = self.heap.allocate(HeapObject::Str(msg.to_string()));
-        let location_ref = self.heap.allocate(HeapObject::Null);
+        // Job 036 (ISSUES §75f): {file, line, column} when the failing
+        // instruction had a recorded position; otherwise null — §154 "jika
+        // informasi tersebut tersedia", never fabricated (decision 4).
+        let location_ref = match self.current_error_loc.take() {
+            Some((file, line, column)) => {
+                let file_ref = self.heap.allocate(HeapObject::Str(file));
+                let line_ref = self.heap.allocate(HeapObject::Number(line as f64));
+                let col_ref = self.heap.allocate(HeapObject::Number(column as f64));
+                self.heap.allocate(HeapObject::object(vec![
+                    ("file".to_string(), file_ref),
+                    ("line".to_string(), line_ref),
+                    ("column".to_string(), col_ref),
+                ]))
+            }
+            None => self.heap.allocate(HeapObject::Null),
+        };
         let object_ref = self.heap.allocate(HeapObject::error_object(vec![
             ("type".to_string(), type_ref),
             ("message".to_string(), message_ref),
@@ -2523,6 +2622,7 @@ impl ZeroVM {
                         self.handlers.pop();
                         self.unwind_to_handler(&handler);
                         self.pending_error = Some(msg);
+                        self.pending_error_loc = self.current_error_loc.take();
                         // Marker after truncation: FinallyEnd consumes it, then
                         // re-raises pending_error (ISSUES §59d).
                         self.push_pending_finally_marker();
@@ -2539,6 +2639,7 @@ impl ZeroVM {
                     if let Some(finally_pc) = handler.finally_pc {
                         self.unwind_to_handler(&handler);
                         self.pending_error = Some(msg);
+                        self.pending_error_loc = self.current_error_loc.take();
                         self.push_pending_finally_marker();
                         self.pc = finally_pc;
                         return Ok(());
@@ -2557,7 +2658,9 @@ impl ZeroVM {
         while self.call_stack.len() > handler.frame_depth {
             if let Some(frame) = self.call_stack.pop() {
                 if let Some(instrs) = frame.return_instructions {
-                    self.swap_instructions(instrs);
+                    let dbg = frame.return_debug.unwrap_or_default();
+                    let src = frame.return_source.unwrap_or_default();
+                    self.swap_instructions(instrs, dbg, src);
                 }
             }
         }
@@ -2589,7 +2692,9 @@ impl ZeroVM {
         self.pc = frame.return_pc;
 
         if let Some(instructions) = frame.return_instructions {
-            self.swap_instructions(instructions);
+            let dbg = frame.return_debug.clone().unwrap_or_default();
+            let src = frame.return_source.clone().unwrap_or_default();
+            self.swap_instructions(instructions, dbg, src);
         }
 
         // Also discard handlers that were in the popped frame
@@ -2659,7 +2764,9 @@ impl ZeroVM {
         self.pc = frame.return_pc;
 
         if let Some(instructions) = frame.return_instructions {
-            self.swap_instructions(instructions);
+            let dbg = frame.return_debug.clone().unwrap_or_default();
+            let src = frame.return_source.clone().unwrap_or_default();
+            self.swap_instructions(instructions, dbg, src);
         }
 
         if let Some(tid) = frame.task_id {

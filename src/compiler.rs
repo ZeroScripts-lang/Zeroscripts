@@ -9,11 +9,13 @@ pub const BYTECODE_MAGIC: &str = "ZERO";
 
 /// Bytecode format version emitted by this compiler (§125). Distinct from the
 /// ZeroScript language version and from any package/module version.
-pub const BYTECODE_VERSION: u32 = 1;
+pub const BYTECODE_VERSION: u32 = 2;
 
 /// Bytecode versions this ZeroVM accepts (§125: compatibility is stated
-/// explicitly; an old bytecode is never assumed compatible).
-pub const SUPPORTED_BYTECODE_VERSIONS: &[u32] = &[1];
+/// explicitly; an old bytecode is never assumed compatible). Version 2 adds
+/// the debug/position side tables (ISSUES §75f, Job 036); version 1 images
+/// are rejected by the validator before any instruction runs.
+pub const SUPPORTED_BYTECODE_VERSIONS: &[u32] = &[2];
 
 /// Bytecode header (§124, §125): `ZERO` + `BYTECODE_VERSION`. Checked by the
 /// validator before any instruction runs.
@@ -36,6 +38,18 @@ impl BytecodeHeader {
     pub fn is_supported(&self) -> bool {
         self.magic == BYTECODE_MAGIC && SUPPORTED_BYTECODE_VERSIONS.contains(&self.version)
     }
+}
+
+/// One debug side-table entry: the source position (1-based, from the lexer)
+/// of the opcode at `pc` in one instruction stream. Recorded only for
+/// opcodes that can raise a runtime error (ISSUES §75f, Runtime.md §154 —
+/// "jika informasi tersebut tersedia"). Missing entry ⇒ `e.location` is
+/// null; the compiler never fabricates a position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugEntry {
+    pub pc: u32,
+    pub line: u32,
+    pub column: u32,
 }
 
 /// Sentinel on top of every continuation marker (ISSUES §59d). The marker is
@@ -172,6 +186,10 @@ pub struct BytecodeProgram {
     /// Job 022 (§30): one body per default parameter expression, evaluated
     /// at call time. `FunctionInfo.param_defaults` indexes this table.
     pub default_bodies: Vec<Vec<Opcode>>,
+    /// Job 036 (ISSUES §75f): source positions of error-capable opcodes in
+    /// `instructions` (pc-indexed, sorted). Parallel to no other field —
+    /// function bodies carry their own tables in `FunctionInfo`.
+    pub debug: Vec<DebugEntry>,
 }
 
 /// One module's compiled unit before merge into a combined program.
@@ -185,6 +203,9 @@ pub struct ModuleUnit {
     pub function_bodies: Vec<Vec<Opcode>>,
     /// Job 022 (§30): default-parameter expression bodies (§30).
     pub default_bodies: Vec<Vec<Opcode>>,
+    /// Job 036 (ISSUES §75f): debug entries for this module's top-level
+    /// `instructions` (unit-local pc).
+    pub debug: Vec<DebugEntry>,
     pub exports: Vec<String>,
     pub imports: Vec<ModuleImport>,
     /// Re-export edges: (export_name, raw_path). §67.
@@ -212,6 +233,15 @@ pub struct FunctionInfo {
     pub captured_vars: Vec<String>,
     /// `async function` (§49): calling it creates a Task (§101).
     pub is_async: bool,
+    /// Job 036 (ISSUES §75f): source path of the module this function was
+    /// compiled from (input path for the entry, canonical path for deps —
+    /// decision 2026-10-13). Empty for embedder `compile()` with no path.
+    pub source_file: String,
+    /// Job 036: debug entries for this function's body stream (body-local pc).
+    pub debug: Vec<DebugEntry>,
+    /// Job 036: per-default-parameter debug tables, aligned with
+    /// `param_defaults` (`Some` index → table of that default body).
+    pub default_debug: Vec<Option<Vec<DebugEntry>>>,
 }
 
 struct LoopContext {
@@ -285,6 +315,14 @@ struct Compiler {
     /// Job 022 (§30): default-parameter expression bodies, one per defaulted
     /// parameter, indexed by `FunctionInfo.param_defaults`.
     default_bodies: Vec<Vec<Opcode>>,
+    /// Job 036 (ISSUES §75f): debug entries for the stream currently being
+    /// compiled (swapped with bodies, like `instructions`).
+    debug_entries: Vec<DebugEntry>,
+    /// Debug tables parallel to `function_bodies` / `default_bodies`.
+    function_bodies_debug: Vec<Vec<DebugEntry>>,
+    default_bodies_debug: Vec<Vec<DebugEntry>>,
+    /// Source path stamped on every FunctionInfo this compiler emits.
+    source_file: String,
     scopes: Vec<Vec<ScopeVar>>,
     loop_contexts: Vec<LoopContext>,
     try_contexts: Vec<TryContext>,
@@ -342,6 +380,10 @@ impl Compiler {
             module_mode: false,
             fn_is_exported: false,
             exported_names: HashSet::new(),
+            debug_entries: Vec::new(),
+            function_bodies_debug: Vec::new(),
+            default_bodies_debug: Vec::new(),
+            source_file: String::new(),
         }
     }
 
@@ -370,6 +412,10 @@ impl Compiler {
             module_mode: true,
             fn_is_exported: false,
             exported_names: HashSet::new(),
+            debug_entries: Vec::new(),
+            function_bodies_debug: Vec::new(),
+            default_bodies_debug: Vec::new(),
+            source_file: String::new(),
         }
     }
 
@@ -454,6 +500,18 @@ impl Compiler {
         let pos = self.instructions.len();
         self.instructions.push(opcode);
         pos
+    }
+
+    /// Job 036 (ISSUES §75f): emit an error-capable opcode together with its
+    /// source position (the triggering token's span, parser-accurate).
+    fn emit_located(&mut self, opcode: Opcode, span: &Span) -> usize {
+        let pc = self.emit(opcode);
+        self.debug_entries.push(DebugEntry {
+            pc: pc as u32,
+            line: span.line as u32,
+            column: span.column as u32,
+        });
+        pc
     }
 
     fn patch_jump(&mut self, offset: usize) {
@@ -661,12 +719,16 @@ impl Compiler {
     /// outer references become captured variables exactly like body code.
     fn compile_default_body(&mut self, default_expr: &Expr) -> Result<usize, CompilerError> {
         let saved_instructions = std::mem::take(&mut self.instructions);
+        let saved_debug = std::mem::take(&mut self.debug_entries);
         self.compile_expression(default_expr)?;
         self.emit(Opcode::Return);
         let body = std::mem::take(&mut self.instructions);
+        let body_debug = std::mem::take(&mut self.debug_entries);
         self.instructions = saved_instructions;
+        self.debug_entries = saved_debug;
         let idx = self.default_bodies.len();
         self.default_bodies.push(body);
+        self.default_bodies_debug.push(body_debug);
         Ok(idx)
     }
 
@@ -1027,6 +1089,9 @@ impl Compiler {
                     local_count: 0,
                     captured_vars: Vec::new(),
                     is_async: *is_async,
+                    source_file: String::new(),
+                    debug: Vec::new(),
+                    default_debug: Vec::new(),
                 });
 
                 let is_global_root = self.function_base == 0 && self.scopes.len() == 1;
@@ -1034,6 +1099,7 @@ impl Compiler {
 
                 // Save compilation state (but NOT functions - inner functions need to be added)
                 let saved_instructions = std::mem::take(&mut self.instructions);
+                let saved_debug_entries = std::mem::take(&mut self.debug_entries);
                 let saved_constants = std::mem::take(&mut self.constants);
                 let saved_captured = std::mem::take(&mut self.captured_vars);
                 let saved_scope_depth = self.scope_depth;
@@ -1083,6 +1149,10 @@ impl Compiler {
                     }
                     self.declare_variable(&param.name, false)?;
                 }
+                self.functions[func_idx].default_debug = param_defaults
+                    .iter()
+                    .map(|o| o.map(|i| self.default_bodies_debug[i].clone()))
+                    .collect();
                 self.functions[func_idx].param_defaults = param_defaults;
 
                 // Compile body
@@ -1099,14 +1169,19 @@ impl Compiler {
                 let captured = std::mem::take(&mut self.captured_vars);
 
                 let func_instructions = std::mem::take(&mut self.instructions);
+                let mut func_debug = std::mem::take(&mut self.debug_entries);
+                self.functions[func_idx].debug = func_debug.clone();
                 let func_constants = std::mem::take(&mut self.constants);
 
                 // Collect any inner function bodies that were added
                 let mut inner_bodies: Vec<Vec<Opcode>> = self.function_bodies.drain(saved_bodies_count..).collect();
+                let inner_debug: Vec<Vec<DebugEntry>> =
+                    self.function_bodies_debug.drain(saved_bodies_count..).collect();
 
                 // Restore outer state
                 self.scopes = saved_scopes;
                 self.instructions = saved_instructions;
+                self.debug_entries = saved_debug_entries;
                 self.constants = saved_constants;
                 self.captured_vars = saved_captured;
                 self.scope_depth = saved_scope_depth;
@@ -1172,8 +1247,12 @@ impl Compiler {
 
                 // Store this function's body first, then inner bodies
                 self.function_bodies.push(remapped_instructions);
+                self.function_bodies_debug.push(std::mem::take(&mut func_debug));
                 for body in inner_bodies {
                     self.function_bodies.push(body);
+                }
+                for dbg in inner_debug {
+                    self.function_bodies_debug.push(dbg);
                 }
 
                 if *exported {
@@ -1581,39 +1660,45 @@ impl Compiler {
                 self.emit(Opcode::LoadConst(idx));
                 Ok(())
             }
-            Expr::Identifier(name, _) => {
+            Expr::Identifier(name, span) => {
                 let res = self.resolve_for_load(name);
                 match res {
                     VarRes::Captured | VarRes::ConstCaptured => {
                         self.track_captured(name, res);
-                        self.emit(Opcode::LoadCaptured(name.clone().into()));
+                        self.emit_located(Opcode::LoadCaptured(name.clone().into()), span);
                     }
                     VarRes::ModuleScope | VarRes::ConstModuleScope => {
                         // §70d: read through the module environment; the
                         // binding stays in the closure's captured list so the
                         // module env outlives init (§65/§130).
                         self.track_captured(name, res);
-                        self.emit(Opcode::LoadCaptured(name.clone().into()));
+                        self.emit_located(Opcode::LoadCaptured(name.clone().into()), span);
                     }
                     VarRes::Local | VarRes::ConstLocal => {
-                        self.emit(Opcode::LoadLocal(name.clone().into()));
+                        self.emit_located(Opcode::LoadLocal(name.clone().into()), span);
                     }
                     VarRes::Global | VarRes::ConstGlobal => {
-                        self.emit(Opcode::LoadGlobal(name.clone().into()));
+                        self.emit_located(Opcode::LoadGlobal(name.clone().into()), span);
                     }
                 }
                 Ok(())
             }
-            Expr::Unary { op, operand, .. } => {
+            Expr::Unary { op, operand, span } => {
                 self.compile_expression(operand)?;
                 match op {
-                    UnaryOp::Negate => self.emit(Opcode::Neg),
-                    UnaryOp::Plus => self.emit(Opcode::Pos),
-                    UnaryOp::Not => self.emit(Opcode::Not),
+                    UnaryOp::Negate => {
+                        self.emit_located(Opcode::Neg, span);
+                    }
+                    UnaryOp::Plus => {
+                        self.emit_located(Opcode::Pos, span);
+                    }
+                    UnaryOp::Not => {
+                        self.emit(Opcode::Not);
+                    }
                 };
                 Ok(())
             }
-            Expr::Binary { op, left, right, .. } => {
+            Expr::Binary { op, left, right, span } => {
                 // Short-circuit evaluation for and/or
                 match op {
                     BinaryOp::And => {
@@ -1639,19 +1724,45 @@ impl Compiler {
                 self.compile_expression(right)?;
 
                 match op {
-                    BinaryOp::Add => self.emit(Opcode::Add),
-                    BinaryOp::Subtract => self.emit(Opcode::Sub),
-                    BinaryOp::Multiply => self.emit(Opcode::Mul),
-                    BinaryOp::Divide => self.emit(Opcode::Div),
-                    BinaryOp::Modulo => self.emit(Opcode::Mod),
-                    BinaryOp::Power => self.emit(Opcode::Pow),
-                    BinaryOp::Greater => self.emit(Opcode::Gt),
-                    BinaryOp::Less => self.emit(Opcode::Lt),
-                    BinaryOp::GreaterEqual => self.emit(Opcode::Gte),
-                    BinaryOp::LessEqual => self.emit(Opcode::Lte),
-                    BinaryOp::Equal => self.emit(Opcode::Eq),
-                    BinaryOp::NotEqual => self.emit(Opcode::Neq),
-                    BinaryOp::RawEqual => self.emit(Opcode::RawEq),
+                    BinaryOp::Add => {
+                        self.emit_located(Opcode::Add, span);
+                    }
+                    BinaryOp::Subtract => {
+                        self.emit_located(Opcode::Sub, span);
+                    }
+                    BinaryOp::Multiply => {
+                        self.emit_located(Opcode::Mul, span);
+                    }
+                    BinaryOp::Divide => {
+                        self.emit_located(Opcode::Div, span);
+                    }
+                    BinaryOp::Modulo => {
+                        self.emit_located(Opcode::Mod, span);
+                    }
+                    BinaryOp::Power => {
+                        self.emit_located(Opcode::Pow, span);
+                    }
+                    BinaryOp::Greater => {
+                        self.emit_located(Opcode::Gt, span);
+                    }
+                    BinaryOp::Less => {
+                        self.emit_located(Opcode::Lt, span);
+                    }
+                    BinaryOp::GreaterEqual => {
+                        self.emit_located(Opcode::Gte, span);
+                    }
+                    BinaryOp::LessEqual => {
+                        self.emit_located(Opcode::Lte, span);
+                    }
+                    BinaryOp::Equal => {
+                        self.emit(Opcode::Eq);
+                    }
+                    BinaryOp::NotEqual => {
+                        self.emit(Opcode::Neq);
+                    }
+                    BinaryOp::RawEqual => {
+                        self.emit(Opcode::RawEq);
+                    }
                     BinaryOp::And | BinaryOp::Or => unreachable!(),
                 };
 
@@ -1680,16 +1791,16 @@ impl Compiler {
                             self.register_implicit_local(name);
                         }
                     }
-                    Expr::Member { object, property, .. } => {
+                    Expr::Member { object, property, span } => {
                         self.compile_expression(object)?;
                         self.compile_expression(value)?;
-                        self.emit(Opcode::SetProperty(property.clone().into()));
+                        self.emit_located(Opcode::SetProperty(property.clone().into()), span);
                     }
-                    Expr::Index { object, index, .. } => {
+                    Expr::Index { object, index, span } => {
                         self.compile_expression(object)?;
                         self.compile_expression(index)?;
                         self.compile_expression(value)?;
-                        self.emit(Opcode::SetIndex);
+                        self.emit_located(Opcode::SetIndex, span);
                     }
                     _ => {
                         return Err(CompilerError::new("Invalid assignment target"));
@@ -1860,7 +1971,7 @@ impl Compiler {
 
                 Ok(())
             }
-            Expr::Call { callee, args, .. } => {
+            Expr::Call { callee, args, span } => {
                 // Statically resolvable builtin call: no callee is pushed, the
                 // operation name travels in the operand (§145, §146).
                 if let Some(target) = self.static_call_target(callee) {
@@ -1889,19 +2000,19 @@ impl Compiler {
                 }
 
                 // Call
-                self.emit(Opcode::Call(args.len()));
+                self.emit_located(Opcode::Call(args.len()), span);
 
                 Ok(())
             }
-            Expr::Member { object, property, .. } => {
+            Expr::Member { object, property, span } => {
                 self.compile_expression(object)?;
-                self.emit(Opcode::GetProperty(property.clone().into()));
+                self.emit_located(Opcode::GetProperty(property.clone().into()), span);
                 Ok(())
             }
-            Expr::Index { object, index, .. } => {
+            Expr::Index { object, index, span } => {
                 self.compile_expression(object)?;
                 self.compile_expression(index)?;
-                self.emit(Opcode::GetIndex);
+                self.emit_located(Opcode::GetIndex, span);
                 Ok(())
             }
             Expr::List { elements, .. } => {
@@ -1935,10 +2046,14 @@ impl Compiler {
                     local_count: 0,
                     captured_vars: Vec::new(),
                     is_async: false,
+                    source_file: String::new(),
+                    debug: Vec::new(),
+                    default_debug: Vec::new(),
                 });
 
                 // Save and start new compilation context (keep parent scopes for capture detection)
                 let saved_instructions = std::mem::take(&mut self.instructions);
+                let saved_debug_entries = std::mem::take(&mut self.debug_entries);
                 let saved_constants = std::mem::take(&mut self.constants);
                 let saved_captured = std::mem::take(&mut self.captured_vars);
                 let saved_scope_depth = self.scope_depth;
@@ -1971,6 +2086,10 @@ impl Compiler {
                     }
                     self.declare_variable(&param.name, false)?;
                 }
+                self.functions[func_idx].default_debug = param_defaults
+                    .iter()
+                    .map(|o| o.map(|i| self.default_bodies_debug[i].clone()))
+                    .collect();
                 self.functions[func_idx].param_defaults = param_defaults;
 
                 let entry_point = self.instructions.len();
@@ -1987,13 +2106,18 @@ impl Compiler {
                 let captured = std::mem::take(&mut self.captured_vars);
 
                 let mut func_instructions = std::mem::take(&mut self.instructions);
+                let mut func_debug = std::mem::take(&mut self.debug_entries);
+                self.functions[func_idx].debug = func_debug.clone();
                 let func_constants = std::mem::take(&mut self.constants);
 
                 // Collect and remap any inner function bodies
                 let mut inner_bodies: Vec<Vec<Opcode>> = self.function_bodies.drain(saved_bodies_count..).collect();
+                let inner_debug: Vec<Vec<DebugEntry>> =
+                    self.function_bodies_debug.drain(saved_bodies_count..).collect();
 
                 self.scopes = saved_scopes;
                 self.instructions = saved_instructions;
+                self.debug_entries = saved_debug_entries;
                 self.constants = saved_constants;
                 self.captured_vars = saved_captured;
                 self.scope_depth = saved_scope_depth;
@@ -2045,8 +2169,12 @@ impl Compiler {
 
                 // Store function body for VM execution
                 self.function_bodies.push(func_instructions);
+                self.function_bodies_debug.push(std::mem::take(&mut func_debug));
                 for body in inner_bodies {
                     self.function_bodies.push(body);
+                }
+                for dbg in inner_debug {
+                    self.function_bodies_debug.push(dbg);
                 }
 
                 Ok(())
@@ -2067,9 +2195,13 @@ impl Compiler {
                     local_count: 0,
                     captured_vars: Vec::new(),
                     is_async: false,
+                    source_file: String::new(),
+                    debug: Vec::new(),
+                    default_debug: Vec::new(),
                 });
 
                 let saved_instructions = std::mem::take(&mut self.instructions);
+                let saved_debug_entries = std::mem::take(&mut self.debug_entries);
                 let saved_constants = std::mem::take(&mut self.constants);
                 let saved_captured = std::mem::take(&mut self.captured_vars);
                 let saved_scope_depth = self.scope_depth;
@@ -2104,6 +2236,10 @@ impl Compiler {
                     }
                     self.declare_variable(&param.name, false)?;
                 }
+                self.functions[func_idx].default_debug = param_defaults
+                    .iter()
+                    .map(|o| o.map(|i| self.default_bodies_debug[i].clone()))
+                    .collect();
                 self.functions[func_idx].param_defaults = param_defaults;
 
                 let entry_point = self.instructions.len();
@@ -2127,13 +2263,18 @@ impl Compiler {
                 let captured = std::mem::take(&mut self.captured_vars);
 
                 let mut func_instructions = std::mem::take(&mut self.instructions);
+                let mut func_debug = std::mem::take(&mut self.debug_entries);
+                self.functions[func_idx].debug = func_debug.clone();
                 let func_constants = std::mem::take(&mut self.constants);
 
                 // Collect and remap any inner function bodies
                 let mut inner_bodies: Vec<Vec<Opcode>> = self.function_bodies.drain(saved_bodies_count..).collect();
+                let inner_debug: Vec<Vec<DebugEntry>> =
+                    self.function_bodies_debug.drain(saved_bodies_count..).collect();
 
                 self.scopes = saved_scopes;
                 self.instructions = saved_instructions;
+                self.debug_entries = saved_debug_entries;
                 self.constants = saved_constants;
                 self.captured_vars = saved_captured;
                 self.scope_depth = saved_scope_depth;
@@ -2184,8 +2325,12 @@ impl Compiler {
 
                 // Store function body for VM execution
                 self.function_bodies.push(func_instructions);
+                self.function_bodies_debug.push(std::mem::take(&mut func_debug));
                 for body in inner_bodies {
                     self.function_bodies.push(body);
+                }
+                for dbg in inner_debug {
+                    self.function_bodies_debug.push(dbg);
                 }
 
                 Ok(())
@@ -2292,6 +2437,7 @@ pub fn compile(program: &Program) -> Result<BytecodeProgram, CompilerError> {
         functions: compiler.functions,
         function_bodies: compiler.function_bodies,
         default_bodies: compiler.default_bodies,
+        debug: compiler.debug_entries,
     })
 }
 
@@ -2299,6 +2445,7 @@ pub fn compile(program: &Program) -> Result<BytecodeProgram, CompilerError> {
 /// Function bodies stay in `function_bodies` for the loader to merge across modules.
 pub fn compile_module(path: &str, program: &Program) -> Result<ModuleUnit, CompilerError> {
     let mut compiler = Compiler::new_module();
+    compiler.source_file = path.to_string();
     compiler.seed_export_names(program);
     for stmt in &program.statements {
         compiler.compile_statement(stmt)?;
@@ -2312,6 +2459,7 @@ pub fn compile_module(path: &str, program: &Program) -> Result<ModuleUnit, Compi
         functions: compiler.functions,
         function_bodies: compiler.function_bodies,
         default_bodies: compiler.default_bodies,
+        debug: compiler.debug_entries,
         exports: compiler.exports,
         imports: compiler.imports,
         re_exports: compiler.re_exports,
@@ -2327,6 +2475,7 @@ pub fn merge_modules(units: &[ModuleUnit]) -> BytecodeProgram {
         functions: Vec::new(),
         function_bodies: Vec::new(),
         default_bodies: Vec::new(),
+        debug: Vec::new(),
     };
 
     for unit in units {
@@ -2352,8 +2501,20 @@ pub fn merge_modules(units: &[ModuleUnit]) -> BytecodeProgram {
             }
         }
 
+        // Job 036 (ISSUES §75f): top-level debug entries follow the module's
+        // instruction range into the merged program.
+        for entry in &unit.debug {
+            combined.debug.push(DebugEntry {
+                pc: entry.pc + instr_offset as u32,
+                line: entry.line,
+                column: entry.column,
+            });
+        }
+
         for func in &unit.functions {
             let mut f = func.clone();
+            // Job 036: source path for `e.location.file` (ISSUES §75f).
+            f.source_file = unit.path.clone();
             // entry_point is fixed after all bodies are appended below.
             f.entry_point = 0;
             // param_defaults index default_bodies (Job 022, §30), which are
