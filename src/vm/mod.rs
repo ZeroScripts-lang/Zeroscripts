@@ -1771,6 +1771,47 @@ impl ZeroVM {
                 self.err_output.push(output);
                 Ok(Value::Null)
             }
+            // ---- input (StandardLibrary §157, I/O boundary §148) ----
+            "input" => {
+                if args.len() > 1 {
+                    return Err(VmError::RuntimeError(
+                        "input() expects exactly 0 or 1 argument".to_string(),
+                    ));
+                }
+                let prompt = match args.first() {
+                    Some(Value::Str(s)) => Some(s.clone()),
+                    Some(_) => {
+                        return Err(VmError::RuntimeError(
+                            "Expected a string argument for input()".to_string(),
+                        ))
+                    }
+                    None => None,
+                };
+                // §157: the prompt is written to standard output exactly as
+                // given — flushed before the blocking read so it is visible
+                // even without a trailing newline.
+                if let Some(prompt) = prompt {
+                    use std::io::Write;
+                    print!("{}", prompt);
+                    let _ = std::io::stdout().flush();
+                }
+                // §157: blocking — the VM thread waits here; the task
+                // scheduler does not run other tasks meanwhile.
+                let mut line = String::new();
+                match std::io::stdin().read_line(&mut line) {
+                    // EOF → null; empty line (just Enter) → "".
+                    Ok(0) => Ok(Value::Null),
+                    Ok(_) => {
+                        // CRLF ("\r\n") is cut at "\n" (§157); a bare
+                        // trailing "\r" is dropped the same way.
+                        while line.ends_with('\n') || line.ends_with('\r') {
+                            line.pop();
+                        }
+                        Ok(Value::Str(line))
+                    }
+                    Err(e) => Err(VmError::RuntimeError(format!("input() failed: {}", e))),
+                }
+            }
             "type" => {
                 if args.len() != 1 {
                     return Err(VmError::RuntimeError(

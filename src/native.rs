@@ -11,6 +11,7 @@
 /// Root bindings installed into the global scope before execution.
 pub const BUILTIN_ROOTS: &[&str] = &[
     "print",
+    "input",
     "type",
     "number",
     "string",
@@ -26,7 +27,7 @@ pub const BUILTIN_ROOTS: &[&str] = &[
 ];
 
 /// Roots that are callable directly, not only as namespaces.
-pub const ROOT_FUNCTIONS: &[&str] = &["print", "type", "number", "string", "boolean"];
+pub const ROOT_FUNCTIONS: &[&str] = &["print", "input", "type", "number", "string", "boolean"];
 
 /// Methods reachable on each namespace root: `list.add` → ("list", ["add", ..]).
 pub const NATIVE_METHODS: &[(&str, &[&str])] = &[
@@ -103,6 +104,7 @@ mod tests {
         for op in [
             "print",
             "print.err",
+            "input",
             "type",
             "number",
             "string",
