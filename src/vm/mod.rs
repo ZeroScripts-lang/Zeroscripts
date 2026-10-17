@@ -1750,25 +1750,31 @@ impl ZeroVM {
     /// reached dynamically through a `BuiltIn` value — dispatches here.
     fn call_native(&mut self, name: &str, args: &[Value]) -> Result<Value, VmError> {
         match name {
+            // §44 "Argumen": 0 or more arguments — each formatted and
+            // joined with a single space; zero arguments → empty line.
             "print" => {
-                if args.is_empty() {
-                    self.output.push(String::new());
-                } else {
-                    let output = args[0].format_value(&self.heap);
-                    self.output.push(output);
-                }
+                let line = args
+                    .iter()
+                    .map(|value| value.format_value(&self.heap))
+                    .collect::<Vec<String>>()
+                    .join(" ");
+                self.output.push(line);
                 Ok(Value::Null)
             }
             "print.err" => {
                 // ISSUES §59a: a caught error object prints its message so the
-                // output stays a human-readable error line.
-                let output = match args.first() {
-                    Some(value) => value
-                        .error_message(&self.heap)
-                        .unwrap_or_else(|| value.format_value(&self.heap)),
-                    None => String::new(),
-                };
-                self.err_output.push(output);
+                // output stays a human-readable error line; §44 Argumen rule
+                // (space-joined) applies to print.err identically.
+                let line = args
+                    .iter()
+                    .map(|value| {
+                        value
+                            .error_message(&self.heap)
+                            .unwrap_or_else(|| value.format_value(&self.heap))
+                    })
+                    .collect::<Vec<String>>()
+                    .join(" ");
+                self.err_output.push(line);
                 Ok(Value::Null)
             }
             // ---- input (StandardLibrary §157, I/O boundary §148) ----
