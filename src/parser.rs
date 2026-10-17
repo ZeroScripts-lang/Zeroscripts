@@ -228,12 +228,18 @@ impl Parser {
 
     fn parse_return(&mut self) -> Result<Stmt, ParserError> {
         let span = self.current_span();
+        let return_line = self.current().line;
         self.advance(); // consume return
 
+        // §26 "Batas statement untuk return": the value expression is parsed
+        // only when it starts on the same line as the `return` keyword — a
+        // token on a later line makes this a bare return and the next
+        // statement stays a separate statement.
         let value = if self.check(&TokenKind::Semicolon)
             || self.check(&TokenKind::RightBrace)
             || self.check(&TokenKind::Eof)
             || self.at_statement_end()
+            || self.current().line > return_line
         {
             None
         } else {
@@ -1797,6 +1803,66 @@ mod tests {
                     _ => panic!("Expected return statement"),
                 }
             }
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_job038_return_newline_is_bare_return() {
+        // §26 "Batas statement untuk return": the value expression must
+        // start on the same line — a token on the next line is a new
+        // statement, not the return value.
+        let prog = parse("function f() {\n    return\n    print(\"x\")\n}");
+        match &prog.statements[0] {
+            Stmt::FunctionDecl { body, .. } => {
+                assert_eq!(body.len(), 2, "print stays a separate statement: {:?}", body);
+                match &body[0] {
+                    Stmt::Return { value, .. } => assert!(value.is_none()),
+                    _ => panic!("Expected bare return statement"),
+                }
+                match &body[1] {
+                    Stmt::Expression(_) => {}
+                    _ => panic!("Expected expression statement after bare return"),
+                }
+            }
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_job038_return_same_line_expression_kept() {
+        let prog = parse("function f() {\n    return 1 +\n    2\n}");
+        match &prog.statements[0] {
+            Stmt::FunctionDecl { body, .. } => match &body[0] {
+                Stmt::Return { value, .. } => {
+                    let expr = value.as_ref().expect("same-line expression is the value");
+                    // Trailing-operator continuation: the expression started
+                    // on the return line, so it spans the newline.
+                    match expr {
+                        Expr::Binary { .. } => {}
+                        other => panic!("Expected binary expression, got {:?}", other),
+                    }
+                }
+                _ => panic!("Expected return statement"),
+            },
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_job038_return_multiline_list_literal_kept() {
+        let prog = parse("function f() {\n    return [\n        1,\n        2\n    ]\n}");
+        match &prog.statements[0] {
+            Stmt::FunctionDecl { body, .. } => match &body[0] {
+                Stmt::Return { value, .. } => {
+                    let expr = value.as_ref().expect("list literal is the value");
+                    match expr {
+                        Expr::List { elements, .. } => assert_eq!(elements.len(), 2),
+                        other => panic!("Expected list literal, got {:?}", other),
+                    }
+                }
+                _ => panic!("Expected return statement"),
+            },
             _ => panic!("Expected function declaration"),
         }
     }
