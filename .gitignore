@@ -1,22 +1,23 @@
 /target
 
-/jobs/
-/jobs-issue/
+# Governance (spec, issues, check, jobs, agent rules) — tracked since
+# 2026-10-14 as a durable backup (kept under spec/ and jobs/).
 
-CHECK.md
-Dependencies.md
-ISSUES.md
-INDEX.md
-AGENTS.md
-Async.md
-Bytecode.md
-Language.md
-Modules.md
-Runtime.md
-StandardLibrary.md
-ZeroVM.md
+# Working/scratch notes — kept local on purpose.
 jobs-extended.md
 jobs-tambahan.md
 jawaban.md
 opsi.md
+
+# Scratch/benchmark artifacts — never committed.
+bench.*
+bench_*.js
+bench_*.py
+bench_*.zs
+demo.js
+mem_empty.*
+mem_loop.*
+memtest.sh
+zs.txt
+
 /examples/*.zsbc
